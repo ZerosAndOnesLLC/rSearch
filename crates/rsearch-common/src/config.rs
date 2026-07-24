@@ -31,6 +31,8 @@ impl Default for RsearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Cluster name reported by the compatibility API.
+    pub cluster_name: String,
     /// Stable node identifier; defaults to the hostname.
     pub id: Option<String>,
     /// Roles this node runs when not overridden on the command line.
@@ -42,6 +44,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            cluster_name: "rsearch".to_string(),
             id: None,
             roles: Role::ALL.to_vec(),
             data_dir: "./data".to_string(),
