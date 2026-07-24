@@ -1,0 +1,78 @@
+# rSearch configuration. Every value below is a default; delete anything
+# you don't override. Environment overrides use the RSEARCH_ prefix with
+# __ between nested keys, e.g. RSEARCH_HTTP__TLS__ENABLED=true.
+
+[node]
+# id defaults to the machine hostname when unset.
+# id = "ingest-1"
+cluster_name = "rsearch"
+# Roles this node runs unless --roles is passed on the command line.
+roles = ["ingest", "search", "control"]
+# Node-local state: WAL, split cache, staging.
+data_dir = "./data"
+
+[http]
+bind_addr = "0.0.0.0:9200"
+
+[http.tls]
+# Production should terminate TLS here (FIPS provider) or at a FIPS-validated
+# load balancer. When enabled, both paths are required.
+enabled = false
+cert_path = ""
+key_path = ""
+
+[storage]
+# "fs" (local disk) or "s3" (AWS S3 or any S3-compatible endpoint).
+backend = "fs"
+# fs backend:
+root = "./data/storage"
+# s3 backend:
+bucket = ""
+endpoint = ""            # custom endpoint for MinIO/S3-compatible; empty = AWS
+force_path_style = false # required by MinIO
+use_fips_endpoint = false # AWS FIPS endpoints (GovCloud)
+region = ""              # defaults to us-east-1; any value works for MinIO
+# Static credentials for self-hosted / air-gapped installs. When set, the
+# AWS credential chain (and IMDS) is never consulted. Leave empty on AWS to
+# use IAM task/instance roles.
+access_key_id = ""
+secret_access_key = ""
+
+[metastore]
+# Empty reads the DATABASE_URL environment variable. Postgres must use
+# scram-sha-256 authentication (default since Postgres 14).
+database_url = ""
+max_connections = 10
+
+[ingest]
+max_batch_docs = 500000  # cut a split at this many buffered docs...
+max_batch_secs = 30      # ...or when the oldest doc reaches this age
+queue_capacity = 100000  # per-stream in-flight bound before 429s
+memory_budget_mb = 256   # tantivy writer heap per stream worker
+wal_segment_mb = 64      # WAL segment rotation size
+
+[search]
+cache_max_mb = 4096      # local split-fragment cache budget
+
+[control]
+interval_secs = 15       # background-job tick on the elected leader
+merge_min_mb = 100       # published splits smaller than this get merged
+merge_max_group = 8      # max splits combined per merge
+gc_grace_secs = 600      # delay before deleting marked-for-delete splits
+
+# Network log inputs (disabled by default). Each routes to a stream and is
+# subject to routing rules.
+[inputs.syslog]
+enabled = false
+bind_udp = "0.0.0.0:5514"   # empty disables UDP
+bind_tcp = "0.0.0.0:5514"   # empty disables TCP
+tls_cert_path = ""          # both set = TLS on the TCP listener (FIPS)
+tls_key_path = ""
+stream = "syslog"
+
+[inputs.gelf]
+enabled = false
+bind_tcp = "0.0.0.0:12201"
+tls_cert_path = ""
+tls_key_path = ""
+stream = "gelf"

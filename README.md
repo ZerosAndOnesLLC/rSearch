@@ -50,7 +50,9 @@ authentication** (the default since Postgres 14).
 
 ## Status
 
-Early development. See `working-plan.md` for the build plan.
+v1 core complete. See `working-plan.md` for the phase breakdown and
+`BENCHMARKS.md` for the rSearch-vs-OpenSearch gate results (~9× less
+memory, ~5× less CPU at 5k events/s, query-latency parity).
 
 ## Architecture (short version)
 
@@ -60,3 +62,66 @@ Postgres metastore tracks splits, streams, nodes, and retention. Stateless
 search nodes prune splits by time range via the metastore and execute
 queries directly against storage through a local cache. One binary runs any
 combination of roles: `rsearch --roles ingest,search,control`.
+
+## Quick start
+
+```bash
+# 1. dependencies (Postgres 14+ with scram-sha-256, object storage or local disk)
+docker compose up -d postgres minio    # or bring your own
+
+# 2. build (FIPS module needs CMake + Go on the build host)
+cargo build --release
+
+# 3. run a single-node cluster (all roles)
+export DATABASE_URL=postgres://rsearch:rsearch@localhost:5432/rsearch
+./target/release/rsearch --roles ingest,search,control
+```
+
+Migrations run automatically at startup. On first boot, auth is in
+**bootstrap mode** (a startup warning is logged); create the first admin
+to arm enforcement cluster-wide:
+
+```bash
+curl -XPUT localhost:9200/_rsearch/users/admin \
+  -d '{"password":"choose-a-strong-one"}'
+```
+
+A reference multi-node topology (2 ingest + 2 search + 1 control over
+Postgres and MinIO) is in `docker-compose.yml`; the kill-a-node test
+suite that exercises it is `tests/cluster/run-cluster-test.sh`.
+
+## Configuration
+
+Config loads from an optional TOML file (`--config`) with `RSEARCH_`
+environment overrides (nested keys use `__`, e.g.
+`RSEARCH_HTTP__TLS__ENABLED=true`). See `rsearch.example.toml` for the
+full annotated set. Storage backends — S3, S3-compatible (MinIO), and
+local filesystem — are equal citizens; self-hosted/air-gapped
+deployments use static credentials in config so the AWS credential chain
+and IMDS are never touched.
+
+## API surface (OpenSearch-compatible subset)
+
+| Area | Endpoints |
+|------|-----------|
+| Ingest | `POST /_bulk`, `POST /{index}/_bulk` |
+| Search | `POST /{index}/_search`, `POST /_msearch`, `GET /{index}/_mapping` |
+| Index admin | `PUT /{index}` (mapping), `GET /_cat/indices` |
+| Cluster | `GET /`, `GET /_cluster/health`, `GET /_cat/nodes` |
+| Streams | `PUT /_rsearch/streams/{name}/retention`, routing rules under `/_rsearch/routing_rules` |
+| Alerts | `PUT/GET/DELETE /_rsearch/alerts[/{name}]` (scheduled query → webhook) |
+| Auth | `POST /_rsearch/login`, users/api_keys under `/_rsearch/` |
+
+Query DSL subset: `match_all`, `bool`, `term`, `terms`, `range`,
+`exists`, `match`, `match_phrase`, `query_string`. Aggregations pass
+through Tantivy's ES-compatible module (terms, date_histogram, stats,
+percentiles, cardinality, …).
+
+Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
+GELF (TCP), each routable to a stream and subject to routing rules.
+
+## Web console
+
+`ui/` is a Next.js app (search, streams/retention, alerts, users & API
+keys). `cd ui && npm install && npm run build`. Point it at the API with
+`NEXT_PUBLIC_RSEARCH_API`.
