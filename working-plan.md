@@ -63,7 +63,7 @@ cargo check clean before every commit.
 - [x] 2.2 S3 backend via aws-sdk-s3: custom endpoint support (MinIO), path-style
       addressing option, `use_fips` config, retry policy; integration test
       against MinIO container
-- [ ] 2.3 Mapping subset: ES-style mapping JSON → Tantivy schema (keyword, text,
+- [x] 2.3 Mapping subset: ES-style mapping JSON → Tantivy schema (keyword, text,
       long, double, boolean, date, ip); dynamic defaults for unmapped fields;
       `_timestamp` fast field mandatory
 - [ ] 2.4 Split builder: batch of docs → Tantivy segments → single immutable

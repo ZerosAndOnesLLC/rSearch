@@ -1,0 +1,247 @@
+use std::net::IpAddr;
+
+use tantivy::TantivyDocument;
+use tantivy::time::OffsetDateTime;
+use tantivy::time::format_description::well_known::Rfc3339;
+
+use crate::error::{IndexError, IndexResult};
+use crate::mapping::{FieldType, MappedSchema};
+
+/// Extract a document timestamp from `@timestamp` or `timestamp` fields.
+/// Accepts RFC 3339 strings, epoch seconds, or epoch milliseconds
+/// (numbers >= 1e12 are treated as milliseconds).
+pub fn extract_timestamp(doc: &serde_json::Value) -> Option<tantivy::DateTime> {
+    let value = doc.get("@timestamp").or_else(|| doc.get("timestamp"))?;
+    parse_timestamp(value)
+}
+
+fn parse_timestamp(value: &serde_json::Value) -> Option<tantivy::DateTime> {
+    match value {
+        serde_json::Value::String(s) => OffsetDateTime::parse(s, &Rfc3339)
+            .ok()
+            .map(tantivy::DateTime::from_utc),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i >= 1_000_000_000_000 {
+                    Some(tantivy::DateTime::from_timestamp_millis(i))
+                } else {
+                    Some(tantivy::DateTime::from_timestamp_secs(i))
+                }
+            } else {
+                n.as_f64()
+                    .map(|f| tantivy::DateTime::from_timestamp_millis((f * 1000.0) as i64))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Converts raw JSON log documents into Tantivy documents according to a
+/// [`MappedSchema`]: mapped fields are indexed with their declared type,
+/// everything else lands in the `_dynamic` JSON field, and the original
+/// document is stored verbatim in `_source`.
+pub struct DocumentConverter {
+    schema: MappedSchema,
+}
+
+impl DocumentConverter {
+    pub fn new(schema: MappedSchema) -> Self {
+        Self { schema }
+    }
+
+    pub fn schema(&self) -> &MappedSchema {
+        &self.schema
+    }
+
+    /// Convert one document. `fallback_timestamp` is used when the document
+    /// carries no parseable `@timestamp`/`timestamp` (normally ingest time).
+    /// Returns the converted document and its effective timestamp.
+    pub fn convert(
+        &self,
+        doc: &serde_json::Value,
+        fallback_timestamp: tantivy::DateTime,
+    ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
+        let obj = doc
+            .as_object()
+            .ok_or_else(|| IndexError::InvalidDocument("document must be an object".into()))?;
+
+        let timestamp = extract_timestamp(doc).unwrap_or(fallback_timestamp);
+        let mut out = TantivyDocument::new();
+        out.add_date(self.schema.timestamp, timestamp);
+        out.add_text(self.schema.source, doc.to_string());
+
+        let mut dynamic = serde_json::Map::new();
+        for (key, value) in obj {
+            match self.schema.fields.get(key) {
+                Some((field, ty)) => {
+                    for item in flatten(value) {
+                        add_typed(&mut out, *field, *ty, item);
+                    }
+                }
+                None => {
+                    dynamic.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        if !dynamic.is_empty() {
+            out.add_object(
+                self.schema.dynamic,
+                dynamic
+                    .into_iter()
+                    .map(|(k, v)| (k, tantivy::schema::OwnedValue::from(v)))
+                    .collect(),
+            );
+        }
+        Ok((out, timestamp))
+    }
+}
+
+/// Arrays index each element; everything else is a single value.
+fn flatten(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    }
+}
+
+/// Best-effort coercion in the ES spirit: values that don't fit the mapped
+/// type are dropped rather than failing the whole document.
+fn add_typed(
+    out: &mut TantivyDocument,
+    field: tantivy::schema::Field,
+    ty: FieldType,
+    value: &serde_json::Value,
+) {
+    match ty {
+        FieldType::Keyword | FieldType::Text => {
+            if let Some(s) = value.as_str() {
+                out.add_text(field, s);
+            } else if !value.is_null() {
+                out.add_text(field, value.to_string());
+            }
+        }
+        FieldType::Long => {
+            if let Some(i) = value.as_i64() {
+                out.add_i64(field, i);
+            } else if let Some(s) = value.as_str()
+                && let Ok(i) = s.parse::<i64>()
+            {
+                out.add_i64(field, i);
+            }
+        }
+        FieldType::Double => {
+            if let Some(f) = value.as_f64() {
+                out.add_f64(field, f);
+            } else if let Some(s) = value.as_str()
+                && let Ok(f) = s.parse::<f64>()
+            {
+                out.add_f64(field, f);
+            }
+        }
+        FieldType::Boolean => {
+            if let Some(b) = value.as_bool() {
+                out.add_bool(field, b);
+            } else if let Some(s) = value.as_str()
+                && let Ok(b) = s.parse::<bool>()
+            {
+                out.add_bool(field, b);
+            }
+        }
+        FieldType::Date => {
+            if let Some(ts) = parse_timestamp(value) {
+                out.add_date(field, ts);
+            }
+        }
+        FieldType::Ip => {
+            if let Some(s) = value.as_str()
+                && let Ok(ip) = s.parse::<IpAddr>()
+            {
+                let ipv6 = match ip {
+                    IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                    IpAddr::V6(v6) => v6,
+                };
+                out.add_ip_addr(field, ipv6);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::IndexMapping;
+
+    fn converter() -> DocumentConverter {
+        let mapping = IndexMapping::from_json(&serde_json::json!({
+            "properties": {
+                "service": {"type": "keyword"},
+                "message": {"type": "text"},
+                "status": {"type": "long"},
+                "client": {"type": "ip"},
+            }
+        }))
+        .unwrap();
+        DocumentConverter::new(MappedSchema::build(mapping))
+    }
+
+    fn fallback() -> tantivy::DateTime {
+        tantivy::DateTime::from_timestamp_secs(1_700_000_000)
+    }
+
+    #[test]
+    fn converts_mapped_and_dynamic_fields() {
+        let c = converter();
+        let (doc, ts) = c
+            .convert(
+                &serde_json::json!({
+                    "@timestamp": "2026-07-24T01:02:03Z",
+                    "service": "api",
+                    "message": "user login ok",
+                    "status": 200,
+                    "client": "10.1.2.3",
+                    "extra_field": {"nested": "value"},
+                }),
+                fallback(),
+            )
+            .unwrap();
+        assert_ne!(ts, fallback());
+        // _source + _timestamp + 4 mapped + _dynamic
+        assert!(doc.field_values().count() >= 6);
+    }
+
+    #[test]
+    fn uses_fallback_when_timestamp_missing() {
+        let c = converter();
+        let (_, ts) = c
+            .convert(&serde_json::json!({"message": "no ts"}), fallback())
+            .unwrap();
+        assert_eq!(ts, fallback());
+    }
+
+    #[test]
+    fn epoch_millis_and_secs_both_parse() {
+        let millis = extract_timestamp(&serde_json::json!({"timestamp": 1_753_300_000_000_i64}))
+            .unwrap();
+        let secs = extract_timestamp(&serde_json::json!({"timestamp": 1_753_300_000})).unwrap();
+        assert_eq!(millis, secs);
+    }
+
+    #[test]
+    fn rejects_non_object_documents() {
+        let c = converter();
+        assert!(c.convert(&serde_json::json!([1, 2]), fallback()).is_err());
+    }
+
+    #[test]
+    fn arrays_index_each_element() {
+        let c = converter();
+        let (doc, _) = c
+            .convert(
+                &serde_json::json!({"service": ["a", "b"], "status": [1, 2, 3]}),
+                fallback(),
+            )
+            .unwrap();
+        // 2 service + 3 status + _source + _timestamp
+        assert_eq!(doc.field_values().count(), 7);
+    }
+}
