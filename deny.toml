@@ -14,10 +14,13 @@ deny = [
     { crate = "openssl-sys", reason = "system OpenSSL is not the validated module; use rustls + aws-lc-rs FIPS" },
     { crate = "native-tls", reason = "delegates to platform TLS outside the validated module" },
     # Non-approved algorithms for security functions.
-    # Exception: aws-smithy-checksums uses MD5 solely for the S3
+    # Exceptions: (1) aws-smithy-checksums uses MD5 solely for the S3
     # Content-MD5 wire-protocol integrity header — a non-security use
-    # permitted under FIPS. Any other consumer of md-5 stays banned.
-    { crate = "md-5", reason = "MD5 is not FIPS-approved", wrappers = ["aws-smithy-checksums"] },
+    # permitted under FIPS. (2) sqlx-postgres carries MD5 only for the
+    # legacy Postgres md5 auth method; deployments MUST use scram-sha-256
+    # (the Postgres 14+ default), making it dead code on the wire.
+    # Any other consumer of md-5 stays banned.
+    { crate = "md-5", reason = "MD5 is not FIPS-approved", wrappers = ["aws-smithy-checksums", "sqlx-postgres", "sqlx-macros-core"] },
     { crate = "md5", reason = "MD5 is not FIPS-approved" },
     { crate = "sha1_smol", reason = "SHA-1 is not FIPS-approved for new signatures" },
     { crate = "argon2", reason = "not FIPS-approved; use PBKDF2-HMAC-SHA256" },

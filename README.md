@@ -42,6 +42,12 @@ Passwords (phase 9) use PBKDF2-HMAC-SHA256. Non-security hashing
 (document IDs, cache keys) uses clearly non-cryptographic hashes so
 intent stays auditable.
 
+Documented `deny.toml` exceptions (both wire-protocol legacy, not
+security functions): S3 Content-MD5 integrity headers
+(aws-smithy-checksums), and the unused Postgres legacy md5 auth path in
+sqlx — **deployments must configure Postgres with `scram-sha-256`
+authentication** (the default since Postgres 14).
+
 ## Status
 
 Early development. See `working-plan.md` for the build plan.

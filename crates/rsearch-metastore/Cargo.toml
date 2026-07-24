@@ -7,3 +7,12 @@ publish.workspace = true
 
 [dependencies]
 rsearch-common.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+tokio.workspace = true

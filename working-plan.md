@@ -77,9 +77,9 @@ cargo check clean before every commit.
       `splits` (stream_id, time_range, state, size, doc_count, footer offsets),
       `nodes`, `retention_policies`; indexes for the split-listing query
       (stream + time range + state)
-- [ ] 3.2 Metastore API: stage/publish/mark-for-delete split state machine;
+- [x] 3.2 Metastore API: stage/publish/mark-for-delete split state machine;
       list-splits-for-query; all queries explicit columns, no `SELECT *`
-- [ ] 3.3 Node registry: heartbeat upsert loop; stale-node detection;
+- [x] 3.3 Node registry: heartbeat upsert loop; stale-node detection;
       `/_cat/nodes`
 
 ## Phase 4 — Ingest path
