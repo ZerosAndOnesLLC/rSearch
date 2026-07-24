@@ -1,4 +1,6 @@
 mod admin_api;
+mod auth;
+mod auth_api;
 mod bulk_api;
 mod control;
 mod routes;
@@ -139,7 +141,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = routes::router(AppState::new(&config, &roles, metastore, pipeline, search));
+    let state = AppState::new(&config, &roles, metastore, pipeline, search);
+    state.auth.spawn_refresher(state.metastore.clone());
+    let app = routes::router(state);
 
     if config.http.tls.enabled {
         let tls_config = rsearch_common::tls::fips_server_config(&config.http.tls.cert_path, &config.http.tls.key_path)?;

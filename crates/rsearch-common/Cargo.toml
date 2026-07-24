@@ -14,3 +14,4 @@ tracing-subscriber.workspace = true
 config.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+aws-lc-rs.workspace = true

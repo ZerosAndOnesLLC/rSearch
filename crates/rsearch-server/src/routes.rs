@@ -44,6 +44,27 @@ pub fn router(state: AppState) -> Router {
             "/_rsearch/streams/{name}/retention",
             axum::routing::put(crate::admin_api::put_retention),
         )
+        .route("/_rsearch/login", post(crate::auth_api::login))
+        .route(
+            "/_rsearch/users",
+            get(crate::auth_api::list_users),
+        )
+        .route(
+            "/_rsearch/users/{name}",
+            axum::routing::put(crate::auth_api::put_user).delete(crate::auth_api::delete_user),
+        )
+        .route(
+            "/_rsearch/api_keys",
+            post(crate::auth_api::create_api_key).get(crate::auth_api::list_api_keys),
+        )
+        .route(
+            "/_rsearch/api_keys/{name}",
+            axum::routing::delete(crate::auth_api::delete_api_key),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require,
+        ))
         // ES 8.x clients refuse to talk without the product header.
         .layer(axum::middleware::map_response(
             |mut response: axum::response::Response| async {

@@ -151,13 +151,13 @@ cargo check clean before every commit.
 
 ## Phase 9 — AuthN/Z
 
-- [ ] 9.1 Users with PBKDF2-HMAC-SHA256 password storage; session tokens for
+- [x] 9.1 Users with PBKDF2-HMAC-SHA256 password storage; session tokens for
       the UI; standalone auth (no tv-api dependency — this ships to customers)
-- [ ] 9.2 API keys for shippers/automation, scoped to streams + actions
+- [x] 9.2 API keys for shippers/automation, scoped to streams + actions
       (ingest/search/admin)
-- [ ] 9.3 RBAC: roles with per-stream read/write grants; enforcement in ingest
+- [x] 9.3 RBAC: roles with per-stream read/write grants; enforcement in ingest
       and search paths
-- [ ] 9.4 Audit log: auth events + admin mutations to a dedicated internal
+- [x] 9.4 Audit log: auth events + admin mutations to a dedicated internal
       stream
 
 ## Phase 10 — Alerting & UI

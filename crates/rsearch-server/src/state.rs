@@ -17,6 +17,7 @@ pub struct AppState {
     pub pipeline: Option<IngestPipeline>,
     /// Present only on nodes running the search role.
     pub search: Option<Arc<SearchService>>,
+    pub auth: crate::auth::AuthState,
 }
 
 impl AppState {
@@ -34,6 +35,28 @@ impl AppState {
             metastore,
             pipeline,
             search,
+            auth: crate::auth::AuthState::default(),
+        }
+    }
+
+    /// Record a security-relevant event to the `rsearch-audit` stream
+    /// (when this node ingests) and the process log.
+    pub async fn audit(&self, action: &str, subject: &str, detail: &str) {
+        tracing::info!(action, subject, detail, "audit");
+        if let Some(pipeline) = &self.pipeline {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let doc = serde_json::json!({
+                "@timestamp": now_ms,
+                "action": action,
+                "subject": subject,
+                "detail": detail,
+                "node": self.node_id,
+                "source": "audit",
+            });
+            let _ = pipeline.ingest_external("rsearch-audit", vec![doc]).await;
         }
     }
 }

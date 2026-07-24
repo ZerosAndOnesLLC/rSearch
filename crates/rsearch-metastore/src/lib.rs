@@ -2,6 +2,7 @@
 //! split lifecycle (staged → published → marked_for_delete), and node
 //! liveness. All cross-node state lives here or in object storage.
 
+mod auth;
 mod control;
 mod error;
 mod metastore;
@@ -9,6 +10,7 @@ mod nodes;
 mod routing;
 mod types;
 
+pub use auth::{ApiKeyRecord, UserRecord};
 pub use control::CONTROL_LEADER_LOCK;
 pub use routing::RoutingRuleRecord;
 
