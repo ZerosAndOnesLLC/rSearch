@@ -2245,6 +2245,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsearch-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rsearch-common"
 version = "0.1.0"
 dependencies = [

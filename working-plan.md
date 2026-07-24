@@ -115,7 +115,7 @@ cargo check clean before every commit.
 
 ## Phase 6 — Benchmark gate (go/no-go)
 
-- [ ] 6.1 Replay harness: tool that replays a captured day of real logs at
+- [x] 6.1 Replay harness: tool that replays a captured day of real logs at
       controlled rates against any `_bulk` endpoint
 - [ ] 6.2 Side-by-side vs OpenSearch container: ingest CPU/RSS at 5k and 10k
       eps, query p50/p99 for needle, range-scan, and date_histogram queries,

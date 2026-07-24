@@ -8,6 +8,7 @@ members = [
     "crates/rsearch-ingest",
     "crates/rsearch-search",
     "crates/rsearch-server",
+    "crates/rsearch-bench",
 ]
 
 [workspace.package]

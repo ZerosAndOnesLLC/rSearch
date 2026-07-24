@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/_msearch", post(search_api::msearch))
         .route("/{index}/_mapping", get(search_api::get_mapping))
+        .route("/{index}", axum::routing::put(search_api::put_index))
         // ES 8.x clients refuse to talk without the product header.
         .layer(axum::middleware::map_response(
             |mut response: axum::response::Response| async {

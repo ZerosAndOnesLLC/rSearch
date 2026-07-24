@@ -204,6 +204,55 @@ pub async fn get_mapping(State(state): State<AppState>, Path(index): Path<String
     }
 }
 
+/// PUT /{index} — create (or update the mapping of) a stream.
+pub async fn put_index(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+    body: String,
+) -> Response {
+    let body_json: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return es_error(
+                    StatusCode::BAD_REQUEST,
+                    "parse_exception",
+                    &format!("invalid body: {e}"),
+                );
+            }
+        }
+    };
+    let mapping = body_json.get("mappings").cloned().unwrap_or(json!({}));
+    // Validate before storing.
+    if let Err(e) = rsearch_index::IndexMapping::from_json(&mapping) {
+        return es_error(
+            StatusCode::BAD_REQUEST,
+            "mapper_parsing_exception",
+            &e.to_string(),
+        );
+    }
+    let result = async {
+        state.metastore.ensure_stream(&index).await?;
+        state.metastore.update_stream_mapping(&index, &mapping).await
+    }
+    .await;
+    match result {
+        Ok(()) => Json(json!({
+            "acknowledged": true,
+            "shards_acknowledged": true,
+            "index": index,
+        }))
+        .into_response(),
+        Err(e) => es_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &e.to_string(),
+        ),
+    }
+}
+
 /// GET / — the version handshake clients and shippers probe.
 pub async fn root(State(state): State<AppState>) -> Json<Value> {
     Json(json!({

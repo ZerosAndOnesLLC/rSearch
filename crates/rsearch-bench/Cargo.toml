@@ -1,0 +1,20 @@
+[package]
+name = "rsearch-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rsearch-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes.workspace = true
