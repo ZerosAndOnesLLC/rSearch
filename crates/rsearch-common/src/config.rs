@@ -16,6 +16,7 @@ pub struct RsearchConfig {
     pub ingest: IngestConfig,
     pub search: SearchConfig,
     pub control: ControlConfig,
+    pub inputs: InputsConfig,
 }
 
 impl Default for RsearchConfig {
@@ -28,6 +29,65 @@ impl Default for RsearchConfig {
             ingest: IngestConfig::default(),
             search: SearchConfig::default(),
             control: ControlConfig::default(),
+            inputs: InputsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InputsConfig {
+    pub syslog: SyslogInputConfig,
+    pub gelf: GelfInputConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyslogInputConfig {
+    pub enabled: bool,
+    /// UDP bind address; empty disables UDP.
+    pub bind_udp: String,
+    /// TCP bind address (newline-framed); empty disables TCP.
+    pub bind_tcp: String,
+    /// TLS for the TCP listener (FIPS provider); both paths set = enabled.
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    /// Stream syslog messages are routed to by default.
+    pub stream: String,
+}
+
+impl Default for SyslogInputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_udp: "0.0.0.0:5514".to_string(),
+            bind_tcp: "0.0.0.0:5514".to_string(),
+            tls_cert_path: String::new(),
+            tls_key_path: String::new(),
+            stream: "syslog".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GelfInputConfig {
+    pub enabled: bool,
+    /// TCP bind address (null-byte-framed GELF).
+    pub bind_tcp: String,
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    pub stream: String,
+}
+
+impl Default for GelfInputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_tcp: "0.0.0.0:12201".to_string(),
+            tls_cert_path: String::new(),
+            tls_key_path: String::new(),
+            stream: "gelf".to_string(),
         }
     }
 }

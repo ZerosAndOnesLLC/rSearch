@@ -39,12 +39,27 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
         return error_response(StatusCode::BAD_REQUEST, "empty bulk body");
     }
 
-    // Durability point: append every accepted doc to the WAL, fsync once.
+    // Routing expansion, then the durability point: append every routed
+    // copy to the WAL with a single fsync.
+    let BulkParseOutcome {
+        items, rejections, ..
+    } = outcome;
+    let expanded: Vec<(usize, rsearch_ingest::BulkItem, Vec<String>)> = items
+        .into_iter()
+        .map(|(position, item)| {
+            let routes = pipeline.expand_routes(&item.stream, &item.doc);
+            (position, item, routes)
+        })
+        .collect();
     let wal = pipeline.wal().clone();
-    let wal_items: Vec<(String, Vec<u8>)> = outcome
-        .items
+    let wal_items: Vec<(String, Vec<u8>)> = expanded
         .iter()
-        .map(|(_, item)| (item.stream.clone(), item.doc.to_string().into_bytes()))
+        .flat_map(|(_, item, routes)| {
+            let bytes = item.doc.to_string().into_bytes();
+            routes
+                .iter()
+                .map(move |stream| (stream.clone(), bytes.clone()))
+        })
         .collect();
     let positions = match tokio::task::spawn_blocking(move || wal.append_batch(&wal_items)).await {
         Ok(Ok(positions)) => positions,
@@ -62,62 +77,66 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
         }
     };
 
-    // Enqueue for indexing; saturated items get per-item 429s and their
-    // WAL positions confirmed (the shipper will retry them).
-    let mut responses: Vec<(usize, Value)> = Vec::with_capacity(outcome.total);
-    let BulkParseOutcome {
-        items, rejections, ..
-    } = outcome;
-    for ((position, item), pos) in items.into_iter().zip(positions) {
+    // Enqueue each routed copy; an item succeeds if at least one route
+    // was accepted. Saturated routes get confirmed so the WAL drains.
+    let mut responses: Vec<(usize, Value)> = Vec::new();
+    let mut position_iter = positions.into_iter();
+    for (position, item, routes) in expanded {
         let action = item.action.as_str();
-        match pipeline.enqueue(&item.stream, item.doc, pos).await {
-            Ok(()) => {
-                responses.push((
-                    position,
-                    json!({
-                        action: {
-                            "_index": item.stream,
-                            "_id": item.doc_id,
-                            "_version": 1,
-                            "result": "created",
-                            "status": 201,
-                            "_shards": {"total": 1, "successful": 1, "failed": 0},
-                        }
-                    }),
-                ));
-            }
-            Err(IngestError::Saturated) => {
-                pipeline.wal().confirm(&[pos]);
-                responses.push((
-                    position,
-                    json!({
-                        action: {
-                            "_index": item.stream,
-                            "_id": item.doc_id,
-                            "status": 429,
-                            "error": {
-                                "type": "es_rejected_execution_exception",
-                                "reason": "ingest queue is full; retry with backoff",
-                            }
-                        }
-                    }),
-                ));
-            }
-            Err(e) => {
-                pipeline.wal().confirm(&[pos]);
-                responses.push((
-                    position,
-                    json!({
-                        action: {
-                            "_index": item.stream,
-                            "_id": item.doc_id,
-                            "status": 500,
-                            "error": {"type": "internal_error", "reason": e.to_string()},
-                        }
-                    }),
-                ));
+        let mut accepted = 0usize;
+        let mut saturated = false;
+        let mut internal_error: Option<String> = None;
+        for stream in &routes {
+            let pos = position_iter.next().expect("position per routed copy");
+            match pipeline.enqueue(stream, item.doc.clone(), pos).await {
+                Ok(()) => accepted += 1,
+                Err(IngestError::Saturated) => {
+                    pipeline.wal().confirm(&[pos]);
+                    saturated = true;
+                }
+                Err(e) => {
+                    pipeline.wal().confirm(&[pos]);
+                    internal_error = Some(e.to_string());
+                }
             }
         }
+        let entry = if accepted > 0 {
+            json!({
+                action: {
+                    "_index": item.stream,
+                    "_id": item.doc_id,
+                    "_version": 1,
+                    "result": "created",
+                    "status": 201,
+                    "_shards": {"total": 1, "successful": 1, "failed": 0},
+                }
+            })
+        } else if saturated {
+            json!({
+                action: {
+                    "_index": item.stream,
+                    "_id": item.doc_id,
+                    "status": 429,
+                    "error": {
+                        "type": "es_rejected_execution_exception",
+                        "reason": "ingest queue is full; retry with backoff",
+                    }
+                }
+            })
+        } else {
+            json!({
+                action: {
+                    "_index": item.stream,
+                    "_id": item.doc_id,
+                    "status": 500,
+                    "error": {
+                        "type": "internal_error",
+                        "reason": internal_error.unwrap_or_else(|| "no route accepted".into()),
+                    },
+                }
+            })
+        };
+        responses.push((position, entry));
     }
     for (position, action, index, reason) in rejections {
         responses.push((

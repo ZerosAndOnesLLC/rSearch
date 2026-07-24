@@ -141,12 +141,12 @@ cargo check clean before every commit.
 
 ## Phase 8 — Inputs & streams
 
-- [ ] 8.1 Syslog input: RFC 5424 + RFC 3164 over TLS (FIPS provider) and UDP;
+- [x] 8.1 Syslog input: RFC 5424 + RFC 3164 over TLS (FIPS provider) and UDP;
       parsed fields mapped to stream schema
-- [ ] 8.2 GELF TCP input (null-delimited, TLS)
-- [ ] 8.3 Stream routing rules: match conditions on fields → route/copy to
+- [x] 8.2 GELF TCP input (null-delimited, TLS)
+- [x] 8.3 Stream routing rules: match conditions on fields → route/copy to
       streams; per-stream mapping overrides
-- [ ] 8.4 Per-stream retention configuration surfaced through the API
+- [x] 8.4 Per-stream retention configuration surfaced through the API
       (enforced by 7.4)
 
 ## Phase 9 — AuthN/Z

@@ -59,6 +59,15 @@ impl SplitRecord {
     }
 }
 
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct StreamStats {
+    pub name: String,
+    pub retention_hours: Option<i32>,
+    pub split_count: i64,
+    pub doc_count: i64,
+    pub size_bytes: i64,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct NodeRecord {
     pub id: String,

@@ -4,7 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 use rsearch_common::config::MetastoreConfig;
 
 use crate::error::{MetastoreError, MetastoreResult};
-use crate::types::{SplitRecord, SplitState, StreamRecord};
+use crate::types::{SplitRecord, SplitState, StreamRecord, StreamStats};
 
 const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
      size_bytes, time_start_millis, time_end_millis, footer_len, created_by";
@@ -63,6 +63,22 @@ impl Metastore {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| MetastoreError::StreamNotFound(name.to_string()))
+    }
+
+    /// Per-stream stats over published splits (for `_cat/indices`).
+    pub async fn stream_stats(&self) -> MetastoreResult<Vec<StreamStats>> {
+        Ok(sqlx::query_as::<_, StreamStats>(
+            "SELECT st.name, st.retention_hours,
+                    COUNT(s.id) FILTER (WHERE s.state = 'published') AS split_count,
+                    COALESCE(SUM(s.doc_count) FILTER (WHERE s.state = 'published'), 0)::bigint AS doc_count,
+                    COALESCE(SUM(s.size_bytes) FILTER (WHERE s.state = 'published'), 0)::bigint AS size_bytes
+             FROM streams st
+             LEFT JOIN splits s ON s.stream_id = st.id
+             GROUP BY st.id
+             ORDER BY st.name",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn get_stream_by_id(&self, id: i64) -> MetastoreResult<StreamRecord> {

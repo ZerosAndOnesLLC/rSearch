@@ -6,10 +6,12 @@ mod control;
 mod error;
 mod metastore;
 mod nodes;
+mod routing;
 mod types;
 
 pub use control::CONTROL_LEADER_LOCK;
+pub use routing::RoutingRuleRecord;
 
 pub use error::{MetastoreError, MetastoreResult};
 pub use metastore::Metastore;
-pub use types::{NodeRecord, SplitRecord, SplitState, StreamRecord};
+pub use types::{NodeRecord, SplitRecord, SplitState, StreamRecord, StreamStats};

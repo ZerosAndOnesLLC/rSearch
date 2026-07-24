@@ -1,9 +1,10 @@
+mod admin_api;
 mod bulk_api;
 mod control;
 mod routes;
 mod search_api;
 mod state;
-mod tls;
+
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -86,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
         if replay_count > 0 {
             info!(replay_count, "WAL replay complete");
         }
+        rsearch_ingest::spawn_inputs(&config.inputs, pipeline.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("starting log inputs")?;
         Some(pipeline)
     } else {
         None
@@ -137,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let app = routes::router(AppState::new(&config, &roles, metastore, pipeline, search));
 
     if config.http.tls.enabled {
-        let tls_config = tls::server_config(&config.http.tls.cert_path, &config.http.tls.key_path)?;
+        let tls_config = rsearch_common::tls::fips_server_config(&config.http.tls.cert_path, &config.http.tls.key_path)?;
         let addr: std::net::SocketAddr = config
             .http
             .bind_addr

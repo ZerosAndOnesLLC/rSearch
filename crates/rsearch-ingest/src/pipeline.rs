@@ -52,6 +52,8 @@ struct PipelineInner {
     wal: Arc<Wal>,
     workers: tokio::sync::Mutex<HashMap<String, mpsc::Sender<WorkItem>>>,
     metrics: IngestMetrics,
+    /// Routing rules, refreshed periodically from the metastore.
+    rules: std::sync::RwLock<Arc<Vec<rsearch_metastore::RoutingRuleRecord>>>,
 }
 
 #[derive(Clone)]
@@ -74,7 +76,7 @@ impl IngestPipeline {
         metastore: Metastore,
         wal: Arc<Wal>,
     ) -> Self {
-        Self {
+        let pipeline = Self {
             inner: Arc::new(PipelineInner {
                 config,
                 storage,
@@ -82,8 +84,103 @@ impl IngestPipeline {
                 wal,
                 workers: tokio::sync::Mutex::new(HashMap::new()),
                 metrics: IngestMetrics::default(),
+                rules: std::sync::RwLock::new(Arc::new(Vec::new())),
             }),
+        };
+        // Keep the routing-rule cache warm.
+        let inner = pipeline.inner.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                match inner.metastore.list_routing_rules().await {
+                    Ok(rules) => *inner.rules.write().unwrap() = Arc::new(rules),
+                    Err(e) => warn!(error = %e, "routing rule refresh failed"),
+                }
+            }
+        });
+        pipeline
+    }
+
+    /// Resolve where a document should go: the default stream unless a
+    /// `move` rule matches; `copy` rules add extra destinations.
+    pub fn expand_routes(&self, default_stream: &str, doc: &Value) -> Vec<String> {
+        let rules = self.inner.rules.read().unwrap().clone();
+        let mut primary = default_stream.to_string();
+        let mut extra: Vec<String> = Vec::new();
+        for rule in rules.iter() {
+            let matched = match (rule.op.as_str(), doc.get(&rule.field)) {
+                (_, None) => false,
+                ("exists", Some(_)) => true,
+                ("eq", Some(v)) => {
+                    v.as_str().map(|s| s == rule.value).unwrap_or_else(|| {
+                        v.to_string() == rule.value
+                    })
+                }
+                ("contains", Some(v)) => {
+                    v.as_str().map(|s| s.contains(&rule.value)).unwrap_or(false)
+                }
+                _ => false,
+            };
+            if matched {
+                if rule.copy {
+                    extra.push(rule.target_stream.clone());
+                } else {
+                    primary = rule.target_stream.clone();
+                }
+            }
         }
+        let mut routes = vec![primary];
+        for stream in extra {
+            if !routes.contains(&stream) {
+                routes.push(stream);
+            }
+        }
+        routes
+    }
+
+    /// Ingest documents from a non-HTTP input (syslog, GELF): apply
+    /// routing, WAL-append the batch, enqueue. Saturated docs are dropped
+    /// with a warning (datagram sources have no backpressure channel).
+    /// Returns (accepted, dropped).
+    pub async fn ingest_external(
+        &self,
+        default_stream: &str,
+        docs: Vec<Value>,
+    ) -> IngestResult<(usize, usize)> {
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        for doc in docs {
+            for stream in self.expand_routes(default_stream, &doc) {
+                pairs.push((stream, doc.clone()));
+            }
+        }
+        if pairs.is_empty() {
+            return Ok((0, 0));
+        }
+        let wal = self.inner.wal.clone();
+        let wal_items: Vec<(String, Vec<u8>)> = pairs
+            .iter()
+            .map(|(stream, doc)| (stream.clone(), doc.to_string().into_bytes()))
+            .collect();
+        let positions = tokio::task::spawn_blocking(move || wal.append_batch(&wal_items))
+            .await
+            .map_err(|e| IngestError::Wal(std::io::Error::other(e.to_string())))??;
+
+        let mut accepted = 0;
+        let mut dropped = 0;
+        for ((stream, doc), pos) in pairs.into_iter().zip(positions) {
+            match self.enqueue(&stream, doc, pos).await {
+                Ok(()) => accepted += 1,
+                Err(_) => {
+                    self.inner.wal.confirm(&[pos]);
+                    dropped += 1;
+                }
+            }
+        }
+        if dropped > 0 {
+            warn!(dropped, "input documents dropped (ingest saturated)");
+        }
+        Ok((accepted, dropped))
     }
 
     pub fn metrics(&self) -> &IngestMetrics {

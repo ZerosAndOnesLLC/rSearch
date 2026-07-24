@@ -33,6 +33,17 @@ pub fn router(state: AppState) -> Router {
         .route("/_msearch", post(search_api::msearch))
         .route("/{index}/_mapping", get(search_api::get_mapping))
         .route("/{index}", axum::routing::put(search_api::put_index))
+        .route("/_cat/indices", get(crate::admin_api::cat_indices))
+        .route("/_rsearch/routing_rules", get(crate::admin_api::list_rules))
+        .route(
+            "/_rsearch/routing_rules/{name}",
+            axum::routing::put(crate::admin_api::put_rule)
+                .delete(crate::admin_api::delete_rule),
+        )
+        .route(
+            "/_rsearch/streams/{name}/retention",
+            axum::routing::put(crate::admin_api::put_retention),
+        )
         // ES 8.x clients refuse to talk without the product header.
         .layer(axum::middleware::map_response(
             |mut response: axum::response::Response| async {
