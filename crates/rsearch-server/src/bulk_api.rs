@@ -82,26 +82,16 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
     let mut responses: Vec<(usize, Value)> = Vec::new();
     let mut position_iter = positions.into_iter();
     for (position, item, routes) in expanded {
-        // Pull out what the response needs so the doc Value can be moved
-        // into enqueue on the final route (no clone in the common
-        // single-route case).
         let action = item.action.as_str();
         let stream_name = item.stream;
         let doc_id = item.doc_id;
         let raw = item.raw;
-        let mut doc = Some(item.doc);
         let mut accepted = 0usize;
         let mut saturated = false;
         let mut internal_error: Option<String> = None;
-        let n_routes = routes.len();
-        for (i, stream) in routes.iter().enumerate() {
+        for stream in routes.iter() {
             let pos = position_iter.next().expect("position per routed copy");
-            let doc_value = if i + 1 == n_routes {
-                doc.take().unwrap()
-            } else {
-                doc.clone().unwrap()
-            };
-            match pipeline.enqueue(stream, doc_value, raw.clone(), pos).await {
+            match pipeline.enqueue(stream, raw.clone(), pos).await {
                 Ok(()) => accepted += 1,
                 Err(IngestError::Saturated) => {
                     pipeline.wal().confirm(&[pos]);

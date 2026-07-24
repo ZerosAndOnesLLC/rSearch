@@ -30,8 +30,10 @@ pub struct PipelineConfig {
 }
 
 struct WorkItem {
-    doc: Value,
-    /// Original document bytes, stored verbatim as `_source`.
+    /// Original document bytes. The queue holds only these (not a parsed
+    /// Value, which is several times larger in memory) — the indexer
+    /// re-parses on the blocking thread. Keeps ingest RSS low, which is
+    /// the whole point of the engine.
     source: Arc<str>,
     pos: WalPos,
 }
@@ -182,8 +184,8 @@ impl IngestPipeline {
 
         let mut accepted = 0;
         let mut dropped = 0;
-        for ((stream, doc, source), pos) in pairs.into_iter().zip(positions) {
-            match self.enqueue(&stream, doc, source, pos).await {
+        for ((stream, _doc, source), pos) in pairs.into_iter().zip(positions) {
+            match self.enqueue(&stream, source, pos).await {
                 Ok(()) => accepted += 1,
                 Err(_) => {
                     self.inner.wal.confirm(&[pos]);
@@ -206,20 +208,14 @@ impl IngestPipeline {
     }
 
     /// Enqueue a WAL-durable document for indexing. `source` is the exact
-    /// bytes stored as `_source` (the client's original line — no
-    /// re-serialization). Fails with [`IngestError::Saturated`] when the
-    /// stream's queue is full — the caller reports a per-item 429 and
-    /// confirms the WAL position.
-    pub async fn enqueue(
-        &self,
-        stream: &str,
-        doc: Value,
-        source: Arc<str>,
-        pos: WalPos,
-    ) -> IngestResult<()> {
+    /// document bytes — stored as `_source` and re-parsed by the indexer.
+    /// Fails with [`IngestError::Saturated`] when the stream's queue is
+    /// full — the caller reports a per-item 429 and confirms the WAL
+    /// position.
+    pub async fn enqueue(&self, stream: &str, source: Arc<str>, pos: WalPos) -> IngestResult<()> {
         let tx = self.worker_for(stream).await?;
         let size = source.len() as u64;
-        match tx.try_send(WorkItem { doc, source, pos }) {
+        match tx.try_send(WorkItem { source, pos }) {
             Ok(()) => {
                 self.inner.metrics.docs_enqueued.fetch_add(1, Ordering::Relaxed);
                 self.inner
@@ -239,31 +235,25 @@ impl IngestPipeline {
     pub async fn replay(&self, records: Vec<WalRecord>) -> IngestResult<usize> {
         let count = records.len();
         for record in records {
-            match serde_json::from_slice::<Value>(&record.doc) {
-                Ok(doc) => {
-                    // The WAL payload IS the original source bytes.
-                    let source: Arc<str> =
-                        Arc::from(String::from_utf8_lossy(&record.doc).into_owned());
-                    let tx = self.worker_for(&record.stream).await?;
-                    self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                    if tx
-                        .send(WorkItem {
-                            doc,
-                            source,
-                            pos: record.pos,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        warn!(stream = %record.stream, "worker gone during replay");
-                    }
-                }
-                Err(e) => {
-                    // Unparseable WAL payload: confirm so it doesn't pin
-                    // the segment forever.
-                    warn!(stream = %record.stream, error = %e, "dropping corrupt WAL doc");
-                    self.inner.wal.confirm(&[record.pos]);
-                }
+            // Validate the payload is parseable JSON; the WAL payload IS
+            // the source bytes, so we don't keep the parsed value.
+            if serde_json::from_slice::<serde::de::IgnoredAny>(&record.doc).is_err() {
+                warn!(stream = %record.stream, "dropping corrupt WAL doc");
+                self.inner.wal.confirm(&[record.pos]);
+                continue;
+            }
+            let source: Arc<str> = Arc::from(String::from_utf8_lossy(&record.doc).into_owned());
+            let tx = self.worker_for(&record.stream).await?;
+            self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+            if tx
+                .send(WorkItem {
+                    source,
+                    pos: record.pos,
+                })
+                .await
+                .is_err()
+            {
+                warn!(stream = %record.stream, "worker gone during replay");
             }
         }
         if count > 0 {
@@ -413,7 +403,18 @@ async fn flush_inner(
             let mut builder = SplitBuilder::new(stream_name, schema, &work_dir, budget)?;
             let fallback = now_datetime();
             for item in &batch {
-                builder.add_json_with_source(&item.doc, Some(&item.source), fallback)?;
+                // Parse the source here, on the indexer thread — the queue
+                // only ever held the raw bytes.
+                match serde_json::from_str::<Value>(&item.source) {
+                    Ok(doc) => {
+                        builder.add_json_with_source(&doc, Some(&item.source), fallback)?;
+                    }
+                    Err(e) => {
+                        // Enqueued docs were validated, so this is unexpected;
+                        // skip the bad doc rather than fail the whole batch.
+                        tracing::warn!(error = %e, "skipping unparseable buffered doc");
+                    }
+                }
             }
             builder.finish()
         })();

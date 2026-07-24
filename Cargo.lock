@@ -2344,6 +2344,7 @@ dependencies = [
  "rsearch-index",
  "rsearch-metastore",
  "rsearch-storage",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
