@@ -68,7 +68,7 @@ cargo check clean before every commit.
       `_timestamp` fast field mandatory
 - [x] 2.4 Split builder: batch of docs → Tantivy segments → single immutable
       split file (bundle + footer with hotcache metadata) → upload via `Storage`
-- [ ] 2.5 Split reader: lazy open from footer, byte-range reads through a local
+- [x] 2.5 Split reader: lazy open from footer, byte-range reads through a local
       disk cache with LRU eviction; search a split without downloading it fully
 
 ## Phase 3 — Metastore (Postgres/sqlx)
