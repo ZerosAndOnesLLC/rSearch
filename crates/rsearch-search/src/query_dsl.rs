@@ -47,9 +47,16 @@ fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
 /// `fixed_interval` — Grafana sends all three.
 pub fn rewrite_agg_fields(schema: &MappedSchema, aggs: &Value) -> Value {
     match aggs {
-        Value::Object(map) => Value::Object(
+        Value::Object(map) => {
+            // Only strip display-only params inside an agg parameter block
+            // (identified by a sibling "field" key) — never at the aggs
+            // level, where "format" could be a user's aggregation name (L4).
+            let is_param_block = map.contains_key("field");
+            Value::Object(
             map.iter()
-                .filter(|(k, _)| k.as_str() != "format" && k.as_str() != "time_zone")
+                .filter(|(k, _)| {
+                    !(is_param_block && (k.as_str() == "format" || k.as_str() == "time_zone"))
+                })
                 .map(|(k, v)| {
                     if k == "field"
                         && let Some(name) = v.as_str()
@@ -67,7 +74,8 @@ pub fn rewrite_agg_fields(schema: &MappedSchema, aggs: &Value) -> Value {
                     }
                 })
                 .collect(),
-        ),
+            )
+        }
         Value::Array(items) => Value::Array(
             items.iter().map(|v| rewrite_agg_fields(schema, v)).collect(),
         ),
@@ -96,9 +104,12 @@ fn parse_time_millis(value: &Value) -> Option<i64> {
             if let Some(i) = n.as_i64() {
                 Some(rsearch_index::epoch_to_millis(i))
             } else {
+                // A float epoch is fractional SECONDS — convert directly to
+                // millis; do not re-run the unit heuristic (which would
+                // double-scale small pre-1973 values). L3.
                 n.as_f64()
                     .filter(|f| f.is_finite())
-                    .map(|f| rsearch_index::epoch_to_millis((f * 1000.0) as i64))
+                    .map(|f| (f * 1000.0) as i64)
             }
         }
         _ => None,
@@ -114,6 +125,11 @@ pub fn extract_time_bounds(query: &Value) -> (Option<i64>, Option<i64>) {
     (start, end)
 }
 
+/// Only harvest bounds from conjunctive context: a `range` at the top
+/// level or under `must`/`filter`. A timestamp range under `should` (OR)
+/// or `must_not` (negation) must NOT prune splits — doing so drops
+/// matching documents (H3/H4). Recursion into `should`/`must_not` stops
+/// bound collection for that subtree.
 fn scan_time_bounds(node: &Value, start: &mut Option<i64>, end: &mut Option<i64>) {
     match node {
         Value::Object(map) => {
@@ -135,6 +151,16 @@ fn scan_time_bounds(node: &Value, start: &mut Option<i64>, end: &mut Option<i64>
                         }
                     }
                 }
+            }
+            if let Some(bool_body) = map.get("bool").and_then(Value::as_object) {
+                // Recurse only into conjunctive clauses.
+                for key in ["must", "filter"] {
+                    if let Some(clause) = bool_body.get(key) {
+                        scan_time_bounds(clause, start, end);
+                    }
+                }
+                // should / must_not deliberately skipped.
+                return;
             }
             for value in map.values() {
                 scan_time_bounds(value, start, end);
@@ -609,6 +635,56 @@ mod tests {
         let (start, end) = extract_time_bounds(&query);
         assert_eq!(start, Some(1_753_300_000_000));
         assert_eq!(end, Some(1_753_300_060_000));
+    }
+
+    #[test]
+    fn time_bounds_ignore_must_not_and_should() {
+        // A timestamp range under must_not asks for docs OUTSIDE it — must
+        // not prune (H4).
+        let must_not = serde_json::json!({"bool": {"must_not": [
+            {"range": {"@timestamp": {"gte": 1_753_300_000_000_i64}}}
+        ]}});
+        assert_eq!(extract_time_bounds(&must_not), (None, None));
+
+        // OR of two ranges: intersecting them would drop hits (H4).
+        let should = serde_json::json!({"bool": {"should": [
+            {"range": {"@timestamp": {"gte": 100, "lte": 200}}},
+            {"range": {"@timestamp": {"gte": 900, "lte": 1000}}},
+        ]}});
+        assert_eq!(extract_time_bounds(&should), (None, None));
+
+        // But a must/filter range still prunes.
+        let must = serde_json::json!({"bool": {"must": [
+            {"range": {"@timestamp": {"gte": 1_753_300_000_000_i64}}}
+        ]}});
+        assert_eq!(extract_time_bounds(&must), (Some(1_753_300_000_000), None));
+    }
+
+    #[test]
+    fn float_epoch_seconds_not_double_scaled() {
+        // Pre-1973 fractional epoch seconds: must become millis once, not
+        // twice (L3).
+        let bounds = super::parse_time_millis(&serde_json::json!(1000.5));
+        assert_eq!(bounds, Some(1_000_500));
+    }
+
+    #[test]
+    fn agg_named_format_is_not_dropped() {
+        // A user aggregation literally named "format" must survive; only a
+        // "format" param inside a param block (with "field") is stripped (L4).
+        let s = schema();
+        let aggs = serde_json::json!({
+            "format": {"terms": {"field": "service"}},
+            "by_time": {"date_histogram": {
+                "field": "@timestamp", "fixed_interval": "1m",
+                "format": "epoch_millis", "time_zone": "UTC"
+            }},
+        });
+        let out = rewrite_agg_fields(&s, &aggs);
+        assert!(out.get("format").is_some(), "user agg 'format' was dropped");
+        assert_eq!(out["by_time"]["date_histogram"]["field"], "_timestamp");
+        assert!(out["by_time"]["date_histogram"].get("format").is_none());
+        assert!(out["by_time"]["date_histogram"].get("time_zone").is_none());
     }
 
     #[test]

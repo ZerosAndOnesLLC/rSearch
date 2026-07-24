@@ -62,9 +62,13 @@ pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let mut responses = Vec::new();
+
+    // Parse all header/body pairs first, then run them concurrently — a
+    // Grafana dashboard sends one panel per pair, so serial execution made
+    // dashboard load time the sum of panels instead of the max (M13).
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
     let mut i = 0;
-    while i + 1 < lines.len() || (i < lines.len() && lines.len() % 2 == 0) {
+    while i + 1 <= lines.len().saturating_sub(1) {
         let header: Value = match serde_json::from_str(lines[i]) {
             Ok(v) => v,
             Err(e) => {
@@ -75,10 +79,7 @@ pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
                 );
             }
         };
-        let Some(body_line) = lines.get(i + 1) else {
-            break;
-        };
-        let search_body: Value = match serde_json::from_str(body_line) {
+        let search_body: Value = match serde_json::from_str(lines[i + 1]) {
             Ok(v) => v,
             Err(e) => {
                 return es_error(
@@ -88,39 +89,46 @@ pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
                 );
             }
         };
+        pairs.push((header, search_body));
         i += 2;
-
-        let index_pattern = header
-            .get("index")
-            .map(|v| match v {
-                Value::Array(items) => items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default();
-
-        let result = match resolve_stream(&state, &index_pattern).await {
-            Ok(stream) => match SearchRequest::parse(&stream, &search_body) {
-                Ok(request) => service.search(request).await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            },
-            Err(e) => Err(e),
-        };
-        responses.push(match result {
-            Ok(mut response) => {
-                response["status"] = json!(200);
-                response
-            }
-            Err(reason) => json!({
-                "error": {"type": "search_exception", "reason": reason},
-                "status": 400,
-            }),
-        });
     }
+
+    let futures = pairs.into_iter().map(|(header, search_body)| {
+        let state = &state;
+        let service = &service;
+        async move {
+            let index_pattern = header
+                .get("index")
+                .map(|v| match v {
+                    Value::Array(items) => items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            let result = match resolve_stream(state, &index_pattern).await {
+                Ok(stream) => match SearchRequest::parse(&stream, &search_body) {
+                    Ok(request) => service.search(request).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(mut response) => {
+                    response["status"] = json!(200);
+                    response
+                }
+                Err(reason) => json!({
+                    "error": {"type": "search_exception", "reason": reason},
+                    "status": 400,
+                }),
+            }
+        }
+    });
+    let responses = futures::future::join_all(futures).await;
     Json(json!({"took": 0, "responses": responses})).into_response()
 }
 

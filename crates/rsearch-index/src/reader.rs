@@ -20,6 +20,9 @@ use crate::split_file::{BundleMeta, FOOTER_TAIL_LEN, parse_footer_tail, parse_me
 pub struct SplitReader {
     pub meta: BundleMeta,
     index: Index,
+    /// Built once and reused: splits are immutable, so re-opening every
+    /// segment's readers per query is pure waste.
+    reader: tantivy::IndexReader,
 }
 
 impl SplitReader {
@@ -45,6 +48,13 @@ impl SplitReader {
             .await
             .map_err(|e| IndexError::InvalidDocument(format!("read split tail {key}: {e}")))?;
         let meta_len = parse_footer_tail(&tail)?;
+        // Guard against a corrupt/hostile footer whose declared length
+        // would underflow the offset math (L1).
+        if meta_len > size - FOOTER_TAIL_LEN {
+            return Err(IndexError::InvalidDocument(format!(
+                "split {key} footer length {meta_len} exceeds object size {size}"
+            )));
+        }
         let meta_start = size - FOOTER_TAIL_LEN - meta_len;
         let meta_bytes = storage
             .get_range(key, meta_start..meta_start + meta_len)
@@ -62,26 +72,34 @@ impl SplitReader {
             }),
         };
         // Index::open reads bundled files, which bridges back into the
-        // async runtime — so it must run on a blocking thread.
-        let index = tokio::task::spawn_blocking(move || Index::open(directory))
-            .await
-            .map_err(|e| IndexError::InvalidDocument(format!("open task failed: {e}")))??;
-        Ok(Self { meta, index })
+        // async runtime — so it must run on a blocking thread. Build the
+        // reader once here (also blocking: it opens every segment).
+        let (index, reader) = tokio::task::spawn_blocking(move || {
+            let index = Index::open(directory)?;
+            let reader = index
+                .reader_builder()
+                .reload_policy(tantivy::ReloadPolicy::Manual)
+                .try_into()?;
+            Ok::<_, tantivy::TantivyError>((index, reader))
+        })
+        .await
+        .map_err(|e| IndexError::InvalidDocument(format!("open task failed: {e}")))??;
+        Ok(Self {
+            meta,
+            index,
+            reader,
+        })
     }
 
     pub fn index(&self) -> &Index {
         &self.index
     }
 
-    /// A searcher over this immutable split (manual reload policy — the
-    /// contents never change). Call from a blocking context.
+    /// A searcher over this immutable split, reusing the reader built at
+    /// open time (segment readers are pooled, not re-opened). Call from a
+    /// blocking context.
     pub fn searcher(&self) -> IndexResult<tantivy::Searcher> {
-        Ok(self
-            .index
-            .reader_builder()
-            .reload_policy(tantivy::ReloadPolicy::Manual)
-            .try_into()?
-            .searcher())
+        Ok(self.reader.searcher())
     }
 
     /// Export every document as (source JSON, timestamp millis) — used by

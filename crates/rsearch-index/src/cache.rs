@@ -8,6 +8,8 @@ pub struct SplitCache {
     root: PathBuf,
     max_bytes: u64,
     state: Mutex<CacheState>,
+    /// Monotonic counter for unique temp-file names.
+    tmp_counter: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -26,6 +28,7 @@ impl SplitCache {
             root,
             max_bytes,
             state: Mutex::new(CacheState::default()),
+            tmp_counter: std::sync::atomic::AtomicU64::new(0),
         };
         cache.rebuild_from_disk()?;
         Ok(cache)
@@ -42,9 +45,16 @@ impl SplitCache {
             let split_id = split_dir.file_name().to_string_lossy().to_string();
             for entry in std::fs::read_dir(split_dir.path())? {
                 let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Leftover temp files from a crash are not real entries —
+                // delete them rather than counting them (L5).
+                if name.contains(".tmp-cache") {
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
                 if entry.file_type()?.is_file() {
                     let size = entry.metadata()?.len();
-                    let key = format!("{split_id}/{}", entry.file_name().to_string_lossy());
+                    let key = format!("{split_id}/{name}");
                     state.entries.insert(key, (size, 0));
                     state.total_bytes += size;
                 }
@@ -87,7 +97,16 @@ impl SplitCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp-cache");
+        // Unique temp name per file: bundled files share a segment-UUID
+        // stem with different extensions, so a `with_extension` temp would
+        // collide across concurrent fetches and persist one file's bytes
+        // under another's name (H6). Include the full file name + a
+        // per-call counter.
+        let uniq = self.tmp_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_file_name(format!(
+            "{file_name}.tmp-cache-{}-{uniq}",
+            std::process::id()
+        ));
         std::fs::write(&tmp, data)?;
         std::fs::rename(&tmp, &path)?;
 
@@ -95,7 +114,7 @@ impl SplitCache {
         let mut state = self.state.lock().unwrap();
         state.tick += 1;
         let tick = state.tick;
-        if let Some((old_size, _)) = state.entries.insert(key, (data.len() as u64, tick)) {
+        if let Some((old_size, _)) = state.entries.insert(key.clone(), (data.len() as u64, tick)) {
             state.total_bytes -= old_size;
         }
         state.total_bytes += data.len() as u64;
@@ -104,6 +123,10 @@ impl SplitCache {
             let Some((victim, size)) = state
                 .entries
                 .iter()
+                // Never evict the entry we just inserted, even if it alone
+                // exceeds the budget — returning a path to a deleted file
+                // would make the split unsearchable (M4).
+                .filter(|(k, _)| *k != &key)
                 .min_by_key(|(_, v)| v.1)
                 .map(|(k, v)| (k.clone(), v.0))
             else {
