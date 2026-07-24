@@ -2,10 +2,13 @@
 //! split lifecycle (staged → published → marked_for_delete), and node
 //! liveness. All cross-node state lives here or in object storage.
 
+mod control;
 mod error;
 mod metastore;
 mod nodes;
 mod types;
+
+pub use control::CONTROL_LEADER_LOCK;
 
 pub use error::{MetastoreError, MetastoreResult};
 pub use metastore::Metastore;

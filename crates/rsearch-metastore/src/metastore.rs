@@ -65,6 +65,16 @@ impl Metastore {
         .ok_or_else(|| MetastoreError::StreamNotFound(name.to_string()))
     }
 
+    pub async fn get_stream_by_id(&self, id: i64) -> MetastoreResult<StreamRecord> {
+        sqlx::query_as::<_, StreamRecord>(
+            "SELECT id, name, mapping, retention_hours FROM streams WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| MetastoreError::StreamNotFound(format!("id={id}")))
+    }
+
     pub async fn list_streams(&self) -> MetastoreResult<Vec<StreamRecord>> {
         Ok(sqlx::query_as::<_, StreamRecord>(
             "SELECT id, name, mapping, retention_hours FROM streams ORDER BY name",

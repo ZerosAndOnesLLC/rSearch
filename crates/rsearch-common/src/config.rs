@@ -15,6 +15,7 @@ pub struct RsearchConfig {
     pub metastore: MetastoreConfig,
     pub ingest: IngestConfig,
     pub search: SearchConfig,
+    pub control: ControlConfig,
 }
 
 impl Default for RsearchConfig {
@@ -26,6 +27,32 @@ impl Default for RsearchConfig {
             metastore: MetastoreConfig::default(),
             ingest: IngestConfig::default(),
             search: SearchConfig::default(),
+            control: ControlConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlConfig {
+    /// Seconds between control-job ticks on the leader.
+    pub interval_secs: u64,
+    /// Published splits smaller than this are merge candidates (MB).
+    pub merge_min_mb: i64,
+    /// Max splits combined per merge operation.
+    pub merge_max_group: usize,
+    /// Seconds a split stays marked_for_delete before storage deletion,
+    /// letting in-flight searches finish.
+    pub gc_grace_secs: f64,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 15,
+            merge_min_mb: 100,
+            merge_max_group: 8,
+            gc_grace_secs: 600.0,
         }
     }
 }

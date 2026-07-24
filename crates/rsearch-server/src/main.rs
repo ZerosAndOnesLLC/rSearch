@@ -1,4 +1,5 @@
 mod bulk_api;
+mod control;
 mod routes;
 mod search_api;
 mod state;
@@ -105,6 +106,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Control role: contend for leadership and run background jobs.
+    if roles.contains(&Role::Control) {
+        let plane = control::ControlPlane::new(&config, metastore.clone(), storage.clone())
+            .context("initializing control plane")?;
+        tokio::spawn(plane.run());
+    }
 
     // Every node heartbeats its liveness row.
     {

@@ -126,15 +126,15 @@ cargo check clean before every commit.
 
 ## Phase 7 — Cluster ops
 
-- [ ] 7.1 Role separation verified: ingest-only, search-only, control-only
+- [x] 7.1 Role separation verified: ingest-only, search-only, control-only
       nodes run correctly from the same binary
-- [ ] 7.2 Control loop with Postgres advisory-lock leader election; only the
+- [x] 7.2 Control loop with Postgres advisory-lock leader election; only the
       leader runs background jobs; leadership failover test
-- [ ] 7.3 Merge policy: combine small published splits per stream/time-bucket
+- [x] 7.3 Merge policy: combine small published splits per stream/time-bucket
       into larger ones; old splits marked-for-delete after merge publish
-- [ ] 7.4 Retention & GC: enforce per-stream retention by marking expired
+- [x] 7.4 Retention & GC: enforce per-stream retention by marking expired
       splits; grace-period deletion of marked splits from storage + metastore
-- [ ] 7.5 Multi-node docker-compose (2 ingest, 2 search, 1 control, Postgres,
+- [x] 7.5 Multi-node docker-compose (2 ingest, 2 search, 1 control, Postgres,
       MinIO): kill-a-node tests — searcher death (LB reroutes), ingest death
       (WAL replay on restart, shipper retry covers the gap), leader death
       (lock failover)

@@ -83,6 +83,42 @@ impl SplitReader {
             .try_into()?
             .searcher())
     }
+
+    /// Export every document as (source JSON, timestamp millis) — used by
+    /// the merge job to re-index small splits. Call from a blocking
+    /// context; streams the doc store rather than materializing segments.
+    pub fn export_docs(&self) -> IndexResult<Vec<(serde_json::Value, i64)>> {
+        let searcher = self.searcher()?;
+        let schema = self.index.schema();
+        let source_field = schema
+            .get_field(crate::mapping::SOURCE_FIELD)
+            .map_err(|_| IndexError::InvalidDocument("split lacks _source".into()))?;
+        let mut docs = Vec::with_capacity(self.meta.split.doc_count as usize);
+        for segment_reader in searcher.segment_readers() {
+            let store = segment_reader.get_store_reader(10)?;
+            let ts_column = segment_reader
+                .fast_fields()
+                .date(crate::mapping::TIMESTAMP_FIELD)?;
+            for doc_id in segment_reader.doc_ids_alive() {
+                let doc: tantivy::TantivyDocument = store.get(doc_id)?;
+                let source = doc
+                    .get_first(source_field)
+                    .and_then(|v| tantivy::schema::Value::as_str(&v))
+                    .ok_or_else(|| {
+                        IndexError::InvalidDocument("document missing _source".into())
+                    })?;
+                let json: serde_json::Value = serde_json::from_str(source).map_err(|e| {
+                    IndexError::InvalidDocument(format!("corrupt _source: {e}"))
+                })?;
+                let ts = ts_column
+                    .first(doc_id)
+                    .map(|dt| dt.into_timestamp_millis())
+                    .unwrap_or_default();
+                docs.push((json, ts));
+            }
+        }
+        Ok(docs)
+    }
 }
 
 struct DirectoryInner {
