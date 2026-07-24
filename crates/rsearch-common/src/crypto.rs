@@ -58,6 +58,18 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     .is_ok()
 }
 
+/// A fixed, valid PBKDF2 hash to verify against when a user does not
+/// exist, so the absent-user auth path costs the same as a real verify
+/// (defeats username-enumeration timing). Verifying any password against
+/// it returns false.
+pub fn dummy_password_hash() -> String {
+    // Precomputed hash of a random secret nobody knows; format matches
+    // hash_password so verify_password runs the full 600k iterations.
+    "pbkdf2-sha256$600000$AAAAAAAAAAAAAAAAAAAAAA$\
+     x9QJ0dG0Z0mVn2yqTiVn5x6eXbYy9k3s7Xy0oP2mQ4A"
+        .to_string()
+}
+
 /// SHA-256 hex digest — used to store session/API-key tokens.
 pub fn token_digest(token: &str) -> String {
     let digest = digest::digest(&digest::SHA256, token.as_bytes());
@@ -156,5 +168,32 @@ mod tests {
         let b = generate_token().unwrap();
         assert_ne!(a, b);
         assert_eq!(token_digest(&a).len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod dummy_hash_test {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn dummy_hash_runs_full_verify() {
+        // Must parse and run the full 600k iterations (return false), not
+        // early-out on a malformed hash — otherwise the timing defense is
+        // defeated. Compare its cost to a real hash's verify.
+        let real = hash_password("some-password-value").unwrap();
+        let dummy = dummy_password_hash();
+
+        let t0 = Instant::now();
+        assert!(!verify_password("guess", &dummy));
+        let dummy_cost = t0.elapsed();
+
+        let t1 = Instant::now();
+        assert!(!verify_password("guess", &real));
+        let real_cost = t1.elapsed();
+
+        // Within 3x of each other means the dummy ran real PBKDF2 work.
+        let ratio = dummy_cost.as_secs_f64() / real_cost.as_secs_f64().max(1e-9);
+        assert!(ratio > 0.3 && ratio < 3.0, "dummy {dummy_cost:?} vs real {real_cost:?}");
     }
 }

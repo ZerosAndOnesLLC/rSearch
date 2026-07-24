@@ -139,10 +139,25 @@ impl Metastore {
     }
 
     pub async fn api_key_by_hash(&self, key_hash: &str) -> MetastoreResult<Option<ApiKeyRecord>> {
-        Ok(sqlx::query_as::<_, ApiKeyRecord>(
-            "UPDATE api_keys SET last_used_at = now()
+        // Throttle the last_used_at write to at most once per minute per
+        // key so shipper auth doesn't generate a row write (+ dead tuples)
+        // on every request. The UPDATE matches only when the stamp is
+        // stale; a plain SELECT resolves the key otherwise.
+        let updated = sqlx::query_as::<_, ApiKeyRecord>(
+            "UPDATE api_keys
+             SET last_used_at = now()
              WHERE key_hash = $1
+               AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
              RETURNING id, name, actions, streams",
+        )
+        .bind(key_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        if updated.is_some() {
+            return Ok(updated);
+        }
+        Ok(sqlx::query_as::<_, ApiKeyRecord>(
+            "SELECT id, name, actions, streams FROM api_keys WHERE key_hash = $1",
         )
         .bind(key_hash)
         .fetch_optional(self.pool())

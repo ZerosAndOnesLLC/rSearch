@@ -18,6 +18,8 @@ pub struct AppState {
     /// Present only on nodes running the search role.
     pub search: Option<Arc<SearchService>>,
     pub auth: crate::auth::AuthState,
+    /// Mirror of control.allow_insecure_webhooks for the alerts API.
+    pub allow_insecure_webhooks: bool,
 }
 
 impl AppState {
@@ -36,6 +38,7 @@ impl AppState {
             pipeline,
             search,
             auth: crate::auth::AuthState::default(),
+            allow_insecure_webhooks: config.control.allow_insecure_webhooks,
         }
     }
 

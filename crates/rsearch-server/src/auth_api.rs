@@ -101,6 +101,7 @@ pub async fn put_user(
                 .auth
                 .enforced
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            state.auth.invalidate();
             state.audit("user_upserted", &name, role).await;
             Json(json!({"acknowledged": true, "username": user.username,
                         "role": user.role, "streams": user.streams,
@@ -128,6 +129,7 @@ pub async fn list_users(State(state): State<AppState>) -> Response {
 pub async fn delete_user(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     match state.metastore.delete_user(&name).await {
         Ok(true) => {
+            state.auth.invalidate();
             state.audit("user_deleted", &name, "").await;
             Json(json!({"acknowledged": true})).into_response()
         }
@@ -203,6 +205,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> Response {
 pub async fn delete_api_key(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     match state.metastore.delete_api_key(&name).await {
         Ok(true) => {
+            state.auth.invalidate();
             state.audit("api_key_deleted", &name, "").await;
             Json(json!({"acknowledged": true})).into_response()
         }

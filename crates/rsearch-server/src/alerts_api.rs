@@ -30,8 +30,8 @@ pub async fn put_alert(
     let Some(webhook) = body.get("webhook_url").and_then(Value::as_str) else {
         return err(StatusCode::BAD_REQUEST, "'webhook_url' is required");
     };
-    if !webhook.starts_with("http://") && !webhook.starts_with("https://") {
-        return err(StatusCode::BAD_REQUEST, "'webhook_url' must be http(s)");
+    if let Err(reason) = crate::webhook::validate_webhook_url(webhook, state.allow_insecure_webhooks) {
+        return err(StatusCode::BAD_REQUEST, &reason);
     }
     let query = body.get("query").cloned().unwrap_or_else(|| json!({}));
     let op = body

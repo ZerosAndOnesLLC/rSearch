@@ -104,6 +104,13 @@ pub struct ControlConfig {
     /// Seconds a split stays marked_for_delete before storage deletion,
     /// letting in-flight searches finish.
     pub gc_grace_secs: f64,
+    /// Allow plaintext http:// alert webhooks (trusted networks only).
+    /// Default false: webhooks must be https and must not target
+    /// loopback/link-local/private addresses.
+    pub allow_insecure_webhooks: bool,
+    /// Seconds a split may sit in `staged` before an orphan sweep marks
+    /// it for deletion (crash between stage and publish).
+    pub staged_orphan_secs: f64,
 }
 
 impl Default for ControlConfig {
@@ -113,6 +120,8 @@ impl Default for ControlConfig {
             merge_min_mb: 100,
             merge_max_group: 8,
             gc_grace_secs: 600.0,
+            allow_insecure_webhooks: false,
+            staged_orphan_secs: 3600.0,
         }
     }
 }

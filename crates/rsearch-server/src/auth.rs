@@ -9,8 +9,9 @@
 //! user immediately arms enforcement cluster-wide.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -25,9 +26,54 @@ use rsearch_common::crypto;
 use crate::state::AppState;
 
 /// Cached "any users exist?" flag; refreshed by a background task.
-#[derive(Clone, Default)]
+/// Fails CLOSED: enforcement is on until a user count *successfully*
+/// returns zero, so a startup race or a metastore blip never disables auth.
+#[derive(Clone)]
 pub struct AuthState {
     pub enforced: Arc<AtomicBool>,
+    /// token-digest -> (identity, inserted_at). Short-TTL cache that keeps
+    /// shipper auth off the DB hot path (no per-request session lookup or
+    /// `last_used_at` write). Cleared on user/key mutation.
+    cache: Arc<Mutex<std::collections::HashMap<String, (Identity, Instant)>>>,
+}
+
+const TOKEN_CACHE_TTL: Duration = Duration::from_secs(30);
+
+impl Default for AuthState {
+    fn default() -> Self {
+        Self {
+            enforced: Arc::new(AtomicBool::new(true)),
+            cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+impl AuthState {
+    fn cache_get(&self, hash: &str) -> Option<Identity> {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some((identity, at)) = cache.get(hash) {
+            if at.elapsed() < TOKEN_CACHE_TTL {
+                return Some(identity.clone());
+            }
+            cache.remove(hash);
+        }
+        None
+    }
+
+    fn cache_put(&self, hash: String, identity: Identity) {
+        let mut cache = self.cache.lock().unwrap();
+        // Bounded to keep a token flood from growing it without limit.
+        if cache.len() > 10_000 {
+            cache.clear();
+        }
+        cache.insert(hash, (identity, Instant::now()));
+    }
+
+    /// Invalidate the whole token cache — called after any user/key change
+    /// so revocations take effect within one request rather than one TTL.
+    pub fn invalidate(&self) {
+        self.cache.lock().unwrap().clear();
+    }
 }
 
 impl AuthState {
@@ -39,6 +85,8 @@ impl AuthState {
             loop {
                 interval.tick().await;
                 match metastore.count_users().await {
+                    // Only bootstrap-mode (auth off) after a *successful*
+                    // count of zero.
                     Ok(0) => {
                         if !warned {
                             warn!(
@@ -49,8 +97,13 @@ impl AuthState {
                         }
                         enforced.store(false, Ordering::Relaxed);
                     }
-                    Ok(_) => enforced.store(true, Ordering::Relaxed),
-                    Err(e) => warn!(error = %e, "auth refresh failed"),
+                    Ok(_) => {
+                        warned = false;
+                        enforced.store(true, Ordering::Relaxed);
+                    }
+                    // On error, leave enforcement as-is (starts true) — never
+                    // open auth because the metastore is unreachable.
+                    Err(e) => warn!(error = %e, "auth refresh failed; enforcement unchanged"),
                 }
             }
         });
@@ -111,20 +164,30 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
     // Session or API-key token.
     for token in [bearer, api_key_header].into_iter().flatten() {
         let hash = crypto::token_digest(token);
+        if let Some(identity) = state.auth.cache_get(&hash) {
+            return Some(identity);
+        }
         if let Ok(Some(user)) = state.metastore.session_user(&hash).await {
-            return Some(user_identity(user));
+            let identity = user_identity(user);
+            state.auth.cache_put(hash, identity.clone());
+            return Some(identity);
         }
         if let Ok(Some(key)) = state.metastore.api_key_by_hash(&hash).await {
-            return Some(Identity {
+            let identity = Identity {
                 name: format!("apikey:{}", key.name),
                 is_admin: key.actions.iter().any(|a| a == "admin"),
                 actions: key.actions.into_iter().collect(),
                 streams: key.streams,
-            });
+            };
+            state.auth.cache_put(hash, identity.clone());
+            return Some(identity);
         }
     }
 
-    // HTTP Basic.
+    // HTTP Basic. Always run a PBKDF2 verify — against the real hash when
+    // the user exists, against a fixed dummy hash when it doesn't — so the
+    // absent-user path costs the same and can't be used to enumerate
+    // usernames by timing.
     if let Some(basic) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -132,14 +195,17 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
         && let Some(decoded) = crypto::b64_decode(basic.trim())
         && let Ok(text) = String::from_utf8(decoded)
         && let Some((username, password)) = text.split_once(':')
-        && let Ok(Some(user)) = state.metastore.get_user(username).await
     {
-        let hash = user.password_hash.clone();
+        let user = state.metastore.get_user(username).await.ok().flatten();
+        let hash = user
+            .as_ref()
+            .map(|u| u.password_hash.clone())
+            .unwrap_or_else(crypto::dummy_password_hash);
         let password = password.to_string();
         let ok = tokio::task::spawn_blocking(move || crypto::verify_password(&password, &hash))
             .await
             .unwrap_or(false);
-        if ok {
+        if ok && let Some(user) = user {
             return Some(user_identity(user));
         }
     }

@@ -43,6 +43,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs", "webpki-roots", "tls12"] }
+url = "2"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 async-trait = "0.1"
 bytes = "1"
