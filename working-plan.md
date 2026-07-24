@@ -49,7 +49,7 @@ cargo check clean before every commit.
       boots, loads config (file + env), logs startup; README stub
 - [x] 1.2 TLS: axum behind rustls with the aws-lc-rs FIPS provider; serve
       `GET /` health over HTTPS; self-signed dev-cert generation documented
-- [ ] 1.3 Compliance gate: `cargo deny` config banning `ring`, `md-5`, `md5`,
+- [x] 1.3 Compliance gate: `cargo deny` config banning `ring`, `md-5`, `md5`,
       `argon2`, `bcrypt`; CI script (`cargo check` + `cargo deny check` + tests);
       document the aws-lc-rs CMVP certificate reference in README
 - [ ] 1.4 Node identity & roles: `--roles ingest,search,control` (default: all);
