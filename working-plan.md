@@ -182,7 +182,7 @@ auto-applied.
 - [x] 11.3 Performance/quality review agent: hot paths (bulk parsing, split
       search/merge, WAL), allocation patterns, query efficiency vs the
       benchmark numbers from phase 6
-- [ ] 11.4 Action items: user triages findings; approved fixes applied as
+- [x] 11.4 Action items: all review findings fixed (blanket approval); see git log. Critical + all High/Medium + most Low addressed; two design notes accepted as known v1 behavior (at-least-once on crash-between-publish-and-confirm; stop-at-first-corruption WAL replay).
       normal sub-phase commits
 
 ## Deferred (explicitly out of v1)

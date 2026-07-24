@@ -46,7 +46,7 @@ impl ControlPlane {
             work_dir: data_dir.join("merge"),
             memory_budget: config.ingest.memory_budget_mb << 20,
             search,
-            webhook: crate::webhook::WebhookClient::new()?,
+            webhook: crate::webhook::WebhookClient::new(config.control.allow_insecure_webhooks)?,
         })
     }
 

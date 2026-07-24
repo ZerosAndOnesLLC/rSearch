@@ -18,7 +18,8 @@ pub fn validate_webhook_url(url: &str, allow_insecure: bool) -> Result<(), Strin
         "http" if allow_insecure => {}
         "http" => {
             return Err(
-                "webhook_url must use https (set control.allow_insecure_webhooks to permit http)"
+                "webhook_url must use https (set control.allow_insecure_webhooks to permit http \
+                 and internal addresses)"
                     .to_string(),
             );
         }
@@ -27,8 +28,12 @@ pub fn validate_webhook_url(url: &str, allow_insecure: bool) -> Result<(), Strin
     let host = parsed
         .host_str()
         .ok_or_else(|| "webhook_url has no host".to_string())?;
-    // If the host is a literal IP, reject non-global addresses up front.
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // Reject non-global literal IPs unless the operator has explicitly
+    // opted into trusted-network mode (which also permits internal
+    // webhook targets like a private monitoring endpoint).
+    if !allow_insecure
+        && let Ok(ip) = host.parse::<IpAddr>()
+    {
         guard_addr(&ip)?;
     }
     Ok(())
@@ -69,10 +74,12 @@ pub struct WebhookClient {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         Full<Bytes>,
     >,
+    /// Trusted-network mode: permit http and internal/private addresses.
+    allow_insecure: bool,
 }
 
 impl WebhookClient {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(allow_insecure: bool) -> anyhow::Result<Self> {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(rustls::crypto::default_fips_provider())?
             .https_or_http()
@@ -80,6 +87,7 @@ impl WebhookClient {
             .build();
         Ok(Self {
             client: Client::builder(TokioExecutor::new()).build(https),
+            allow_insecure,
         })
     }
 
@@ -91,12 +99,14 @@ impl WebhookClient {
     ) -> anyhow::Result<u16> {
         // Re-resolve the host at send time and guard every resolved
         // address, closing the DNS-rebinding gap that a create-time check
-        // alone would leave open.
-        let parsed = url::Url::parse(url)?;
-        if let Some(host) = parsed.host_str() {
-            let port = parsed.port_or_known_default().unwrap_or(443);
-            for addr in tokio::net::lookup_host((host, port)).await? {
-                guard_addr(&addr.ip()).map_err(|e| anyhow::anyhow!(e))?;
+        // alone would leave open. Skipped in trusted-network mode.
+        if !self.allow_insecure {
+            let parsed = url::Url::parse(url)?;
+            if let Some(host) = parsed.host_str() {
+                let port = parsed.port_or_known_default().unwrap_or(443);
+                for addr in tokio::net::lookup_host((host, port)).await? {
+                    guard_addr(&addr.ip()).map_err(|e| anyhow::anyhow!(e))?;
+                }
             }
         }
         let request = hyper::Request::builder()
