@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+/* rSearch console tokens */
+:root {
+  --bg: #0e1116;        /* console night */
+  --panel: #151a22;     /* raised surface */
+  --line: #232a35;      /* hairline */
+  --ink: #e2e8f0;       /* primary text */
+  --muted: #8a94a6;     /* secondary text */
+  --accent: #7aa2f7;    /* periwinkle — the one accent */
+  --sev-err: #f7768e;
+  --sev-warn: #e0af68;
+  --sev-ok: #9ece6a;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+body {
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.field {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 7px 10px;
+  font-size: 13px;
+  width: 100%;
+}
+.field:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.btn {
+  background: var(--accent);
+  color: #0e1116;
+  border-radius: 4px;
+  padding: 7px 14px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+.btn-quiet {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+.btn-quiet:hover {
+  color: var(--ink);
+  border-color: var(--muted);
+}
+
+.nav-link {
+  display: block;
+  padding: 6px 12px;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.nav-link:hover {
+  color: var(--ink);
+}
+.nav-link.active {
+  color: var(--ink);
+  background: var(--panel);
+}
+
+/* The ledger: severity gutter + tabular rows */
+.ledger-row {
+  display: grid;
+  grid-template-columns: 4px 44px 176px 1fr;
+  gap: 12px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  align-items: baseline;
+}
+.ledger-row:hover {
+  background: var(--panel);
+}
+.sev-tick {
+  width: 4px;
+  height: 14px;
+  border-radius: 1px;
+  align-self: center;
+}
+.sev-code {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+.ts {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+label {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+table.data th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+table.data td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

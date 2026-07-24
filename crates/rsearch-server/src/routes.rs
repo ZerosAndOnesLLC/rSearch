@@ -1,5 +1,6 @@
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::HeaderValue;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -70,17 +71,35 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::auth::require,
         ))
-        // ES 8.x clients refuse to talk without the product header.
-        .layer(axum::middleware::map_response(
-            |mut response: axum::response::Response| async {
-                response.headers_mut().insert(
-                    "x-elastic-product",
-                    HeaderValue::from_static("Elasticsearch"),
-                );
-                response
+        // ES 8.x clients refuse to talk without the product header; CORS
+        // lets the UI (separate origin) call the API with token auth.
+        .layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async {
+                if request.method() == axum::http::Method::OPTIONS {
+                    return cors_headers(axum::http::StatusCode::NO_CONTENT.into_response());
+                }
+                cors_headers(next.run(request).await)
             },
         ))
         .with_state(state)
+}
+
+fn cors_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-elastic-product",
+        HeaderValue::from_static("Elasticsearch"),
+    );
+    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("authorization, content-type, x-api-key"),
+    );
+    response
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {

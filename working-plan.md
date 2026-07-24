@@ -164,7 +164,7 @@ cargo check clean before every commit.
 
 - [x] 10.1 Scheduled query alerts: cron-style schedule, query + threshold
       condition, webhook notification (email later); runs on control leader
-- [ ] 10.2 UI (separate NextJS project, S3+CloudFront pattern): search screen
+- [x] 10.2 UI (separate NextJS project, S3+CloudFront pattern): search screen
       (query, time picker, histogram, results), stream management, retention,
       users/keys, alerts
 
