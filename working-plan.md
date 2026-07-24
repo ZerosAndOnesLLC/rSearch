@@ -73,7 +73,7 @@ cargo check clean before every commit.
 
 ## Phase 3 — Metastore (Postgres/sqlx)
 
-- [ ] 3.1 sqlx setup + initial migrations (`sqlx migrate`): `streams`,
+- [x] 3.1 sqlx setup + initial migrations (`sqlx migrate`): `streams`,
       `splits` (stream_id, time_range, state, size, doc_count, footer offsets),
       `nodes`, `retention_policies`; indexes for the split-listing query
       (stream + time range + state)
