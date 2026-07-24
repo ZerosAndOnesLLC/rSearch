@@ -110,7 +110,7 @@ cargo check clean before every commit.
 - [x] 5.4 Compat surface: response envelopes (`took`, `hits.total`, `_shards`),
       product/version headers so ES clients and Grafana's datasource accept us;
       `GET /`, `GET /_cat/indices`, `_cluster/health` fleshed out
-- [ ] 5.5 End-to-end test: Vector and Fluent Bit ship logs in unmodified;
+- [x] 5.5 End-to-end test: Vector and Fluent Bit ship logs in unmodified;
       Grafana ES datasource queries and renders them
 
 ## Phase 6 — Benchmark gate (go/no-go)

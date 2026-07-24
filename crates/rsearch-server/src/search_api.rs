@@ -211,18 +211,17 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
         "cluster_name": state.cluster_name,
         "cluster_uuid": "rsearch",
         "version": {
-            // Report the OpenSearch-compatible ES version so ES clients,
-            // Vector, Fluent Bit, and Grafana take their 7.x code paths.
-            "number": "7.10.2",
-            "distribution": "opensearch",
-            "opensearch_version": "2.19.0",
-            "rsearch_version": env!("CARGO_PKG_VERSION"),
+            // Report ES 7.17 so ES clients, Vector, Fluent Bit, and
+            // Grafana (which requires >= 7.16) take their 7.x code paths.
+            "number": "7.17.0",
+            "build_flavor": "default",
             "build_type": "tar",
-            "lucene_version": "8.7.0",
+            "rsearch_version": env!("CARGO_PKG_VERSION"),
+            "lucene_version": "8.11.1",
             "minimum_wire_compatibility_version": "6.8.0",
             "minimum_index_compatibility_version": "6.0.0",
         },
-        "tagline": "The OpenSearch Project: https://opensearch.org/",
+        "tagline": "You Know, for Search",
     }))
 }
 

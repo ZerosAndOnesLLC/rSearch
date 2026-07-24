@@ -41,11 +41,15 @@ fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
 }
 
 /// Rewrite aggregation field names the same way queries resolve them, so
-/// ES-shaped aggregation requests hit the right Tantivy columns.
+/// ES-shaped aggregation requests hit the right Tantivy columns. Also
+/// sanitizes parameters ES tolerates but Tantivy rejects (display-only
+/// `format`, `time_zone`) and maps the legacy `interval` to
+/// `fixed_interval` — Grafana sends all three.
 pub fn rewrite_agg_fields(schema: &MappedSchema, aggs: &Value) -> Value {
     match aggs {
         Value::Object(map) => Value::Object(
             map.iter()
+                .filter(|(k, _)| k.as_str() != "format" && k.as_str() != "time_zone")
                 .map(|(k, v)| {
                     if k == "field"
                         && let Some(name) = v.as_str()
@@ -56,6 +60,8 @@ pub fn rewrite_agg_fields(schema: &MappedSchema, aggs: &Value) -> Value {
                             Resolved::Dynamic(_, path) => format!("_dynamic.{path}"),
                         };
                         (k.clone(), Value::String(rewritten))
+                    } else if k == "interval" && v.is_string() {
+                        ("fixed_interval".to_string(), v.clone())
                     } else {
                         (k.clone(), rewrite_agg_fields(schema, v))
                     }

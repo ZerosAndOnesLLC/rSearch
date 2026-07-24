@@ -1,0 +1,13 @@
+sources:
+  demo:
+    type: demo_logs
+    format: json
+    interval: 0.02
+
+sinks:
+  rsearch:
+    type: elasticsearch
+    inputs: [demo]
+    endpoints: ["http://host.docker.internal:9200"]
+    bulk:
+      index: vector-logs

@@ -1,0 +1,11 @@
+apiVersion: 1
+datasources:
+  - name: rsearch
+    uid: rsearch
+    type: elasticsearch
+    access: proxy
+    url: http://host.docker.internal:9200
+    isDefault: true
+    jsonData:
+      index: vector-logs
+      timeField: "@timestamp"
