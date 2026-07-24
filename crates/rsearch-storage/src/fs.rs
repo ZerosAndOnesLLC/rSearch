@@ -20,7 +20,11 @@ impl FsStorage {
         Self { root: root.into() }
     }
 
-    /// Resolve a key to a path under root, rejecting traversal.
+    /// Resolve a key to a path under root, rejecting traversal. Keys are
+    /// lexically confined to root (no `..`, absolute, or `.` segments); if
+    /// the target already exists, its canonical path is additionally
+    /// verified to stay under root, defeating a symlink placed inside the
+    /// data dir that points outside it.
     fn resolve(&self, key: &str) -> StorageResult<PathBuf> {
         if key.is_empty()
             || key.starts_with('/')
@@ -30,7 +34,16 @@ impl FsStorage {
         {
             return Err(StorageError::InvalidKey(key.to_string()));
         }
-        Ok(self.root.join(key))
+        let path = self.root.join(key);
+        // Best-effort symlink-escape guard on existing targets.
+        if let (Ok(canon), Ok(root_canon)) = (path.canonicalize(), self.root.canonicalize())
+            && !canon.starts_with(&root_canon)
+        {
+            return Err(StorageError::InvalidKey(format!(
+                "{key} resolves outside the storage root"
+            )));
+        }
+        Ok(path)
     }
 
     fn io_err(key: &str, source: std::io::Error) -> StorageError {

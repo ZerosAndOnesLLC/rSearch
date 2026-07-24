@@ -13,6 +13,10 @@ data_dir = "./data"
 
 [http]
 bind_addr = "0.0.0.0:9200"
+# Access-Control-Allow-Origin for the browser UI. "*" is convenient; set a
+# specific origin to restrict (auth is header-based, so credentials are
+# never auto-attached, but restricting is safer).
+cors_allow_origin = "*"
 
 [http.tls]
 # Production should terminate TLS here (FIPS provider) or at a FIPS-validated
@@ -55,10 +59,12 @@ wal_segment_mb = 64      # WAL segment rotation size
 cache_max_mb = 4096      # local split-fragment cache budget
 
 [control]
-interval_secs = 15       # background-job tick on the elected leader
-merge_min_mb = 100       # published splits smaller than this get merged
-merge_max_group = 8      # max splits combined per merge
-gc_grace_secs = 600      # delay before deleting marked-for-delete splits
+interval_secs = 15          # background-job tick on the elected leader
+merge_min_mb = 100          # published splits smaller than this get merged
+merge_max_group = 8         # max splits combined per merge
+gc_grace_secs = 600         # delay before deleting marked-for-delete splits
+staged_orphan_secs = 3600   # sweep splits stuck in 'staged' after a crash
+allow_insecure_webhooks = false  # require https + block private IPs for alerts
 
 # Network log inputs (disabled by default). Each routes to a stream and is
 # subject to routing rules.

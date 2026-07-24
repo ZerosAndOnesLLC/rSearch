@@ -1,8 +1,39 @@
-# Benchmarks — rSearch vs OpenSearch (phase 6 gate)
+# Benchmarks — rSearch vs OpenSearch
 
-**Date:** 2026-07-24 · **Verdict: PASS — continue.** rSearch meets or beats
-the planning estimates (~5–10× memory, ~2–3× CPU) on every ingest metric;
-query latencies are single-digit-ms p50 on both systems with mixed wins.
+**Verdict: PASS.** rSearch meets or beats the planning estimates
+(~5–10× memory, ~2–3× CPU) on every ingest metric; query latencies are
+single-digit-ms p50 on both systems with mixed wins.
+
+## Post-review re-run (after phase 11 fixes)
+
+Numbers below are from after the review-remediation pass (concurrent
+split search, reader-built-once, `track_total_hits`, deferred `_source`
+fetch, lazy-parse ingest queue). Same host and workload as the original
+gate.
+
+| Metric | rSearch | OpenSearch |
+|---|---|---|
+| Idle RSS | **16 MB** | 2,492 MB |
+| Peak RSS @5k eps | **109 MB** | 2,698 MB |
+| Avg CPU @5k eps | **7.1%** | 35.3% |
+| needle p50 / p95 | **2.0** / 2.5 ms | 4.1 / 8.3 ms |
+| range_scan p50 | 8.6 ms | **2.1 ms** |
+| date_histogram p50 | 12.4 ms | **1.8 ms** |
+| disk (900k docs) | 336 MB | 111 MB |
+
+The ingest fixes *improved* the memory story further — peak RSS at 5k eps
+dropped from 285 MB (original gate) to **109 MB** — and selective
+queries (needle) now beat OpenSearch. Full-corpus scans/aggregations
+still trail OpenSearch: on this small (~5-split) corpus the new
+concurrency has little to exploit, and those queries touch every split;
+the gap narrows as split counts grow and the merge policy consolidates
+aged data. `_source` is now stored as the client's verbatim line, which
+costs more disk than OpenSearch's compressed store — an accepted trade
+for zero re-serialization on the ingest hot path.
+
+---
+
+## Original phase 6 gate (pre-review)
 
 ## Setup
 
