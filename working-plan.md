@@ -66,7 +66,7 @@ cargo check clean before every commit.
 - [x] 2.3 Mapping subset: ES-style mapping JSON → Tantivy schema (keyword, text,
       long, double, boolean, date, ip); dynamic defaults for unmapped fields;
       `_timestamp` fast field mandatory
-- [ ] 2.4 Split builder: batch of docs → Tantivy segments → single immutable
+- [x] 2.4 Split builder: batch of docs → Tantivy segments → single immutable
       split file (bundle + footer with hotcache metadata) → upload via `Storage`
 - [ ] 2.5 Split reader: lazy open from footer, byte-range reads through a local
       disk cache with LRU eviction; search a split without downloading it fully
