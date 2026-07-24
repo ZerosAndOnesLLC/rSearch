@@ -160,6 +160,7 @@ impl RsearchConfig {
         }
         builder = builder.add_source(
             ::config::Environment::with_prefix("RSEARCH")
+                .prefix_separator("_")
                 .separator("__")
                 .try_parsing(true),
         );

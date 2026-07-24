@@ -1,4 +1,5 @@
 mod routes;
+mod tls;
 
 use anyhow::Context;
 use clap::Parser;
@@ -39,10 +40,24 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let app = routes::router(&config, &roles);
-    let listener = tokio::net::TcpListener::bind(&config.http.bind_addr)
-        .await
-        .with_context(|| format!("binding {}", config.http.bind_addr))?;
-    info!("listening on http://{}", config.http.bind_addr);
-    axum::serve(listener, app).await.context("serving http")?;
+    if config.http.tls.enabled {
+        let tls_config = tls::server_config(&config.http.tls.cert_path, &config.http.tls.key_path)?;
+        let addr: std::net::SocketAddr = config
+            .http
+            .bind_addr
+            .parse()
+            .with_context(|| format!("parsing bind address {}", config.http.bind_addr))?;
+        info!(fips = true, "listening on https://{addr}");
+        axum_server::bind_rustls(addr, axum_server::tls_rustls::RustlsConfig::from_config(tls_config))
+            .serve(app.into_make_service())
+            .await
+            .context("serving https")?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&config.http.bind_addr)
+            .await
+            .with_context(|| format!("binding {}", config.http.bind_addr))?;
+        info!("listening on http://{} (TLS disabled — dev only)", config.http.bind_addr);
+        axum::serve(listener, app).await.context("serving http")?;
+    }
     Ok(())
 }
