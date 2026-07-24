@@ -1,11 +1,20 @@
+mod bulk_api;
 mod routes;
+mod state;
 mod tls;
+
+use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use rsearch_common::config::RsearchConfig;
 use rsearch_common::role::{Role, parse_roles};
-use tracing::info;
+use rsearch_ingest::{IngestPipeline, PipelineConfig, Wal};
+use rsearch_metastore::Metastore;
+use tracing::{info, warn};
+
+use crate::state::AppState;
 
 #[derive(Parser, Debug)]
 #[command(name = "rsearch", about = "FIPS-compliant log search server")]
@@ -39,7 +48,69 @@ async fn main() -> anyhow::Result<()> {
         "starting rsearch"
     );
 
-    let app = routes::router(&config, &roles);
+    let metastore = Metastore::connect(&config.metastore)
+        .await
+        .context("connecting to metastore")?;
+    let storage = rsearch_storage::from_config(&config.storage)
+        .await
+        .context("initializing storage backend")?;
+
+    // Ingest role: open the WAL (replaying unpublished docs) and start the
+    // indexer pipeline.
+    let pipeline = if roles.contains(&Role::Ingest) {
+        let data_dir = PathBuf::from(&config.node.data_dir);
+        let (wal, replayed) = Wal::open(
+            data_dir.join("wal"),
+            config.ingest.wal_segment_mb << 20,
+        )
+        .context("opening WAL")?;
+        let pipeline = IngestPipeline::new(
+            PipelineConfig {
+                max_batch_docs: config.ingest.max_batch_docs,
+                max_batch_secs: config.ingest.max_batch_secs,
+                queue_capacity: config.ingest.queue_capacity,
+                work_dir: data_dir.join("staging"),
+                memory_budget: config.ingest.memory_budget_mb << 20,
+                node_id: config.node_id(),
+            },
+            storage.clone(),
+            metastore.clone(),
+            std::sync::Arc::new(wal),
+        );
+        let replay_count = pipeline
+            .replay(replayed)
+            .await
+            .context("replaying WAL into pipeline")?;
+        if replay_count > 0 {
+            info!(replay_count, "WAL replay complete");
+        }
+        Some(pipeline)
+    } else {
+        None
+    };
+
+    // Every node heartbeats its liveness row.
+    {
+        let metastore = metastore.clone();
+        let node_id = config.node_id();
+        let role_names: Vec<String> = roles.iter().map(ToString::to_string).collect();
+        let address = config.http.bind_addr.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(e) = metastore
+                    .heartbeat(&node_id, &role_names, Some(&address))
+                    .await
+                {
+                    warn!(error = %e, "heartbeat failed");
+                }
+            }
+        });
+    }
+
+    let app = routes::router(AppState::new(&config, &roles, metastore, pipeline));
+
     if config.http.tls.enabled {
         let tls_config = tls::server_config(&config.http.tls.cert_path, &config.http.tls.key_path)?;
         let addr: std::net::SocketAddr = config

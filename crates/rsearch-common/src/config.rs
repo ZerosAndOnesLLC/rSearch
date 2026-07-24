@@ -154,6 +154,10 @@ pub struct IngestConfig {
     pub max_batch_secs: u64,
     /// Bound on the in-flight ingest queue before 429s are returned.
     pub queue_capacity: usize,
+    /// Tantivy writer heap per stream worker, in megabytes.
+    pub memory_budget_mb: usize,
+    /// WAL segment rotation size, in megabytes.
+    pub wal_segment_mb: u64,
 }
 
 impl Default for IngestConfig {
@@ -162,6 +166,8 @@ impl Default for IngestConfig {
             max_batch_docs: 500_000,
             max_batch_secs: 30,
             queue_capacity: 64,
+            memory_budget_mb: 256,
+            wal_segment_mb: 64,
         }
     }
 }

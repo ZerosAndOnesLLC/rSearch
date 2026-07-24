@@ -27,6 +27,8 @@ pub struct PackagedSplit {
     pub meta: SplitMeta,
     pub file_path: PathBuf,
     pub size_bytes: u64,
+    /// Length of the footer metadata JSON (for single-range-read opens).
+    pub footer_len: u64,
     // Keeps the backing temp dir alive until the split is uploaded.
     _work_dir: tempfile::TempDir,
 }
@@ -110,7 +112,10 @@ impl SplitBuilder {
 
         let file_path = self.work_dir.path().join(format!("{}.split", self.split_id));
         let mut out = std::io::BufWriter::new(std::fs::File::create(&file_path)?);
-        split_file::write_bundle(&index_dir, &mut out, meta.clone())?;
+        let bundle = split_file::write_bundle(&index_dir, &mut out, meta.clone())?;
+        let footer_len = serde_json::to_vec(&bundle)
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
         let out = out
             .into_inner()
             .map_err(|e| IndexError::Io(e.into_error()))?;
@@ -121,6 +126,7 @@ impl SplitBuilder {
             meta,
             file_path,
             size_bytes,
+            footer_len,
             _work_dir: self.work_dir,
         })
     }

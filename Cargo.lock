@@ -2278,7 +2278,17 @@ dependencies = [
 name = "rsearch-ingest"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "rsearch-common",
+ "rsearch-index",
+ "rsearch-metastore",
+ "rsearch-storage",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2311,6 +2321,10 @@ dependencies = [
  "axum-server",
  "clap",
  "rsearch-common",
+ "rsearch-index",
+ "rsearch-ingest",
+ "rsearch-metastore",
+ "rsearch-storage",
  "rustls",
  "rustls-pki-types",
  "serde_json",

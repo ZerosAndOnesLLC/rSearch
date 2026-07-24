@@ -10,6 +10,7 @@ mod reader;
 mod split_file;
 
 pub use builder::{PackagedSplit, SplitBuilder};
+pub use tantivy::DateTime;
 pub use cache::SplitCache;
 pub use reader::SplitReader;
 pub use document::{DocumentConverter, extract_timestamp};

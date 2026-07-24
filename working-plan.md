@@ -84,16 +84,16 @@ cargo check clean before every commit.
 
 ## Phase 4 — Ingest path
 
-- [ ] 4.1 `POST /_bulk` (and `POST /{index}/_bulk`): NDJSON parsing, per-action
+- [x] 4.1 `POST /_bulk` (and `POST /{index}/_bulk`): NDJSON parsing, per-action
       responses matching ES shape (incl. per-item errors), index-name → stream
       routing
-- [ ] 4.2 WAL: append-before-ack on local disk, segment rotation, replay on
+- [x] 4.2 WAL: append-before-ack on local disk, segment rotation, replay on
       startup, truncate after split publish
-- [ ] 4.3 Indexer pipeline: per-stream batching by size/time, timestamp
+- [x] 4.3 Indexer pipeline: per-stream batching by size/time, timestamp
       extraction (`@timestamp`/`timestamp` fallbacks), doc ID via
       non-cryptographic hash, commit → split build → upload → publish → WAL
       truncate
-- [ ] 4.4 Backpressure: bounded queues, 429 with `Retry-After` when saturated;
+- [x] 4.4 Backpressure: bounded queues, 429 with `Retry-After` when saturated;
       ingest metrics (docs/s, bytes/s, queue depth)
 
 ## Phase 5 — Search path
