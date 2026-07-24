@@ -1,5 +1,6 @@
 mod bulk_api;
 mod routes;
+mod search_api;
 mod state;
 mod tls;
 
@@ -89,6 +90,22 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Search role: split cache + stateless search service.
+    let search = if roles.contains(&Role::Search) {
+        let cache = rsearch_index::SplitCache::new(
+            PathBuf::from(&config.node.data_dir).join("cache/splits"),
+            config.search.cache_max_mb << 20,
+        )
+        .context("initializing split cache")?;
+        Some(std::sync::Arc::new(rsearch_search::SearchService::new(
+            metastore.clone(),
+            storage.clone(),
+            std::sync::Arc::new(cache),
+        )))
+    } else {
+        None
+    };
+
     // Every node heartbeats its liveness row.
     {
         let metastore = metastore.clone();
@@ -109,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = routes::router(AppState::new(&config, &roles, metastore, pipeline));
+    let app = routes::router(AppState::new(&config, &roles, metastore, pipeline, search));
 
     if config.http.tls.enabled {
         let tls_config = tls::server_config(&config.http.tls.cert_path, &config.http.tls.key_path)?;

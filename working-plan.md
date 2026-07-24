@@ -98,16 +98,16 @@ cargo check clean before every commit.
 
 ## Phase 5 — Search path
 
-- [ ] 5.1 Query DSL subset parser: `bool`, `match`, `match_phrase`, `term`,
+- [x] 5.1 Query DSL subset parser: `bool`, `match`, `match_phrase`, `term`,
       `terms`, `range`, `exists`, `query_string` (via Tantivy query parser),
       `match_all`; unsupported query types → clear 400
-- [ ] 5.2 Execution: metastore split pruning by time range → per-split search →
+- [x] 5.2 Execution: metastore split pruning by time range → per-split search →
       top-k merge; `from`/`size`, `sort` (timestamp default), `_source`
       filtering
-- [ ] 5.3 Aggregations: pass through Tantivy's ES-compatible aggregation module
+- [x] 5.3 Aggregations: pass through Tantivy's ES-compatible aggregation module
       (terms, histogram, date_histogram, stats, min/max/avg/sum, percentiles,
       cardinality); merge across splits
-- [ ] 5.4 Compat surface: response envelopes (`took`, `hits.total`, `_shards`),
+- [x] 5.4 Compat surface: response envelopes (`took`, `hits.total`, `_shards`),
       product/version headers so ES clients and Grafana's datasource accept us;
       `GET /`, `GET /_cat/indices`, `_cluster/health` fleshed out
 - [ ] 5.5 End-to-end test: Vector and Fluent Bit ship logs in unmodified;

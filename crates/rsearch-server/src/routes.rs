@@ -1,9 +1,11 @@
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::HeaderValue;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::bulk_api;
+use crate::search_api;
 use crate::state::AppState;
 
 /// Bulk bodies can be large; cap at 100 MB.
@@ -11,6 +13,7 @@ const BULK_BODY_LIMIT: usize = 100 << 20;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(search_api::root))
         .route("/health", get(health))
         .route("/_cluster/health", get(cluster_health))
         .route("/_cat/nodes", get(cat_nodes))
@@ -23,6 +26,22 @@ pub fn router(state: AppState) -> Router {
             "/{index}/_bulk",
             post(bulk_api::bulk_index).layer(DefaultBodyLimit::max(BULK_BODY_LIMIT)),
         )
+        .route(
+            "/{index}/_search",
+            post(search_api::search).get(search_api::search),
+        )
+        .route("/_msearch", post(search_api::msearch))
+        .route("/{index}/_mapping", get(search_api::get_mapping))
+        // ES 8.x clients refuse to talk without the product header.
+        .layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async {
+                response.headers_mut().insert(
+                    "x-elastic-product",
+                    HeaderValue::from_static("Elasticsearch"),
+                );
+                response
+            },
+        ))
         .with_state(state)
 }
 

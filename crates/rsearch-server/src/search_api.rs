@@ -1,0 +1,260 @@
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
+
+use rsearch_metastore::MetastoreError;
+use rsearch_search::{SearchError, SearchRequest};
+
+use crate::state::AppState;
+
+/// POST/GET /{index}/_search
+pub async fn search(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+    body: String,
+) -> Response {
+    let Some(service) = state.search.clone() else {
+        return es_error(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "this node does not run the search role",
+        );
+    };
+    let body_json: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return es_error(
+                    StatusCode::BAD_REQUEST,
+                    "parse_exception",
+                    &format!("invalid search body: {e}"),
+                );
+            }
+        }
+    };
+    let request = match SearchRequest::parse(&index, &body_json) {
+        Ok(request) => request,
+        Err(e) => return map_search_error(e),
+    };
+    match service.search(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => map_search_error(e),
+    }
+}
+
+/// POST /_msearch — NDJSON header/body pairs (Grafana's transport).
+pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
+    if state.search.is_none() {
+        return es_error(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "this node does not run the search role",
+        );
+    }
+    let service = state.search.clone().unwrap();
+
+    let lines: Vec<&str> = body
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut responses = Vec::new();
+    let mut i = 0;
+    while i + 1 < lines.len() || (i < lines.len() && lines.len() % 2 == 0) {
+        let header: Value = match serde_json::from_str(lines[i]) {
+            Ok(v) => v,
+            Err(e) => {
+                return es_error(
+                    StatusCode::BAD_REQUEST,
+                    "parse_exception",
+                    &format!("invalid msearch header: {e}"),
+                );
+            }
+        };
+        let Some(body_line) = lines.get(i + 1) else {
+            break;
+        };
+        let search_body: Value = match serde_json::from_str(body_line) {
+            Ok(v) => v,
+            Err(e) => {
+                return es_error(
+                    StatusCode::BAD_REQUEST,
+                    "parse_exception",
+                    &format!("invalid msearch body: {e}"),
+                );
+            }
+        };
+        i += 2;
+
+        let index_pattern = header
+            .get("index")
+            .map(|v| match v {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+
+        let result = match resolve_stream(&state, &index_pattern).await {
+            Ok(stream) => match SearchRequest::parse(&stream, &search_body) {
+                Ok(request) => service.search(request).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e),
+        };
+        responses.push(match result {
+            Ok(mut response) => {
+                response["status"] = json!(200);
+                response
+            }
+            Err(reason) => json!({
+                "error": {"type": "search_exception", "reason": reason},
+                "status": 400,
+            }),
+        });
+    }
+    Json(json!({"took": 0, "responses": responses})).into_response()
+}
+
+/// Resolve an index expression (possibly `logs-*` style) to one stream.
+async fn resolve_stream(state: &AppState, pattern: &str) -> Result<String, String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Err("no index specified".to_string());
+    }
+    if !pattern.contains('*') {
+        return Ok(pattern.to_string());
+    }
+    let streams = state
+        .metastore
+        .list_streams()
+        .await
+        .map_err(|e| e.to_string())?;
+    let matches: Vec<String> = streams
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|name| glob_match(pattern, name))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no stream matches '{pattern}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => Err(format!(
+            "'{pattern}' matches {n} streams; multi-stream search is not supported yet"
+        )),
+    }
+}
+
+/// Minimal glob: '*' matches any run of characters.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut rest = name;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(pos) => {
+                // First part must anchor at the start.
+                if i == 0 && pos != 0 {
+                    return false;
+                }
+                rest = &rest[pos + part.len()..];
+            }
+            None => return false,
+        }
+    }
+    // Last part must anchor at the end unless the pattern ends with '*'.
+    pattern.ends_with('*') || parts.last().map(|p| rest.is_empty() || p.is_empty()).unwrap_or(true)
+}
+
+/// GET /{index}/_mapping — Grafana fetches this to discover fields.
+pub async fn get_mapping(State(state): State<AppState>, Path(index): Path<String>) -> Response {
+    match state.metastore.get_stream(&index).await {
+        Ok(stream) => {
+            let mut properties = stream
+                .mapping
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // The timestamp field is always present and always a date.
+            properties["@timestamp"] = json!({"type": "date"});
+            Json(json!({
+                index: {"mappings": {"properties": properties}}
+            }))
+            .into_response()
+        }
+        Err(MetastoreError::StreamNotFound(_)) => es_error(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            &format!("no such index [{index}]"),
+        ),
+        Err(e) => es_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// GET / — the version handshake clients and shippers probe.
+pub async fn root(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "name": state.node_id,
+        "cluster_name": state.cluster_name,
+        "cluster_uuid": "rsearch",
+        "version": {
+            // Report the OpenSearch-compatible ES version so ES clients,
+            // Vector, Fluent Bit, and Grafana take their 7.x code paths.
+            "number": "7.10.2",
+            "distribution": "opensearch",
+            "opensearch_version": "2.19.0",
+            "rsearch_version": env!("CARGO_PKG_VERSION"),
+            "build_type": "tar",
+            "lucene_version": "8.7.0",
+            "minimum_wire_compatibility_version": "6.8.0",
+            "minimum_index_compatibility_version": "6.0.0",
+        },
+        "tagline": "The OpenSearch Project: https://opensearch.org/",
+    }))
+}
+
+fn map_search_error(err: SearchError) -> Response {
+    match &err {
+        SearchError::BadRequest(reason) => {
+            es_error(StatusCode::BAD_REQUEST, "illegal_argument_exception", reason)
+        }
+        SearchError::Metastore(MetastoreError::StreamNotFound(name)) => es_error(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            &format!("no such index [{name}]"),
+        ),
+        other => es_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &other.to_string(),
+        ),
+    }
+}
+
+fn es_error(status: StatusCode, error_type: &str, reason: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "type": error_type,
+                "reason": reason,
+                "root_cause": [{"type": error_type, "reason": reason}],
+            },
+            "status": status.as_u16(),
+        })),
+    )
+        .into_response()
+}

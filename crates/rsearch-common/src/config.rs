@@ -14,6 +14,7 @@ pub struct RsearchConfig {
     pub storage: StorageConfig,
     pub metastore: MetastoreConfig,
     pub ingest: IngestConfig,
+    pub search: SearchConfig,
 }
 
 impl Default for RsearchConfig {
@@ -24,7 +25,21 @@ impl Default for RsearchConfig {
             storage: StorageConfig::default(),
             metastore: MetastoreConfig::default(),
             ingest: IngestConfig::default(),
+            search: SearchConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Local split-cache budget, in megabytes.
+    pub cache_max_mb: u64,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { cache_max_mb: 4096 }
     }
 }
 
