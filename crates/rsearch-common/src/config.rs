@@ -167,7 +167,8 @@ pub struct IngestConfig {
     pub max_batch_docs: usize,
     /// Max seconds a batch may age before a split is cut.
     pub max_batch_secs: u64,
-    /// Bound on the in-flight ingest queue before 429s are returned.
+    /// Bound on the in-flight ingest queue (documents per stream) before
+    /// per-item 429s are returned.
     pub queue_capacity: usize,
     /// Tantivy writer heap per stream worker, in megabytes.
     pub memory_budget_mb: usize,
@@ -180,7 +181,7 @@ impl Default for IngestConfig {
         Self {
             max_batch_docs: 500_000,
             max_batch_secs: 30,
-            queue_capacity: 64,
+            queue_capacity: 100_000,
             memory_budget_mb: 256,
             wal_segment_mb: 64,
         }

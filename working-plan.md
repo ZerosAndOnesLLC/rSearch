@@ -117,10 +117,10 @@ cargo check clean before every commit.
 
 - [x] 6.1 Replay harness: tool that replays a captured day of real logs at
       controlled rates against any `_bulk` endpoint
-- [ ] 6.2 Side-by-side vs OpenSearch container: ingest CPU/RSS at 5k and 10k
+- [x] 6.2 Side-by-side vs OpenSearch container: ingest CPU/RSS at 5k and 10k
       eps, query p50/p99 for needle, range-scan, and date_histogram queries,
       disk usage per GB ingested
-- [ ] 6.3 Record results in BENCHMARKS.md; validate the ~5–10× memory /
+- [x] 6.3 Record results in BENCHMARKS.md; validate the ~5–10× memory /
       ~2–3× CPU estimates; decide any architecture corrections before
       continuing
 
