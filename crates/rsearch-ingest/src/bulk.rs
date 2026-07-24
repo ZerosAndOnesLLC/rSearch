@@ -26,6 +26,9 @@ pub struct BulkItem {
     pub stream: String,
     pub doc_id: String,
     pub doc: Value,
+    /// The client's original document line, stored verbatim as `_source`
+    /// and written to the WAL — avoids re-serializing the parsed value.
+    pub raw: std::sync::Arc<str>,
 }
 
 /// Parse result: accepted items plus per-line rejections, positioned so
@@ -92,8 +95,8 @@ pub fn parse_bulk_body(
                         index,
                         "missing document line".to_string(),
                     ));
-                    outcome.total = position + 1;
-                    break;
+                    position += 1; // count this partial action...
+                    break; // ...then the post-loop `total = position` is correct
                 };
                 match serde_json::from_str::<Value>(doc_line) {
                     Ok(doc) if doc.is_object() => {
@@ -112,6 +115,7 @@ pub fn parse_bulk_body(
                                     stream: index,
                                     doc_id,
                                     doc,
+                                    raw: std::sync::Arc::from(doc_line),
                                 },
                             ));
                         }

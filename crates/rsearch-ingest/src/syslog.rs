@@ -48,12 +48,19 @@ fn try_parse(line: &str) -> Option<Value> {
         Some(doc)
     } else {
         // RFC 3164: "Mmm dd hh:mm:ss host tag: msg"
+        // The 15-char timestamp is ASCII, but a hostile packet may put a
+        // multi-byte char at that boundary — slice on a char boundary so
+        // this never panics (this runs inline in the UDP receive loop).
         let rest = rest.trim_start();
-        if rest.len() < 16 {
+        let split = rest
+            .char_indices()
+            .nth(15)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        if split < 15 {
             return None;
         }
-        let (_ts, after_ts) = rest.split_at(15);
-        let after_ts = after_ts.trim_start();
+        let after_ts = rest[split..].trim_start();
         let (host, msg) = after_ts.split_once(' ').unwrap_or((after_ts, ""));
         let (app, message) = match msg.split_once(':') {
             Some((tag, m)) => (tag.trim_end_matches(|c: char| c == '[' || c.is_ascii_digit() || c == ']'), m.trim_start()),
@@ -141,5 +148,17 @@ mod tests {
         let doc = parse_syslog("not really syslog");
         assert_eq!(doc["message"], "not really syslog");
         assert_eq!(doc["parse_error"], true);
+    }
+
+    #[test]
+    fn multibyte_at_timestamp_boundary_does_not_panic() {
+        // 8 two-byte chars = 16 bytes; byte 15 is mid-codepoint. This
+        // previously panicked the UDP receive loop.
+        let doc = parse_syslog("<13>éééééééérest of the message");
+        assert!(doc.is_object());
+        // A pile of exotic inputs must all return, never panic.
+        for raw in ["<0>", "<999>1 ", "<34>é", "<34>\u{10348}\u{10348}\u{10348}\u{10348}"] {
+            let _ = parse_syslog(raw);
+        }
     }
 }

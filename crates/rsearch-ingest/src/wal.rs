@@ -34,6 +34,8 @@ struct WalInner {
     current_len: u64,
     writer: BufWriter<std::fs::File>,
     segments: BTreeMap<u64, SegmentState>,
+    /// Total records write(2)-flushed to the OS (not yet fsynced).
+    written: u64,
 }
 
 /// Thread-safe WAL. Appends are called from blocking contexts (they do
@@ -42,6 +44,11 @@ pub struct Wal {
     dir: PathBuf,
     max_segment_bytes: u64,
     inner: Mutex<WalInner>,
+    /// Records durably fsynced. Group commit: whoever holds `sync_gate`
+    /// runs one fsync that makes every write flushed before it durable, so
+    /// concurrent appends don't each pay an independent fsync.
+    synced: std::sync::atomic::AtomicU64,
+    sync_gate: Mutex<()>,
 }
 
 fn segment_path(dir: &Path, seq: u64) -> PathBuf {
@@ -104,42 +111,77 @@ impl Wal {
                     current_len: 0,
                     writer: BufWriter::new(file),
                     segments,
+                    written: 0,
                 }),
+                synced: std::sync::atomic::AtomicU64::new(0),
+                sync_gate: Mutex::new(()),
             },
             records,
         ))
     }
 
-    /// Append a batch of (stream, doc) pairs and fsync once. Returns the
-    /// position of each record. Blocking — call via spawn_blocking.
+    /// Append a batch of (stream, doc) pairs durably. Returns the position
+    /// of each record. Blocking — call via spawn_blocking.
+    ///
+    /// Two phases: records are written and OS-flushed under the writer lock
+    /// (records serialized directly, CRC streamed — no per-record temp
+    /// buffer), then the fsync runs under a separate gate so concurrent
+    /// appends coalesce into one fsync (group commit) instead of each
+    /// paying its own.
     pub fn append_batch(&self, items: &[(String, Vec<u8>)]) -> std::io::Result<Vec<WalPos>> {
-        let mut inner = self.inner.lock().unwrap();
+        use std::sync::atomic::Ordering;
         let mut positions = Vec::with_capacity(items.len());
-        for (stream, doc) in items {
-            if inner.current_len >= self.max_segment_bytes {
-                self.rotate(&mut inner)?;
+        let (fd, my_gen) = {
+            let mut inner = self.inner.lock().unwrap();
+            for (stream, doc) in items {
+                if inner.current_len >= self.max_segment_bytes {
+                    self.rotate(&mut inner)?;
+                }
+                let stream_bytes = stream.as_bytes();
+                let payload_len = 2 + stream_bytes.len() + doc.len();
+                let len_field = stream_bytes.len() as u16;
+                // Stream the CRC over the three payload slices; write them
+                // directly to the buffered writer (no intermediate Vec).
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&len_field.to_le_bytes());
+                hasher.update(stream_bytes);
+                hasher.update(doc);
+                let crc = hasher.finalize();
+                inner.writer.write_all(&(payload_len as u32).to_le_bytes())?;
+                inner.writer.write_all(&crc.to_le_bytes())?;
+                inner.writer.write_all(&len_field.to_le_bytes())?;
+                inner.writer.write_all(stream_bytes)?;
+                inner.writer.write_all(doc)?;
+                inner.current_len += 8 + payload_len as u64;
+                let seq = inner.current_seq;
+                inner
+                    .segments
+                    .get_mut(&seq)
+                    .expect("current segment tracked")
+                    .outstanding += 1;
+                positions.push(WalPos { segment: seq });
             }
-            let stream_bytes = stream.as_bytes();
-            let payload_len = 2 + stream_bytes.len() + doc.len();
-            let mut payload = Vec::with_capacity(payload_len);
-            payload.extend_from_slice(&(stream_bytes.len() as u16).to_le_bytes());
-            payload.extend_from_slice(stream_bytes);
-            payload.extend_from_slice(doc);
-            let crc = crc32fast::hash(&payload);
-            inner.writer.write_all(&(payload_len as u32).to_le_bytes())?;
-            inner.writer.write_all(&crc.to_le_bytes())?;
-            inner.writer.write_all(&payload)?;
-            inner.current_len += 8 + payload_len as u64;
-            let seq = inner.current_seq;
-            inner
-                .segments
-                .get_mut(&seq)
-                .expect("current segment tracked")
-                .outstanding += 1;
-            positions.push(WalPos { segment: seq });
+            // Push buffered bytes to the OS, then clone the fd so the fsync
+            // can run outside this lock. `written` is bumped only after the
+            // flush, so any observer of a given gen knows it was flushed.
+            inner.writer.flush()?;
+            let fd = inner.writer.get_ref().try_clone()?;
+            inner.written += items.len() as u64;
+            (fd, inner.written)
+        };
+
+        // Group commit: if someone already fsynced past our records, skip;
+        // otherwise fsync once (covers everyone flushed so far).
+        if self.synced.load(Ordering::Acquire) < my_gen {
+            let _gate = self.sync_gate.lock().unwrap();
+            if self.synced.load(Ordering::Acquire) < my_gen {
+                // Snapshot the flushed high-water mark before the fsync so
+                // we can advance `synced` to cover all coalesced writers.
+                let covered = self.inner.lock().unwrap().written;
+                fd.sync_data()?;
+                self.synced.fetch_max(covered, Ordering::AcqRel);
+            }
         }
-        inner.writer.flush()?;
-        inner.writer.get_ref().sync_data()?;
         Ok(positions)
     }
 
@@ -300,6 +342,34 @@ mod tests {
         let positions: Vec<WalPos> = replayed.iter().map(|r| r.pos).collect();
         wal.confirm(&positions);
         assert_eq!(wal.outstanding(), 0);
+    }
+
+    #[test]
+    fn concurrent_group_commit_loses_nothing() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = Wal::open(dir.path(), 1 << 20).unwrap();
+        let wal = Arc::new(wal);
+        // 8 threads each append 100 records concurrently; group commit must
+        // not drop or mis-sync any of them.
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let wal = wal.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        wal.append_batch(&items(1, &format!("s{t}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(wal.outstanding(), 800);
+        drop(wal);
+        // Everything must replay after a "restart".
+        let (_, replayed) = Wal::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(replayed.len(), 800);
     }
 
     #[test]

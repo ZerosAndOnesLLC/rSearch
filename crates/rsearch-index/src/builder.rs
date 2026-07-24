@@ -71,18 +71,32 @@ impl SplitBuilder {
         self.doc_count
     }
 
-    /// Convert and buffer one document.
+    /// Convert and buffer one document (serializes `_source` from `doc`).
     pub fn add_json(
         &mut self,
         doc: &serde_json::Value,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
+        self.add_json_with_source(doc, None, fallback_timestamp)
+    }
+
+    /// Convert and buffer one document, storing `source` verbatim as
+    /// `_source` (the client's original line) instead of re-serializing.
+    pub fn add_json_with_source(
+        &mut self,
+        doc: &serde_json::Value,
+        source: Option<&str>,
+        fallback_timestamp: tantivy::DateTime,
+    ) -> IndexResult<()> {
         let (converted, ts): (TantivyDocument, _) =
-            self.converter.convert(doc, fallback_timestamp)?;
+            self.converter
+                .convert_with_source(doc, source, fallback_timestamp)?;
         let millis = ts.into_timestamp_millis();
+        // Update the advertised time range only after the doc is accepted,
+        // so a rejected add can't widen the split's range (L6).
+        self.writer.add_document(converted)?;
         self.min_ts_millis = self.min_ts_millis.min(millis);
         self.max_ts_millis = self.max_ts_millis.max(millis);
-        self.writer.add_document(converted)?;
         self.doc_count += 1;
         Ok(())
     }

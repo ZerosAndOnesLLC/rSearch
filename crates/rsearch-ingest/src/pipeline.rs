@@ -31,6 +31,8 @@ pub struct PipelineConfig {
 
 struct WorkItem {
     doc: Value,
+    /// Original document bytes, stored verbatim as `_source`.
+    source: Arc<str>,
     pos: WalPos,
 }
 
@@ -102,6 +104,15 @@ impl IngestPipeline {
         pipeline
     }
 
+    /// Load routing rules synchronously. Call before the ingest endpoints
+    /// start serving so documents in the startup window are never routed
+    /// with an empty rule set (M8).
+    pub async fn warm_routing_rules(&self) -> IngestResult<()> {
+        let rules = self.inner.metastore.list_routing_rules().await?;
+        *self.inner.rules.write().unwrap() = Arc::new(rules);
+        Ok(())
+    }
+
     /// Resolve where a document should go: the default stream unless a
     /// `move` rule matches; `copy` rules add extra destinations.
     pub fn expand_routes(&self, default_stream: &str, doc: &Value) -> Vec<String> {
@@ -148,10 +159,13 @@ impl IngestPipeline {
         default_stream: &str,
         docs: Vec<Value>,
     ) -> IngestResult<(usize, usize)> {
-        let mut pairs: Vec<(String, Value)> = Vec::new();
+        // Programmatic inputs have no original line, so serialize once and
+        // share the Arc across every route.
+        let mut pairs: Vec<(String, Value, Arc<str>)> = Vec::new();
         for doc in docs {
+            let source: Arc<str> = Arc::from(doc.to_string());
             for stream in self.expand_routes(default_stream, &doc) {
-                pairs.push((stream, doc.clone()));
+                pairs.push((stream, doc.clone(), source.clone()));
             }
         }
         if pairs.is_empty() {
@@ -160,7 +174,7 @@ impl IngestPipeline {
         let wal = self.inner.wal.clone();
         let wal_items: Vec<(String, Vec<u8>)> = pairs
             .iter()
-            .map(|(stream, doc)| (stream.clone(), doc.to_string().into_bytes()))
+            .map(|(stream, _, source)| (stream.clone(), source.as_bytes().to_vec()))
             .collect();
         let positions = tokio::task::spawn_blocking(move || wal.append_batch(&wal_items))
             .await
@@ -168,8 +182,8 @@ impl IngestPipeline {
 
         let mut accepted = 0;
         let mut dropped = 0;
-        for ((stream, doc), pos) in pairs.into_iter().zip(positions) {
-            match self.enqueue(&stream, doc, pos).await {
+        for ((stream, doc, source), pos) in pairs.into_iter().zip(positions) {
+            match self.enqueue(&stream, doc, source, pos).await {
                 Ok(()) => accepted += 1,
                 Err(_) => {
                     self.inner.wal.confirm(&[pos]);
@@ -191,13 +205,21 @@ impl IngestPipeline {
         &self.inner.wal
     }
 
-    /// Enqueue a WAL-durable document for indexing. Fails with
-    /// [`IngestError::Saturated`] when the stream's queue is full — the
-    /// caller reports a per-item 429 and confirms the WAL position.
-    pub async fn enqueue(&self, stream: &str, doc: Value, pos: WalPos) -> IngestResult<()> {
+    /// Enqueue a WAL-durable document for indexing. `source` is the exact
+    /// bytes stored as `_source` (the client's original line — no
+    /// re-serialization). Fails with [`IngestError::Saturated`] when the
+    /// stream's queue is full — the caller reports a per-item 429 and
+    /// confirms the WAL position.
+    pub async fn enqueue(
+        &self,
+        stream: &str,
+        doc: Value,
+        source: Arc<str>,
+        pos: WalPos,
+    ) -> IngestResult<()> {
         let tx = self.worker_for(stream).await?;
-        let size = doc.to_string().len() as u64; // approximate
-        match tx.try_send(WorkItem { doc, pos }) {
+        let size = source.len() as u64;
+        match tx.try_send(WorkItem { doc, source, pos }) {
             Ok(()) => {
                 self.inner.metrics.docs_enqueued.fetch_add(1, Ordering::Relaxed);
                 self.inner
@@ -219,9 +241,20 @@ impl IngestPipeline {
         for record in records {
             match serde_json::from_slice::<Value>(&record.doc) {
                 Ok(doc) => {
+                    // The WAL payload IS the original source bytes.
+                    let source: Arc<str> =
+                        Arc::from(String::from_utf8_lossy(&record.doc).into_owned());
                     let tx = self.worker_for(&record.stream).await?;
                     self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                    if tx.send(WorkItem { doc, pos: record.pos }).await.is_err() {
+                    if tx
+                        .send(WorkItem {
+                            doc,
+                            source,
+                            pos: record.pos,
+                        })
+                        .await
+                        .is_err()
+                    {
                         warn!(stream = %record.stream, "worker gone during replay");
                     }
                 }
@@ -274,6 +307,10 @@ async fn stream_worker(
     let mut buffer: Vec<WorkItem> = Vec::new();
     let far_future = Duration::from_secs(3600 * 24 * 365);
     let mut deadline = tokio::time::Instant::now() + far_future;
+    // Re-resolved before each flush so a mapping change (PUT /{index})
+    // takes effect on the next split, not only after a restart (L7).
+    let mut schema = schema;
+    let mut mapping_json = schema.mapping.to_json();
 
     loop {
         let flush_now = tokio::select! {
@@ -296,6 +333,14 @@ async fn stream_worker(
             _ = tokio::time::sleep_until(deadline) => !buffer.is_empty(),
         };
         if flush_now {
+            // Pick up mapping changes before building the split.
+            if let Ok(record) = inner.metastore.get_stream(&stream).await
+                && record.mapping != mapping_json
+            {
+                let mapping = IndexMapping::from_json(&record.mapping).unwrap_or_default();
+                schema = MappedSchema::build(mapping);
+                mapping_json = record.mapping;
+            }
             flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
             deadline = tokio::time::Instant::now() + far_future;
         }
@@ -309,56 +354,91 @@ async fn flush(
     schema: &MappedSchema,
     buffer: &mut Vec<WorkItem>,
 ) {
-    let batch = std::mem::take(buffer);
+    let mut batch = std::mem::take(buffer);
     let count = batch.len() as u64;
     inner.metrics.queue_depth.fetch_sub(count, Ordering::Relaxed);
     let positions: Vec<WalPos> = batch.iter().map(|item| item.pos).collect();
 
-    match flush_inner(inner, stream, stream_id, schema, batch).await {
-        Ok(split_id) => {
-            inner.wal.confirm(&positions);
-            inner.metrics.docs_indexed.fetch_add(count, Ordering::Relaxed);
-            inner.metrics.splits_published.fetch_add(1, Ordering::Relaxed);
-            info!(stream, split_id = %split_id, docs = count, "split published");
-        }
-        Err(e) => {
-            // Documents remain in the WAL and will be replayed on restart.
-            inner.metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
-            error!(stream, docs = count, error = %e, "flush failed; docs retained in WAL for replay");
+    // Retry the flush with capped backoff on transient errors (S3/DB
+    // blips). Data is already WAL-durable, so an in-process retry recovers
+    // without a restart; the WAL still backstops a hard crash.
+    let mut backoff = Duration::from_millis(200);
+    let max_attempts = 8;
+    for attempt in 1..=max_attempts {
+        match flush_inner(inner, stream, stream_id, schema, batch).await {
+            Ok(split_id) => {
+                inner.wal.confirm(&positions);
+                inner.metrics.docs_indexed.fetch_add(count, Ordering::Relaxed);
+                inner.metrics.splits_published.fetch_add(1, Ordering::Relaxed);
+                info!(stream, split_id = %split_id, docs = count, "split published");
+                return;
+            }
+            Err((e, returned)) => {
+                batch = returned;
+                inner.metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                if attempt == max_attempts {
+                    error!(
+                        stream, docs = count, error = %e,
+                        "flush failed after retries; docs retained in WAL for replay on restart"
+                    );
+                    return;
+                }
+                warn!(stream, attempt, error = %e, "flush failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
         }
     }
 }
 
+/// Build → upload → stage → publish a batch. On error, returns the batch
+/// back alongside the error so the caller can retry (the split-building
+/// step is deterministic, so re-running it is safe).
 async fn flush_inner(
     inner: &Arc<PipelineInner>,
     stream: &str,
     stream_id: i64,
     schema: &MappedSchema,
     batch: Vec<WorkItem>,
-) -> IngestResult<String> {
+) -> Result<String, (IngestError, Vec<WorkItem>)> {
     let schema = schema.clone();
     let stream_name = stream.to_string();
     let work_dir = inner.config.work_dir.clone();
     let budget = inner.config.memory_budget;
 
-    let packaged = tokio::task::spawn_blocking(move || {
-        let mut builder = SplitBuilder::new(stream_name, schema, &work_dir, budget)?;
-        let fallback = now_datetime();
-        for item in &batch {
-            builder.add_json(&item.doc, fallback)?;
-        }
-        builder.finish()
+    // The blocking task always hands the batch back so a failed flush can
+    // be retried without having lost the documents.
+    let (result, batch) = tokio::task::spawn_blocking(move || {
+        let build = (|| {
+            let mut builder = SplitBuilder::new(stream_name, schema, &work_dir, budget)?;
+            let fallback = now_datetime();
+            for item in &batch {
+                builder.add_json_with_source(&item.doc, Some(&item.source), fallback)?;
+            }
+            builder.finish()
+        })();
+        (build, batch)
     })
     .await
     .map_err(|e| {
-        IngestError::Index(rsearch_index::IndexError::InvalidDocument(format!(
-            "indexing task panicked: {e}"
-        )))
-    })??;
+        (
+            IngestError::Index(rsearch_index::IndexError::InvalidDocument(format!(
+                "indexing task panicked: {e}"
+            ))),
+            Vec::new(),
+        )
+    })?;
+
+    let packaged = match result {
+        Ok(packaged) => packaged,
+        Err(e) => return Err((IngestError::Index(e), batch)),
+    };
 
     let key = format!("streams/{stream}/{}.split", packaged.meta.split_id);
-    inner.storage.put_file(&key, &packaged.file_path).await?;
-    inner
+    if let Err(e) = inner.storage.put_file(&key, &packaged.file_path).await {
+        return Err((IngestError::Storage(e), batch));
+    }
+    if let Err(e) = inner
         .metastore
         .stage_split(
             &packaged.meta.split_id,
@@ -371,7 +451,12 @@ async fn flush_inner(
             packaged.footer_len as i64,
             Some(&inner.config.node_id),
         )
-        .await?;
-    inner.metastore.publish_split(&packaged.meta.split_id).await?;
+        .await
+    {
+        return Err((IngestError::Metastore(e), batch));
+    }
+    if let Err(e) = inner.metastore.publish_split(&packaged.meta.split_id).await {
+        return Err((IngestError::Metastore(e), batch));
+    }
     Ok(packaged.meta.split_id)
 }

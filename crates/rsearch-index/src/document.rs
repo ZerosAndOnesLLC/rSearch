@@ -75,12 +75,25 @@ impl DocumentConverter {
         &self.schema
     }
 
-    /// Convert one document. `fallback_timestamp` is used when the document
-    /// carries no parseable `@timestamp`/`timestamp` (normally ingest time).
-    /// Returns the converted document and its effective timestamp.
+    /// Convert one document, deriving the stored `_source` from the doc.
     pub fn convert(
         &self,
         doc: &serde_json::Value,
+        fallback_timestamp: tantivy::DateTime,
+    ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
+        self.convert_with_source(doc, None, fallback_timestamp)
+    }
+
+    /// Convert one document. `source` is the exact bytes to store as
+    /// `_source`; when `None` the doc is serialized. Passing the client's
+    /// original NDJSON line avoids a redundant re-serialization on the
+    /// ingest hot path. `fallback_timestamp` is used when the document
+    /// carries no parseable `@timestamp`/`timestamp`. Returns the
+    /// converted document and its effective timestamp.
+    pub fn convert_with_source(
+        &self,
+        doc: &serde_json::Value,
+        source: Option<&str>,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
         let obj = doc
@@ -90,7 +103,10 @@ impl DocumentConverter {
         let timestamp = extract_timestamp(doc).unwrap_or(fallback_timestamp);
         let mut out = TantivyDocument::new();
         out.add_date(self.schema.timestamp, timestamp);
-        out.add_text(self.schema.source, doc.to_string());
+        match source {
+            Some(source) => out.add_text(self.schema.source, source),
+            None => out.add_text(self.schema.source, doc.to_string()),
+        }
 
         let mut dynamic = serde_json::Map::new();
         for (key, value) in obj {

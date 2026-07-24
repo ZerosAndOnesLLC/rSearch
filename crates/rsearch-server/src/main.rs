@@ -91,6 +91,12 @@ async fn main() -> anyhow::Result<()> {
         if replay_count > 0 {
             info!(replay_count, "WAL replay complete");
         }
+        // Load routing rules before any ingest endpoint or input starts,
+        // so startup-window docs are routed correctly.
+        pipeline
+            .warm_routing_rules()
+            .await
+            .context("loading routing rules")?;
         rsearch_ingest::spawn_inputs(&config.inputs, pipeline.clone())
             .await
             .map_err(|e| anyhow::anyhow!(e))
