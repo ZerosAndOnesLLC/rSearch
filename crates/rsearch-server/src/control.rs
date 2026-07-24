@@ -22,6 +22,9 @@ pub struct ControlPlane {
     node_id: String,
     work_dir: std::path::PathBuf,
     memory_budget: usize,
+    /// Alert queries execute locally on the control leader.
+    search: rsearch_search::SearchService,
+    webhook: crate::webhook::WebhookClient,
 }
 
 impl ControlPlane {
@@ -31,15 +34,19 @@ impl ControlPlane {
         storage: Arc<dyn Storage>,
     ) -> anyhow::Result<Self> {
         let data_dir = std::path::PathBuf::from(&config.node.data_dir);
-        let cache = SplitCache::new(data_dir.join("cache/control"), 1 << 30)?;
+        let cache = Arc::new(SplitCache::new(data_dir.join("cache/control"), 1 << 30)?);
+        let search =
+            rsearch_search::SearchService::new(metastore.clone(), storage.clone(), cache.clone());
         Ok(Self {
             metastore,
             storage,
-            cache: Arc::new(cache),
+            cache,
             config: config.control.clone(),
             node_id: config.node_id(),
             work_dir: data_dir.join("merge"),
             memory_budget: config.ingest.memory_budget_mb << 20,
+            search,
+            webhook: crate::webhook::WebhookClient::new()?,
         })
     }
 
@@ -83,6 +90,79 @@ impl ControlPlane {
         if let Err(e) = self.metastore.expire_dead_nodes(3600.0).await {
             error!(error = %e, "node expiry failed");
         }
+        if let Err(e) = self.alert_job().await {
+            error!(error = %e, "alert job failed");
+        }
+    }
+
+    /// Run due alerts: count hits over the window, compare, fire webhook.
+    async fn alert_job(&self) -> anyhow::Result<()> {
+        let due = self.metastore.due_alerts().await?;
+        for alert in due {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let window_start = now_ms - alert.window_secs * 1000;
+            let mut filters = vec![serde_json::json!({
+                "range": {"@timestamp": {"gte": window_start, "lte": now_ms}}
+            })];
+            if alert.query.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+                filters.push(alert.query.clone());
+            }
+            let body = serde_json::json!({
+                "query": {"bool": {"filter": filters}},
+                "size": 0,
+            });
+            let count = match rsearch_search::SearchRequest::parse(&alert.stream, &body) {
+                Ok(request) => match self.search.search(request).await {
+                    Ok(result) => result["hits"]["total"]["value"].as_i64().unwrap_or(0),
+                    Err(e) => {
+                        self.metastore
+                            .record_alert_run(&alert.name, &format!("error: {e}"), None)
+                            .await?;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    self.metastore
+                        .record_alert_run(&alert.name, &format!("error: {e}"), None)
+                        .await?;
+                    continue;
+                }
+            };
+            let triggered = match alert.condition_op.as_str() {
+                "lt" => count < alert.threshold,
+                _ => count > alert.threshold,
+            };
+            let status = if triggered {
+                let payload = serde_json::json!({
+                    "alert": alert.name,
+                    "stream": alert.stream,
+                    "count": count,
+                    "condition": format!("count {} {}", alert.condition_op, alert.threshold),
+                    "window_secs": alert.window_secs,
+                    "timestamp_millis": now_ms,
+                    "node": self.node_id,
+                });
+                match self.webhook.post_json(&alert.webhook_url, &payload).await {
+                    Ok(status_code) => {
+                        info!(alert = %alert.name, count, status_code, "alert fired");
+                        "fired".to_string()
+                    }
+                    Err(e) => {
+                        warn!(alert = %alert.name, error = %e, "webhook delivery failed");
+                        format!("webhook_error: {e}")
+                    }
+                }
+            } else {
+                "ok".to_string()
+            };
+            self.metastore
+                .record_alert_run(&alert.name, &status, Some(count))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Combine the first group of >= 2 small published splits in one

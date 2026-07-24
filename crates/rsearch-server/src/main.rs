@@ -1,4 +1,5 @@
 mod admin_api;
+mod alerts_api;
 mod auth;
 mod auth_api;
 mod bulk_api;
@@ -6,6 +7,7 @@ mod control;
 mod routes;
 mod search_api;
 mod state;
+mod webhook;
 
 
 use std::path::PathBuf;

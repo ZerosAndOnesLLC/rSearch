@@ -162,7 +162,7 @@ cargo check clean before every commit.
 
 ## Phase 10 — Alerting & UI
 
-- [ ] 10.1 Scheduled query alerts: cron-style schedule, query + threshold
+- [x] 10.1 Scheduled query alerts: cron-style schedule, query + threshold
       condition, webhook notification (email later); runs on control leader
 - [ ] 10.2 UI (separate NextJS project, S3+CloudFront pattern): search screen
       (query, time picker, histogram, results), stream management, retention,

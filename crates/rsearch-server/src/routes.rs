@@ -45,6 +45,11 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(crate::admin_api::put_retention),
         )
         .route("/_rsearch/login", post(crate::auth_api::login))
+        .route("/_rsearch/alerts", get(crate::alerts_api::list_alerts))
+        .route(
+            "/_rsearch/alerts/{name}",
+            axum::routing::put(crate::alerts_api::put_alert).delete(crate::alerts_api::delete_alert),
+        )
         .route(
             "/_rsearch/users",
             get(crate::auth_api::list_users),

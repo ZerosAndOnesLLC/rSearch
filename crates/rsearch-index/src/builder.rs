@@ -198,3 +198,51 @@ mod tests {
         assert!(builder.finish().is_err());
     }
 }
+
+#[cfg(test)]
+mod timestamp_units {
+    use super::*;
+    use crate::mapping::{IndexMapping, MappedSchema};
+
+    /// Regression: shippers send epoch timestamps in seconds, millis,
+    /// micros, or nanos. None of them may panic the indexer.
+    #[test]
+    fn hostile_timestamp_units_never_panic() {
+        let scratch = tempfile::tempdir().unwrap();
+        let schema = MappedSchema::build(IndexMapping::default());
+        let mut builder = SplitBuilder::new("repro", schema, scratch.path(), 50 << 20).unwrap();
+        for ts in [
+            serde_json::json!(1_784_871_020_i64),             // seconds
+            serde_json::json!(1_784_871_020_163_i64),         // millis
+            serde_json::json!(1_784_871_020_163_018_i64),     // micros
+            serde_json::json!(1_784_871_020_163_018_377_i64), // nanos
+            serde_json::json!(1_784_871_020.163),             // float secs (GELF)
+            serde_json::json!(i64::MAX),
+            serde_json::json!(i64::MIN),
+            serde_json::json!(f64::INFINITY),
+        ] {
+            builder
+                .add_json(
+                    &serde_json::json!({"@timestamp": ts, "message": "x"}),
+                    tantivy::DateTime::from_timestamp_millis(1_784_871_020_163),
+                )
+                .unwrap();
+        }
+        let packaged = builder.finish().unwrap();
+        assert_eq!(packaged.meta.doc_count, 8);
+        // All finite epoch variants agree on the same instant (to the second).
+        assert!(packaged.meta.time_start_millis <= -9_000_000_000_000);
+        assert!(packaged.meta.time_end_millis >= 9_000_000_000_000);
+    }
+
+    #[test]
+    fn epoch_unit_detection() {
+        use crate::document::epoch_to_millis;
+        assert_eq!(epoch_to_millis(1_784_871_020), 1_784_871_020_000);
+        assert_eq!(epoch_to_millis(1_784_871_020_163), 1_784_871_020_163);
+        assert_eq!(epoch_to_millis(1_784_871_020_163_018), 1_784_871_020_163);
+        assert_eq!(epoch_to_millis(1_784_871_020_163_018_377), 1_784_871_020_163);
+        assert!(epoch_to_millis(i64::MAX) <= i64::MAX / 1_000_000);
+        assert!(epoch_to_millis(i64::MIN) >= -(i64::MAX / 1_000_000));
+    }
+}

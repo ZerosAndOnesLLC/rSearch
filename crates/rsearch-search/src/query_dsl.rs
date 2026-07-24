@@ -90,21 +90,19 @@ fn parse_time_millis(value: &Value) -> Option<i64> {
             if let Ok(dt) = OffsetDateTime::parse(s, &Rfc3339) {
                 return Some((dt.unix_timestamp_nanos() / 1_000_000) as i64);
             }
-            s.parse::<i64>().ok().map(normalize_epoch)
+            s.parse::<i64>().ok().map(rsearch_index::epoch_to_millis)
         }
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Some(normalize_epoch(i))
+                Some(rsearch_index::epoch_to_millis(i))
             } else {
-                n.as_f64().map(|f| (f * 1000.0) as i64)
+                n.as_f64()
+                    .filter(|f| f.is_finite())
+                    .map(|f| rsearch_index::epoch_to_millis((f * 1000.0) as i64))
             }
         }
         _ => None,
     }
-}
-
-fn normalize_epoch(i: i64) -> i64 {
-    if i >= 1_000_000_000_000 { i } else { i * 1000 }
 }
 
 /// Scan a query tree for range bounds on the timestamp field, for split

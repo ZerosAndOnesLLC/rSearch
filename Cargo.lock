@@ -1582,6 +1582,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2349,6 +2350,10 @@ dependencies = [
  "axum",
  "axum-server",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rsearch-common",
  "rsearch-index",
  "rsearch-ingest",

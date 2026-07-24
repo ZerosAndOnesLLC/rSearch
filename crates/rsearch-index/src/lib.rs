@@ -13,7 +13,7 @@ pub use builder::{PackagedSplit, SplitBuilder};
 pub use tantivy::DateTime;
 pub use cache::SplitCache;
 pub use reader::SplitReader;
-pub use document::{DocumentConverter, extract_timestamp};
+pub use document::{DocumentConverter, epoch_to_millis, extract_timestamp};
 pub use error::{IndexError, IndexResult};
 pub use mapping::{FieldType, IndexMapping, MappedSchema};
 pub use split_file::{BundleMeta, FOOTER_TAIL_LEN, FileSpan, SplitMeta, parse_footer_tail, parse_meta};

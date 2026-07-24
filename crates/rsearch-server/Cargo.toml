@@ -25,3 +25,7 @@ clap.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 axum-server.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+hyper-rustls.workspace = true

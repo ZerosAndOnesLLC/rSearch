@@ -15,22 +15,44 @@ pub fn extract_timestamp(doc: &serde_json::Value) -> Option<tantivy::DateTime> {
     parse_timestamp(value)
 }
 
+/// Widest epoch-millis range tantivy's nanosecond representation holds
+/// (~year 1677 to ~2262). Out-of-range inputs clamp instead of panicking.
+const MAX_SAFE_MILLIS: i64 = i64::MAX / 1_000_000;
+
+/// Normalize an epoch number of unknown unit (secs, millis, micros, or
+/// nanos — shippers send all four) to clamped epoch milliseconds.
+pub fn epoch_to_millis(value: i64) -> i64 {
+    let millis = match value.unsigned_abs() {
+        0..=99_999_999_999 => value,                       // seconds (to ~5138 AD)
+        100_000_000_000..=99_999_999_999_999 => return value.clamp(-MAX_SAFE_MILLIS, MAX_SAFE_MILLIS), // millis
+        100_000_000_000_000..=99_999_999_999_999_999 => return value / 1_000, // micros
+        _ => return value / 1_000_000,                     // nanos
+    };
+    millis.saturating_mul(1000).clamp(-MAX_SAFE_MILLIS, MAX_SAFE_MILLIS)
+}
+
 fn parse_timestamp(value: &serde_json::Value) -> Option<tantivy::DateTime> {
     match value {
         serde_json::Value::String(s) => OffsetDateTime::parse(s, &Rfc3339)
             .ok()
             .map(tantivy::DateTime::from_utc),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                if i >= 1_000_000_000_000 {
-                    Some(tantivy::DateTime::from_timestamp_millis(i))
-                } else {
-                    Some(tantivy::DateTime::from_timestamp_secs(i))
-                }
+            let millis = if let Some(i) = n.as_i64() {
+                epoch_to_millis(i)
             } else {
-                n.as_f64()
-                    .map(|f| tantivy::DateTime::from_timestamp_millis((f * 1000.0) as i64))
-            }
+                let f = n.as_f64()?;
+                if !f.is_finite() {
+                    return None;
+                }
+                // Floats follow the same unit heuristic (GELF sends
+                // fractional seconds).
+                if f.abs() < 100_000_000_000.0 {
+                    ((f * 1000.0) as i64).clamp(-MAX_SAFE_MILLIS, MAX_SAFE_MILLIS)
+                } else {
+                    epoch_to_millis(f as i64)
+                }
+            };
+            Some(tantivy::DateTime::from_timestamp_millis(millis))
         }
         _ => None,
     }
