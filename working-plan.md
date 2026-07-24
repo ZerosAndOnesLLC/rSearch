@@ -174,12 +174,12 @@ Standard review agents only (no multi-agent workflow orchestration). Findings
 are presented grouped by severity and wait for per-finding direction — never
 auto-applied.
 
-- [ ] 11.1 Security review (`/security-review`): full pass over the codebase —
+- [x] 11.1 Security review (`/security-review`): full pass over the codebase —
       auth paths, ingest parsing (untrusted NDJSON/syslog/GELF input), TLS
       config, FIPS algorithm usage, SQL injection surface
-- [ ] 11.2 Code review (`/code-review`): correctness pass over the core crates
+- [x] 11.2 Code review (`/code-review`): correctness pass over the core crates
       (index, metastore, ingest, search)
-- [ ] 11.3 Performance/quality review agent: hot paths (bulk parsing, split
+- [x] 11.3 Performance/quality review agent: hot paths (bulk parsing, split
       search/merge, WAL), allocation patterns, query efficiency vs the
       benchmark numbers from phase 6
 - [ ] 11.4 Action items: user triages findings; approved fixes applied as
