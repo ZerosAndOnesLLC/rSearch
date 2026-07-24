@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::HeaderValue;
 use axum::response::IntoResponse;
@@ -13,6 +15,10 @@ use crate::state::AppState;
 const BULK_BODY_LIMIT: usize = 100 << 20;
 
 pub fn router(state: AppState) -> Router {
+    let cors_origin = Arc::new(
+        HeaderValue::from_str(&state.cors_allow_origin)
+            .unwrap_or_else(|_| HeaderValue::from_static("*")),
+    );
     Router::new()
         .route("/", get(search_api::root))
         .route("/health", get(health))
@@ -73,24 +79,33 @@ pub fn router(state: AppState) -> Router {
         ))
         // ES 8.x clients refuse to talk without the product header; CORS
         // lets the UI (separate origin) call the API with token auth.
-        .layer(axum::middleware::from_fn(
-            |request: axum::extract::Request, next: axum::middleware::Next| async {
+        .layer(axum::middleware::from_fn_with_state(
+            cors_origin,
+            |axum::extract::State(origin): axum::extract::State<Arc<HeaderValue>>,
+             request: axum::extract::Request,
+             next: axum::middleware::Next| async move {
                 if request.method() == axum::http::Method::OPTIONS {
-                    return cors_headers(axum::http::StatusCode::NO_CONTENT.into_response());
+                    return cors_headers(
+                        axum::http::StatusCode::NO_CONTENT.into_response(),
+                        &origin,
+                    );
                 }
-                cors_headers(next.run(request).await)
+                cors_headers(next.run(request).await, &origin)
             },
         ))
         .with_state(state)
 }
 
-fn cors_headers(mut response: axum::response::Response) -> axum::response::Response {
+fn cors_headers(
+    mut response: axum::response::Response,
+    origin: &HeaderValue,
+) -> axum::response::Response {
     let headers = response.headers_mut();
     headers.insert(
         "x-elastic-product",
         HeaderValue::from_static("Elasticsearch"),
     );
-    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    headers.insert("access-control-allow-origin", origin.clone());
     headers.insert(
         "access-control-allow-methods",
         HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),

@@ -71,9 +71,14 @@ impl ControlPlane {
                 tokio::time::sleep(Duration::from_secs(self.config.interval_secs)).await;
                 if !Metastore::leadership_alive(&mut leader_conn).await {
                     warn!("leadership connection lost; abdicating");
+                    // Dead connection: the lock is already freed server-side,
+                    // just drop it.
                     break;
                 }
             }
+            // Explicitly release the advisory lock so a healthy connection
+            // doesn't keep leadership pinned in the pool (M7).
+            Metastore::release_leadership(leader_conn).await;
         }
     }
 
@@ -83,6 +88,9 @@ impl ControlPlane {
         }
         if let Err(e) = self.retention_job().await {
             error!(error = %e, "retention job failed");
+        }
+        if let Err(e) = self.staged_orphan_job().await {
+            error!(error = %e, "staged-orphan sweep failed");
         }
         if let Err(e) = self.gc_job().await {
             error!(error = %e, "gc job failed");
@@ -249,6 +257,23 @@ impl ControlPlane {
             docs = packaged.meta.doc_count,
             "merge complete"
         );
+        Ok(())
+    }
+
+    /// Sweep splits stuck in `staged` (crash between stage and publish):
+    /// mark them for deletion so the GC job removes the orphaned object
+    /// and row (M5).
+    async fn staged_orphan_job(&self) -> anyhow::Result<()> {
+        let stale = self
+            .metastore
+            .stale_staged_splits(self.config.staged_orphan_secs, 100)
+            .await?;
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = stale.iter().map(|s| s.split_id.clone()).collect();
+        let marked = self.metastore.mark_splits_for_delete(&ids).await?;
+        info!(marked, "swept orphaned staged splits for deletion");
         Ok(())
     }
 

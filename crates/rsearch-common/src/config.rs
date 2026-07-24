@@ -168,6 +168,10 @@ impl Default for NodeConfig {
 pub struct HttpConfig {
     pub bind_addr: String,
     pub tls: TlsConfig,
+    /// Value for Access-Control-Allow-Origin. Defaults to "*"; set to a
+    /// specific origin to restrict browser access (auth is header-based,
+    /// so credentials are never auto-attached, but restricting is safer).
+    pub cors_allow_origin: String,
 }
 
 impl Default for HttpConfig {
@@ -175,6 +179,7 @@ impl Default for HttpConfig {
         Self {
             bind_addr: "0.0.0.0:9200".to_string(),
             tls: TlsConfig::default(),
+            cors_allow_origin: "*".to_string(),
         }
     }
 }
@@ -285,6 +290,14 @@ impl Default for IngestConfig {
 }
 
 impl RsearchConfig {
+    /// Known top-level config sections. Only `RSEARCH_<SECTION>__…` env
+    /// vars targeting one of these are consumed, so an unrelated
+    /// `RSEARCH_*` variable in the environment never crashes startup
+    /// (`deny_unknown_fields` still catches typos *within* a section).
+    const SECTIONS: [&str; 8] = [
+        "NODE", "HTTP", "STORAGE", "METASTORE", "INGEST", "SEARCH", "CONTROL", "INPUTS",
+    ];
+
     /// Load configuration: defaults <- optional TOML file <- RSEARCH_ env vars.
     pub fn load(file: Option<&str>) -> Result<Self> {
         let mut builder = ::config::Config::builder();
@@ -295,7 +308,11 @@ impl RsearchConfig {
             ::config::Environment::with_prefix("RSEARCH")
                 .prefix_separator("_")
                 .separator("__")
-                .try_parsing(true),
+                .try_parsing(true)
+                // Feed a pre-filtered env map so stray RSEARCH_-prefixed
+                // vars that don't target a known section (RSEARCH_TEST_*,
+                // RSEARCH_HOME, …) never reach deny_unknown_fields (M14).
+                .source(Some(filtered_rsearch_env())),
         );
         let cfg = builder
             .build()
@@ -318,6 +335,22 @@ impl RsearchConfig {
     }
 }
 
+/// Collect `RSEARCH_<SECTION>__…` environment variables for the known
+/// sections only. Everything else with the `RSEARCH_` prefix is ignored,
+/// so unrelated vars can't fail config deserialization.
+fn filtered_rsearch_env() -> ::config::Map<String, String> {
+    let mut map = ::config::Map::new();
+    for (key, value) in std::env::vars() {
+        if let Some(rest) = key.strip_prefix("RSEARCH_") {
+            let section = rest.split("__").next().unwrap_or("");
+            if RsearchConfig::SECTIONS.contains(&section) {
+                map.insert(key, value);
+            }
+        }
+    }
+    map
+}
+
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -335,5 +368,22 @@ mod tests {
         assert_eq!(cfg.http.bind_addr, "0.0.0.0:9200");
         assert_eq!(cfg.storage.backend, "fs");
         assert!(!cfg.http.tls.enabled);
+    }
+
+    #[test]
+    fn stray_rsearch_env_var_does_not_crash_load() {
+        // A prefixed var that targets no known section must be ignored,
+        // not error via deny_unknown_fields (M14). SAFETY: single-threaded
+        // test process.
+        unsafe {
+            std::env::set_var("RSEARCH_TEST_DATABASE_URL", "postgres://x");
+            std::env::set_var("RSEARCH_HOME", "/tmp");
+        }
+        let cfg = RsearchConfig::load(None).expect("stray RSEARCH_ vars must not crash load");
+        assert_eq!(cfg.http.bind_addr, "0.0.0.0:9200");
+        unsafe {
+            std::env::remove_var("RSEARCH_TEST_DATABASE_URL");
+            std::env::remove_var("RSEARCH_HOME");
+        }
     }
 }
