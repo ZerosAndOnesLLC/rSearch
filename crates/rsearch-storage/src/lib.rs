@@ -3,9 +3,13 @@
 //! ever go through the [`Storage`] trait.
 
 mod error;
+mod factory;
 mod fs;
+mod s3;
 mod storage;
 
 pub use error::{StorageError, StorageResult};
+pub use factory::from_config;
 pub use fs::FsStorage;
+pub use s3::S3Storage;
 pub use storage::Storage;

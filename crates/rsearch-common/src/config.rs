@@ -101,6 +101,15 @@ pub struct StorageConfig {
     pub force_path_style: bool,
     /// Use FIPS endpoints when talking to AWS S3.
     pub use_fips_endpoint: bool,
+    /// Signing region. Any non-empty string works for MinIO/S3-compatible
+    /// stores; defaults to us-east-1 when unset.
+    pub region: String,
+    /// Static credentials for self-hosted / air-gapped deployments
+    /// (set here or via RSEARCH_STORAGE__ACCESS_KEY_ID / __SECRET_ACCESS_KEY).
+    /// When empty, the AWS credential chain is used (env, profile,
+    /// task role, IMDS) — intended for real AWS with IAM roles.
+    pub access_key_id: String,
+    pub secret_access_key: String,
 }
 
 impl Default for StorageConfig {
@@ -112,6 +121,9 @@ impl Default for StorageConfig {
             endpoint: String::new(),
             force_path_style: false,
             use_fips_endpoint: false,
+            region: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
         }
     }
 }

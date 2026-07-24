@@ -14,7 +14,10 @@ deny = [
     { crate = "openssl-sys", reason = "system OpenSSL is not the validated module; use rustls + aws-lc-rs FIPS" },
     { crate = "native-tls", reason = "delegates to platform TLS outside the validated module" },
     # Non-approved algorithms for security functions.
-    { crate = "md-5", reason = "MD5 is not FIPS-approved" },
+    # Exception: aws-smithy-checksums uses MD5 solely for the S3
+    # Content-MD5 wire-protocol integrity header — a non-security use
+    # permitted under FIPS. Any other consumer of md-5 stays banned.
+    { crate = "md-5", reason = "MD5 is not FIPS-approved", wrappers = ["aws-smithy-checksums"] },
     { crate = "md5", reason = "MD5 is not FIPS-approved" },
     { crate = "sha1_smol", reason = "SHA-1 is not FIPS-approved for new signatures" },
     { crate = "argon2", reason = "not FIPS-approved; use PBKDF2-HMAC-SHA256" },

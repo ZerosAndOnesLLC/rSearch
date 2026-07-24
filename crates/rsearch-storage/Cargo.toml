@@ -12,6 +12,11 @@ async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-http-client.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+aws-config.workspace = true
+aws-smithy-http-client.workspace = true
