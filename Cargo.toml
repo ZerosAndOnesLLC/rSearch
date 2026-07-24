@@ -37,6 +37,9 @@ clap = { version = "4", features = ["derive", "env"] }
 rustls = { version = "0.23", default-features = false, features = ["fips", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+async-trait = "0.1"
+bytes = "1"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

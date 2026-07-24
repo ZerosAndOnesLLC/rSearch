@@ -58,7 +58,7 @@ cargo check clean before every commit.
 
 ## Phase 2 — Storage & index core
 
-- [ ] 2.1 `Storage` trait (put, get, get_range, delete, list, exists) +
+- [x] 2.1 `Storage` trait (put, get, get_range, delete, list, exists) +
       local-FS implementation + tests
 - [ ] 2.2 S3 backend via aws-sdk-s3: custom endpoint support (MinIO), path-style
       addressing option, `use_fips` config, retry policy; integration test
