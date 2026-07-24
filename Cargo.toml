@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsearch-common",
+    "crates/rsearch-storage",
+    "crates/rsearch-index",
+    "crates/rsearch-metastore",
+    "crates/rsearch-ingest",
+    "crates/rsearch-search",
+    "crates/rsearch-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[workspace.dependencies]
+rsearch-common = { path = "crates/rsearch-common" }
+rsearch-storage = { path = "crates/rsearch-storage" }
+rsearch-index = { path = "crates/rsearch-index" }
+rsearch-metastore = { path = "crates/rsearch-metastore" }
+rsearch-ingest = { path = "crates/rsearch-ingest" }
+rsearch-search = { path = "crates/rsearch-search" }
+
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+config = { version = "0.15", default-features = false, features = ["toml"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+lto = "thin"

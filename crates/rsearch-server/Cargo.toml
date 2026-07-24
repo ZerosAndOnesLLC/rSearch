@@ -1,0 +1,18 @@
+[package]
+name = "rsearch-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rsearch"
+path = "src/main.rs"
+
+[dependencies]
+rsearch-common.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+clap.workspace = true
