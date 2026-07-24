@@ -69,6 +69,24 @@ impl FsStorage {
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| Self::io_err(key, e))?;
+        self.sync_parent(&path, key).await?;
+        Ok(())
+    }
+
+    /// fsync the directory holding `path` so a rename survives power loss.
+    async fn sync_parent(&self, path: &Path, key: &str) -> StorageResult<()> {
+        if let Some(parent) = path.parent() {
+            // Directory fsync is best-effort across platforms; ignore
+            // ENOTSUP/EINVAL but surface real IO errors.
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                match dir.sync_all().await {
+                    Ok(()) => {}
+                    // Some filesystems reject directory fsync (EINVAL 22).
+                    Err(e) if e.raw_os_error() == Some(22) => {}
+                    Err(e) => return Err(Self::io_err(key, e)),
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -86,9 +104,18 @@ impl Storage for FsStorage {
         tokio::fs::copy(local, &tmp)
             .await
             .map_err(|e| Self::io_err(key, e))?;
+        // Durability: fsync the data before it becomes visible, so the
+        // ingest WAL is only truncated after the split is truly on disk.
+        {
+            let file = tokio::fs::File::open(&tmp)
+                .await
+                .map_err(|e| Self::io_err(key, e))?;
+            file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
+        }
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| Self::io_err(key, e))?;
+        self.sync_parent(&path, key).await?;
         Ok(())
     }
 
