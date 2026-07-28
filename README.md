@@ -125,3 +125,8 @@ GELF (TCP), each routable to a stream and subject to routing rules.
 `ui/` is a Next.js app (search, streams/retention, alerts, users & API
 keys). `cd ui && npm install && npm run build`. Point it at the API with
 `NEXT_PUBLIC_RSEARCH_API`.
+
+## License
+
+rSearch is free software, licensed under the [GNU General Public
+License v3.0 or later](LICENSE).
