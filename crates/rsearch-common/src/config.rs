@@ -123,6 +123,12 @@ pub struct ControlConfig {
     /// Seconds a split may sit in `staged` before an orphan sweep marks
     /// it for deletion (crash between stage and publish).
     pub staged_orphan_secs: f64,
+    /// Replicated backend: a holder whose heartbeat is older than this
+    /// counts as gone for replication purposes, making its objects repair
+    /// candidates. Deliberately much shorter than dead-node expiry (which
+    /// only governs registry row cleanup) — with factor 2, every second
+    /// of this window is one failure away from data loss.
+    pub repair_stale_secs: f64,
 }
 
 impl Default for ControlConfig {
@@ -134,6 +140,7 @@ impl Default for ControlConfig {
             gc_grace_secs: 600.0,
             allow_insecure_webhooks: false,
             staged_orphan_secs: 3600.0,
+            repair_stale_secs: 300.0,
         }
     }
 }

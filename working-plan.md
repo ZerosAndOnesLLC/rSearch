@@ -236,7 +236,7 @@ Design decisions (locked):
       wiring. Write-target selection is bytes-aware: prefer live,
       non-draining storage nodes holding the fewest total bytes (aggregate
       over `object_locations`), so new nodes absorb writes first
-- [ ] 12.4 Repair + lifecycle on the control leader: re-replication job
+- [x] 12.4 Repair + lifecycle on the control leader: re-replication job
       (scan under-replicated keys, instruct a healthy non-holder to pull
       from a live holder), prioritizing keys with the fewest live holders;
       under-replication counts holders against a short staleness threshold

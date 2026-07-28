@@ -25,6 +25,15 @@ pub struct ControlPlane {
     /// Alert queries execute locally on the control leader.
     search: rsearch_search::SearchService,
     webhook: crate::webhook::WebhookClient,
+    /// Present when the replicated storage backend is active: the leader
+    /// re-replicates under-held objects between peers.
+    replication: Option<ReplicationCtl>,
+}
+
+struct ReplicationCtl {
+    client: rsearch_storage::PeerClient,
+    replication_factor: i64,
+    repair_stale_secs: f64,
 }
 
 impl ControlPlane {
@@ -37,6 +46,16 @@ impl ControlPlane {
         let cache = Arc::new(SplitCache::new(data_dir.join("cache/control"), 1 << 30)?);
         let search =
             rsearch_search::SearchService::new(metastore.clone(), storage.clone(), cache.clone());
+        let replication = if config.storage.backend == "replicated" {
+            Some(ReplicationCtl {
+                client: rsearch_storage::PeerClient::new(&config.cluster.internal_token)
+                    .map_err(|e| anyhow::anyhow!("building repair peer client: {e}"))?,
+                replication_factor: config.storage.replication_factor as i64,
+                repair_stale_secs: config.control.repair_stale_secs,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             metastore,
             storage,
@@ -47,6 +66,7 @@ impl ControlPlane {
             memory_budget: config.ingest.memory_budget_mb << 20,
             search,
             webhook: crate::webhook::WebhookClient::new(config.control.allow_insecure_webhooks)?,
+            replication,
         })
     }
 
@@ -98,9 +118,68 @@ impl ControlPlane {
         if let Err(e) = self.metastore.expire_dead_nodes(3600.0).await {
             error!(error = %e, "node expiry failed");
         }
+        if let Err(e) = self.repair_job().await {
+            error!(error = %e, "repair job failed");
+        }
         if let Err(e) = self.alert_job().await {
             error!(error = %e, "alert job failed");
         }
+    }
+
+    /// Re-replicate objects held by fewer than replication_factor live
+    /// nodes (replicated backend only). Most-endangered keys first; each
+    /// copy is a leader-instructed pull on the target so the transfer
+    /// streams peer-to-peer, never through the leader.
+    async fn repair_job(&self) -> anyhow::Result<()> {
+        let Some(ctl) = &self.replication else {
+            return Ok(());
+        };
+        let under = self
+            .metastore
+            .under_replicated_keys(ctl.replication_factor, ctl.repair_stale_secs, 20)
+            .await?;
+        for entry in under {
+            let key = &entry.storage_key;
+            // Holders must be reachable *now* to serve as copy sources.
+            let holders = self.metastore.live_holders_of(key, 30.0).await?;
+            let Some(source) = holders.iter().find_map(|h| h.address.as_deref()) else {
+                warn!(key, "repair: no live holder — object currently unavailable");
+                continue;
+            };
+            let missing = (ctl.replication_factor as usize).saturating_sub(holders.len());
+            if missing == 0 {
+                continue;
+            }
+            let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
+            let targets = self
+                .metastore
+                .replication_targets(30.0, &exclude, missing as i64)
+                .await?;
+            if targets.is_empty() {
+                warn!(key, "repair: no eligible target nodes");
+                continue;
+            }
+            for target in targets {
+                let Some(target_addr) = target.address.as_deref() else { continue };
+                match tokio::time::timeout(
+                    Duration::from_secs(600),
+                    ctl.client.replicate(target_addr, key, source),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        info!(key, target = %target.id, "repair: copy restored");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(key, target = %target.id, error = %e, "repair: replicate failed");
+                    }
+                    Err(_) => {
+                        warn!(key, target = %target.id, "repair: replicate timed out");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run due alerts: count hits over the window, compare, fire webhook.

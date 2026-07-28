@@ -51,14 +51,27 @@ impl Metastore {
         .await?)
     }
 
-    /// Remove nodes that have not heartbeated for `expire_after_secs`.
+    /// Remove nodes that have not heartbeated for `expire_after_secs`,
+    /// along with their object placement rows (an expired node's copies
+    /// are unreachable; repair has had ample time to replace them, and a
+    /// returning node must not resurrect stale placement).
     pub async fn expire_dead_nodes(&self, expire_after_secs: f64) -> MetastoreResult<u64> {
-        let result = sqlx::query(
-            "DELETE FROM nodes WHERE last_heartbeat < now() - make_interval(secs => $1)",
+        let mut tx = self.pool().begin().await?;
+        let expired: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM nodes WHERE last_heartbeat < now() - make_interval(secs => $1)
+             RETURNING id",
         )
         .bind(expire_after_secs)
-        .execute(self.pool())
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        if !expired.is_empty() {
+            let ids: Vec<String> = expired.iter().map(|(id,)| id.clone()).collect();
+            sqlx::query("DELETE FROM object_locations WHERE node_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(expired.len() as u64)
     }
 }

@@ -79,6 +79,7 @@ merge_min_mb = 100          # published splits smaller than this get merged
 merge_max_group = 8         # max splits combined per merge
 gc_grace_secs = 600         # delay before deleting marked-for-delete splits
 staged_orphan_secs = 3600   # sweep splits stuck in 'staged' after a crash
+repair_stale_secs = 300     # replicated backend: holder silence before re-replication
 allow_insecure_webhooks = false  # require https + block private IPs for alerts
 
 # Network log inputs (disabled by default). Each routes to a stream and is
