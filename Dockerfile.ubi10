@@ -1,0 +1,58 @@
+# ── UBI 10 FIPS build of rSearch ──────────────────────────────────────────────
+# Produces a Red Hat UBI 10 image whose cryptography is the CMVP-validated AWS-LC
+# FIPS module (pulled in via aws-lc-rs "fips" across the dependency graph). Use
+# this variant on FIPS-enabled RHEL / OpenShift hosts; the debian `Dockerfile`
+# remains the default for local/dev builds.
+#
+# Both stages are UBI 10 so the glibc the binary links against matches the runtime.
+# The AWS-LC FIPS module builds from source and needs cmake + go + perl + a C/C++
+# toolchain. Rust is pinned via rustup to the workspace `rust-version` (UBI's
+# rust-toolset trails the required 1.97).
+
+ARG RUST_VERSION=1.97.0
+
+# ---- build ------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi10/ubi:latest AS build
+ARG RUST_VERSION
+# Toolchain for cargo + the AWS-LC FIPS module (cmake/go/perl + clang).
+# clang is REQUIRED for the FIPS module: its "delocate" step rejects the sections
+# RHEL's hardened gcc emits (".data section found in module"). Build the C/C++ with
+# clang via CC/CXX below; Rust itself still uses its bundled LLVM.
+RUN dnf -y install \
+        gcc gcc-c++ make cmake golang clang \
+        perl perl-FindBin perl-IPC-Cmd perl-Data-Dumper \
+        curl-minimal \
+    && dnf clean all
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:$PATH \
+    CC=clang \
+    CXX=clang++
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}"
+WORKDIR /src
+COPY . .
+# Builds the `rsearch` binary; the FIPS provider is compiled in and the server
+# refuses to start TLS unless ServerConfig::fips() reports true.
+RUN cargo build --release -p rsearch-server \
+    && strip target/release/rsearch
+
+# ---- runtime ----------------------------------------------------------------
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
+LABEL org.opencontainers.image.title="rSearch (UBI10 FIPS)" \
+      org.opencontainers.image.source="https://github.com/ZerosAndOnesLLC/rSearch" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+# ca-certificates for TLS trust; shadow-utils for useradd. OpenShift runs
+# containers with an arbitrary UID in group 0, so the data dir is owned by
+# group 0 and group-writable (chmod g=u).
+RUN microdnf -y install ca-certificates shadow-utils \
+    && microdnf clean all \
+    && useradd -r -u 1001 -g 0 -s /sbin/nologin -d /var/lib/rsearch rsearch \
+    && mkdir -p /var/lib/rsearch \
+    && chown -R 1001:0 /var/lib/rsearch \
+    && chmod -R g=u /var/lib/rsearch
+COPY --from=build /src/target/release/rsearch /usr/local/bin/rsearch
+USER 1001
+ENV RSEARCH_NODE__DATA_DIR=/var/lib/rsearch
+EXPOSE 9200
+ENTRYPOINT ["/usr/local/bin/rsearch"]
