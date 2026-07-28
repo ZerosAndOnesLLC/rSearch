@@ -5,6 +5,7 @@ mod auth_api;
 mod bulk_api;
 mod control;
 mod internal_api;
+mod placement;
 mod routes;
 mod search_api;
 mod state;
@@ -59,9 +60,29 @@ async fn main() -> anyhow::Result<()> {
     let metastore = Metastore::connect(&config.metastore)
         .await
         .context("connecting to metastore")?;
-    let storage = rsearch_storage::from_config(&config.storage)
-        .await
-        .context("initializing storage backend")?;
+    let storage: std::sync::Arc<dyn rsearch_storage::Storage> =
+        if config.storage.backend == "replicated" {
+            if config.cluster.internal_token.is_empty() {
+                anyhow::bail!(
+                    "storage.backend = \"replicated\" requires cluster.internal_token \
+                     (generate one with `openssl rand -hex 32`)"
+                );
+            }
+            std::sync::Arc::new(rsearch_storage::ReplicatedStorage::new(
+                rsearch_storage::FsStorage::new(config.storage.root.clone()),
+                std::sync::Arc::new(placement::MetastorePlacement::new(metastore.clone())),
+                rsearch_storage::PeerClient::new(&config.cluster.internal_token)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("building peer client")?,
+                config.node_id(),
+                config.storage.replication_factor,
+                config.storage.effective_write_quorum(),
+            ))
+        } else {
+            rsearch_storage::from_config(&config.storage)
+                .await
+                .context("initializing storage backend")?
+        };
 
     // Ingest role: open the WAL (replaying unpublished docs) and start the
     // indexer pipeline.
@@ -152,12 +173,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut state = AppState::new(&config, &roles, metastore, pipeline, search);
     if config.storage.backend == "replicated" {
-        if config.cluster.internal_token.is_empty() {
-            anyhow::bail!(
-                "storage.backend = \"replicated\" requires cluster.internal_token \
-                 (generate one with `openssl rand -hex 32`)"
-            );
-        }
         state.internal = Some(std::sync::Arc::new(internal_api::InternalState {
             fs: rsearch_storage::FsStorage::new(config.storage.root.clone()),
             token_digest: rsearch_common::crypto::token_digest(&config.cluster.internal_token),

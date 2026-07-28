@@ -34,3 +34,4 @@ hyper-rustls.workspace = true
 url.workspace = true
 serde.workspace = true
 tokio-util.workspace = true
+async-trait.workspace = true

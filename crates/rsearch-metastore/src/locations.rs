@@ -88,6 +88,65 @@ impl Metastore {
         Ok(rows.into_iter().map(|(key,)| key).collect())
     }
 
+    /// Up to `limit` live nodes to receive new object copies, excluding
+    /// `exclude` (typically the writer and existing holders), preferring
+    /// nodes holding the fewest total bytes so fresh/empty nodes absorb
+    /// writes first.
+    pub async fn replication_targets(
+        &self,
+        stale_after_secs: f64,
+        exclude: &[String],
+        limit: i64,
+    ) -> MetastoreResult<Vec<NodeRecord>> {
+        Ok(sqlx::query_as::<_, NodeRecord>(
+            "SELECT n.id, n.roles, n.address,
+                    EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs
+             FROM nodes n
+             LEFT JOIN (
+                 SELECT node_id, SUM(size_bytes)::bigint AS bytes
+                 FROM object_locations GROUP BY node_id
+             ) held ON held.node_id = n.id
+             WHERE n.last_heartbeat > now() - make_interval(secs => $1)
+               AND n.id <> ALL($2)
+             ORDER BY COALESCE(held.bytes, 0) ASC, n.id
+             LIMIT $3",
+        )
+        .bind(stale_after_secs)
+        .bind(exclude)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Recorded size of an object, if any copy is registered.
+    pub async fn object_size(&self, storage_key: &str) -> MetastoreResult<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT MAX(size_bytes) FROM object_locations WHERE storage_key = $1
+             GROUP BY storage_key",
+        )
+        .bind(storage_key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(size,)| size))
+    }
+
+    /// Distinct keys under a prefix; the placement table is authoritative
+    /// for cluster-wide listing.
+    pub async fn object_keys_with_prefix(&self, prefix: &str) -> MetastoreResult<Vec<String>> {
+        let pattern = format!(
+            "{}%",
+            prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT storage_key FROM object_locations
+             WHERE storage_key LIKE $1 ORDER BY storage_key",
+        )
+        .bind(pattern)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(key,)| key).collect())
+    }
+
     /// Keys with fewer than `replication_factor` copies on live nodes
     /// (heartbeat within `stale_after_secs`), most endangered first.
     /// Keys whose holders are all dead surface with live_holders = 0.

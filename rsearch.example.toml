@@ -30,9 +30,11 @@ cert_path = ""
 key_path = ""
 
 [storage]
-# "fs" (local disk) or "s3" (AWS S3 or any S3-compatible endpoint).
+# "fs" (local disk), "s3" (AWS S3 or any S3-compatible endpoint), or
+# "replicated" (each node's local disk + peer replication — HA on plain
+# block storage; requires node.advertise_addr and cluster.internal_token).
 backend = "fs"
-# fs backend:
+# fs/replicated backends: local object root.
 root = "./data/storage"
 # s3 backend:
 bucket = ""

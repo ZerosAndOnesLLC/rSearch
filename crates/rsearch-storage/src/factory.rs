@@ -14,7 +14,10 @@ pub async fn from_config(cfg: &StorageConfig) -> StorageResult<Arc<dyn Storage>>
         "s3" => Ok(Arc::new(S3Storage::from_config(cfg).await?)),
         other => Err(StorageError::Backend {
             key: String::new(),
-            message: format!("unknown storage backend '{other}' (expected fs or s3)"),
+            message: format!(
+                "unknown storage backend '{other}' (expected fs, s3, or replicated — \
+                 replicated is constructed by the server, not this factory)"
+            ),
         }),
     }
 }

@@ -228,7 +228,7 @@ Design decisions (locked):
       streamed `PUT /_rsearch/internal/objects/{key}` (atomic tmp+rename,
       fsync — reuse FsStorage write discipline);
       `POST /_rsearch/internal/replicate` (pull `key` from `source_addr`)
-- [ ] 12.3 `ReplicatedStorage` backend in rsearch-storage: wraps local
+- [x] 12.3 `ReplicatedStorage` backend in rsearch-storage: wraps local
       FsStorage + peer HTTP client + metastore handle; put/put_file with
       peer push + quorum + location records; get/get_range with peer
       fallback; delete fans out to all holders and clears location rows
