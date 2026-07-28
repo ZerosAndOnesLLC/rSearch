@@ -185,6 +185,78 @@ auto-applied.
 - [x] 11.4 Action items: all review findings fixed (blanket approval); see git log. Critical + all High/Medium + most Low addressed; two design notes accepted as known v1 behavior (at-least-once on crash-between-publish-and-confirm; stop-at-first-corruption WAL replay).
       normal sub-phase commits
 
+## Phase 12 — Native split replication (`replicated` storage backend)
+
+HA on plain block storage with no external object store: each node keeps a
+local fs object root, splits are replicated to `replication_factor` nodes at
+upload time, reads fall back to a live holder over HTTP, and the control
+leader repairs under-replication. Postgres remains the source of truth
+(placement lives in the metastore); splits are immutable so replication is
+whole-file copy, never sync.
+
+Design decisions (locked):
+- Placement is tracked per storage key in a new `object_locations` table —
+  a storage-layer concern keyed by key, not split_id, so the `Storage` trait
+  stays object-agnostic.
+- Write path: `put_file` writes the local root first, then pushes to
+  `replication_factor - 1` live storage-role peers. Publish requires
+  `write_quorum` successful copies (default: min(2, replication_factor));
+  under quorum the error propagates and the ingest pipeline's existing
+  WAL-backed retry handles it. Repair closes the gap to full RF later.
+- Read path: local root hit → serve; miss → look up holders in the
+  metastore, ranged GET from a live holder. `SplitCache` above the storage
+  layer keeps hot ranges local, so peer reads are cold-path only.
+- Peer API is internal-only: bearer token (`cluster.internal_token`,
+  constant-time compare) over the existing TLS listener; mounted only when
+  `backend = "replicated"`.
+- Ingest WAL stays node-local and unreplicated (accepted RPO: acked docs on
+  a dead node are stranded until its volume returns — same as today, and
+  WAL forwarding stays in Deferred).
+- Heartbeats must advertise a dialable address: new `node.advertise_addr`
+  (falls back to bind_addr) replaces the current `0.0.0.0` heartbeat value.
+
+- [x] 12.1 Metastore + config groundwork: sqlx migration for
+      `object_locations (storage_key, node_id, size_bytes, created_at,
+      PK(storage_key, node_id))` + index on node_id; metastore methods
+      (record/remove location, holders_of, locations_on_node,
+      under_replicated_keys); `node.advertise_addr` config wired into the
+      heartbeat; `storage.replication_factor`, `storage.write_quorum`,
+      `cluster.internal_token` config fields + example toml
+- [ ] 12.2 Internal object API on the axum server (mounted only for the
+      replicated backend, token-gated): ranged
+      `GET /_rsearch/internal/objects/{key}` served from the local root;
+      streamed `PUT /_rsearch/internal/objects/{key}` (atomic tmp+rename,
+      fsync — reuse FsStorage write discipline);
+      `POST /_rsearch/internal/replicate` (pull `key` from `source_addr`)
+- [ ] 12.3 `ReplicatedStorage` backend in rsearch-storage: wraps local
+      FsStorage + peer HTTP client + metastore handle; put/put_file with
+      peer push + quorum + location records; get/get_range with peer
+      fallback; delete fans out to all holders and clears location rows
+      (tolerates dead holders); list from `object_locations`; factory
+      wiring. Write-target selection is bytes-aware: prefer live,
+      non-draining storage nodes holding the fewest total bytes (aggregate
+      over `object_locations`), so new nodes absorb writes first
+- [ ] 12.4 Repair + lifecycle on the control leader: re-replication job
+      (scan under-replicated keys, instruct a healthy non-holder to pull
+      from a live holder), prioritizing keys with the fewest live holders;
+      under-replication counts holders against a short staleness threshold
+      (`control.repair_stale_secs`, default 300) — NOT the 3600s dead-node
+      expiry, which only governs row cleanup; purge location rows for
+      expired nodes inside the dead-node expiry path; GC delete path
+      verified against fan-out
+- [ ] 12.5 Cluster test + docs: extend `tests/cluster/run-cluster-test.sh`
+      with a replicated-backend topology (3 nodes, rf=2, kill a holder,
+      verify search still answers and repair restores rf); README + example
+      config section on HA-on-block-storage
+- [ ] 12.6 Graceful drain/decommission: `draining` flag on the nodes table
+      + admin endpoint (`POST /_rsearch/nodes/{id}/drain`); draining nodes
+      are excluded from write-target selection; drain job on the control
+      leader copies everything in the node's `object_locations` to healthy
+      nodes while it still serves reads; node deletes cleanly once empty
+      (ingest listeners stop + WAL flushes to published splits on the
+      draining node before shutdown, closing the RPO gap for planned
+      scale-in)
+
 ## Deferred (explicitly out of v1)
 
 - Distributed search fan-out across searchers (any searcher answers alone in v1)

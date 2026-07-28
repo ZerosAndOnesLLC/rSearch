@@ -68,6 +68,14 @@ pub struct StreamStats {
     pub size_bytes: i64,
 }
 
+/// A storage object with fewer live copies than the replication factor.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UnderReplicatedKey {
+    pub storage_key: String,
+    /// Copies on nodes whose heartbeat is within the staleness threshold.
+    pub live_holders: i64,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct NodeRecord {
     pub id: String,

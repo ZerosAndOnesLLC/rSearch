@@ -134,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         let metastore = metastore.clone();
         let node_id = config.node_id();
         let role_names: Vec<String> = roles.iter().map(ToString::to_string).collect();
-        let address = config.http.bind_addr.clone();
+        let address = config.advertise_url();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {

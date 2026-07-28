@@ -17,6 +17,7 @@ pub struct RsearchConfig {
     pub search: SearchConfig,
     pub control: ControlConfig,
     pub inputs: InputsConfig,
+    pub cluster: ClusterConfig,
 }
 
 impl Default for RsearchConfig {
@@ -30,8 +31,19 @@ impl Default for RsearchConfig {
             search: SearchConfig::default(),
             control: ControlConfig::default(),
             inputs: InputsConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
+}
+
+/// Node-to-node settings for the replicated storage backend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Shared bearer token authenticating internal peer requests
+    /// (object transfer/replication). Required when the replicated
+    /// storage backend is enabled; compared in constant time.
+    pub internal_token: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -150,6 +162,11 @@ pub struct NodeConfig {
     pub roles: Vec<Role>,
     /// Directory for node-local state (WAL, split cache, staging).
     pub data_dir: String,
+    /// Address other nodes use to reach this node's HTTP API, e.g.
+    /// "node1.internal:9200" or a full "https://…" URL. Empty falls back
+    /// to http.bind_addr — fine for single-node, but a multi-node cluster
+    /// must set it (0.0.0.0 is not dialable by peers).
+    pub advertise_addr: String,
 }
 
 impl Default for NodeConfig {
@@ -159,6 +176,7 @@ impl Default for NodeConfig {
             id: None,
             roles: Role::ALL.to_vec(),
             data_dir: "./data".to_string(),
+            advertise_addr: String::new(),
         }
     }
 }
@@ -226,6 +244,12 @@ pub struct StorageConfig {
     /// task role, IMDS) — intended for real AWS with IAM roles.
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// Replicated backend: copies kept per object across storage nodes.
+    pub replication_factor: usize,
+    /// Replicated backend: copies that must succeed before a write is
+    /// acknowledged. 0 = auto: min(2, replication_factor). Repair closes
+    /// the gap to the full replication factor in the background.
+    pub write_quorum: usize,
 }
 
 impl Default for StorageConfig {
@@ -240,7 +264,23 @@ impl Default for StorageConfig {
             region: String::new(),
             access_key_id: String::new(),
             secret_access_key: String::new(),
+            replication_factor: 2,
+            write_quorum: 0,
         }
+    }
+}
+
+impl StorageConfig {
+    /// Copies required before a write is acknowledged: the configured
+    /// quorum clamped to the replication factor, with 0 meaning auto
+    /// (min(2, replication_factor)).
+    pub fn effective_write_quorum(&self) -> usize {
+        let quorum = if self.write_quorum == 0 {
+            self.replication_factor.min(2)
+        } else {
+            self.write_quorum
+        };
+        quorum.min(self.replication_factor).max(1)
     }
 }
 
@@ -294,8 +334,9 @@ impl RsearchConfig {
     /// vars targeting one of these are consumed, so an unrelated
     /// `RSEARCH_*` variable in the environment never crashes startup
     /// (`deny_unknown_fields` still catches typos *within* a section).
-    const SECTIONS: [&str; 8] = [
+    const SECTIONS: [&str; 9] = [
         "NODE", "HTTP", "STORAGE", "METASTORE", "INGEST", "SEARCH", "CONTROL", "INPUTS",
+        "CLUSTER",
     ];
 
     /// Load configuration: defaults <- optional TOML file <- RSEARCH_ env vars.
@@ -333,6 +374,25 @@ impl RsearchConfig {
             .clone()
             .unwrap_or_else(|| "rsearch-node".to_string())
     }
+
+    /// URL peers use to reach this node, derived from node.advertise_addr
+    /// (falling back to http.bind_addr) with the scheme implied by the TLS
+    /// setting when the address doesn't carry one. This is what the
+    /// heartbeat publishes to the nodes table.
+    pub fn advertise_url(&self) -> String {
+        let addr = if self.node.advertise_addr.is_empty() {
+            &self.http.bind_addr
+        } else {
+            &self.node.advertise_addr
+        };
+        if addr.contains("://") {
+            addr.clone()
+        } else if self.http.tls.enabled {
+            format!("https://{addr}")
+        } else {
+            format!("http://{addr}")
+        }
+    }
 }
 
 /// Collect `RSEARCH_<SECTION>__…` environment variables for the known
@@ -368,6 +428,34 @@ mod tests {
         assert_eq!(cfg.http.bind_addr, "0.0.0.0:9200");
         assert_eq!(cfg.storage.backend, "fs");
         assert!(!cfg.http.tls.enabled);
+    }
+
+    #[test]
+    fn advertise_url_falls_back_and_derives_scheme() {
+        let mut cfg = RsearchConfig::default();
+        assert_eq!(cfg.advertise_url(), "http://0.0.0.0:9200");
+        cfg.node.advertise_addr = "node1.internal:9200".to_string();
+        assert_eq!(cfg.advertise_url(), "http://node1.internal:9200");
+        cfg.http.tls.enabled = true;
+        assert_eq!(cfg.advertise_url(), "https://node1.internal:9200");
+        cfg.node.advertise_addr = "http://behind-proxy:8080".to_string();
+        assert_eq!(cfg.advertise_url(), "http://behind-proxy:8080");
+    }
+
+    #[test]
+    fn write_quorum_auto_and_clamping() {
+        let mut storage = StorageConfig::default();
+        // Auto: min(2, rf).
+        assert_eq!(storage.effective_write_quorum(), 2);
+        storage.replication_factor = 1;
+        assert_eq!(storage.effective_write_quorum(), 1);
+        storage.replication_factor = 3;
+        assert_eq!(storage.effective_write_quorum(), 2);
+        // Explicit quorum clamps to the replication factor, floor 1.
+        storage.write_quorum = 5;
+        assert_eq!(storage.effective_write_quorum(), 3);
+        storage.write_quorum = 1;
+        assert_eq!(storage.effective_write_quorum(), 1);
     }
 
     #[test]

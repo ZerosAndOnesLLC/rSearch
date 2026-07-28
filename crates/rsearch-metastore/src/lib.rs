@@ -6,6 +6,7 @@ mod alerts;
 mod auth;
 mod control;
 mod error;
+mod locations;
 mod metastore;
 mod nodes;
 mod routing;
@@ -18,4 +19,6 @@ pub use routing::RoutingRuleRecord;
 
 pub use error::{MetastoreError, MetastoreResult};
 pub use metastore::Metastore;
-pub use types::{NodeRecord, SplitRecord, SplitState, StreamRecord, StreamStats};
+pub use types::{
+    NodeRecord, SplitRecord, SplitState, StreamRecord, StreamStats, UnderReplicatedKey,
+};

@@ -10,6 +10,10 @@ cluster_name = "rsearch"
 roles = ["ingest", "search", "control"]
 # Node-local state: WAL, split cache, staging.
 data_dir = "./data"
+# Address peers use to reach this node (host:port or full URL). Required in
+# multi-node clusters — the default falls back to http.bind_addr, and
+# 0.0.0.0 is not dialable by peers.
+advertise_addr = ""
 
 [http]
 bind_addr = "0.0.0.0:9200"
@@ -41,6 +45,15 @@ region = ""              # defaults to us-east-1; any value works for MinIO
 # use IAM task/instance roles.
 access_key_id = ""
 secret_access_key = ""
+# replicated backend (HA on plain block storage, no external object store):
+replication_factor = 2   # copies kept per split across storage nodes
+write_quorum = 0         # copies required to ack a write; 0 = min(2, factor)
+
+# Node-to-node settings for the replicated storage backend.
+[cluster]
+# Shared bearer token authenticating internal peer requests. Required when
+# storage.backend = "replicated"; generate with e.g. `openssl rand -hex 32`.
+internal_token = ""
 
 [metastore]
 # Empty reads the DATABASE_URL environment variable. Postgres must use
