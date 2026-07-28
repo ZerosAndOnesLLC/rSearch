@@ -244,7 +244,7 @@ Design decisions (locked):
       expiry, which only governs row cleanup; purge location rows for
       expired nodes inside the dead-node expiry path; GC delete path
       verified against fan-out
-- [ ] 12.5 Cluster test + docs: extend `tests/cluster/run-cluster-test.sh`
+- [x] 12.5 Cluster test + docs: extend `tests/cluster/run-cluster-test.sh`
       with a replicated-backend topology (3 nodes, rf=2, kill a holder,
       verify search still answers and repair restores rf); README + example
       config section on HA-on-block-storage

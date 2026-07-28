@@ -15,6 +15,9 @@ no garbage collector.
 - **Cluster-ready by design** — immutable index splits in object storage
   (S3, MinIO, or local disk), Postgres metastore/control plane, stateless
   searchers; a single node is just a cluster of one
+- **HA on plain block storage** — the `replicated` backend keeps split
+  copies on N nodes' local disks with quorum writes, peer reads, and
+  automatic re-replication; no external object store required
 - **Tantivy index engine** — Lucene-class full-text search and
   ES-compatible aggregations with predictable, GC-free latency
 
@@ -89,6 +92,50 @@ curl -XPUT localhost:9200/_rsearch/users/admin \
 A reference multi-node topology (2 ingest + 2 search + 1 control over
 Postgres and MinIO) is in `docker-compose.yml`; the kill-a-node test
 suite that exercises it is `tests/cluster/run-cluster-test.sh`.
+
+## HA on block storage (no object store)
+
+The `replicated` storage backend turns each node's local disk (any block
+device — EBS, iSCSI, plain SATA) into cluster storage with no external
+object store: only rSearch and Postgres run. Every split is written to
+`storage.replication_factor` nodes (quorum-acknowledged before the
+ingest WAL lets go of the data), reads fall back to a live holder over
+the internal peer API, and the control leader re-replicates the copies
+of a node that goes silent for `control.repair_stale_secs` (default
+5 minutes). New or empty nodes absorb new writes first, so capacity
+rebalances as data churns through retention.
+
+```toml
+[node]
+advertise_addr = "node1.internal:9200"   # peers must be able to dial this
+
+[storage]
+backend = "replicated"
+root = "/var/lib/rsearch/objects"        # this node's local object root
+replication_factor = 2
+
+[cluster]
+internal_token = "<openssl rand -hex 32, same on every node>"
+```
+
+Operational notes:
+
+- Postgres holds placement and all metadata — run it HA too, or it is
+  the single point of failure.
+- With factor 2, the window between a node dying and repair completing
+  is one further failure away from data loss; size
+  `repair_stale_secs` and node count accordingly.
+- A node returning after its registry entry expired may hold orphaned
+  object files (repair already replaced its copies); these are inert
+  and can be cleaned by wiping the object root before restart.
+- The ingest WAL stays node-local: docs acked but not yet published when
+  a node dies are recovered by WAL replay when that node (or its volume)
+  returns — same recovery story as the fs backend.
+- TLS between peers uses the FIPS provider with webpki roots, so
+  internal certificates must chain to a trusted root.
+
+The 3-node kill-a-holder/repair test suite is
+`tests/cluster/run-replicated-test.sh`.
 
 ## Configuration
 
