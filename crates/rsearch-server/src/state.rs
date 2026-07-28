@@ -23,6 +23,9 @@ pub struct AppState {
     pub cors_allow_origin: String,
     /// Peer-transfer state, present only on replicated-backend nodes.
     pub internal: Option<Arc<crate::internal_api::InternalState>>,
+    /// Set when the operator drains this node (learned via heartbeat):
+    /// bulk ingest is refused so the WAL empties out ahead of shutdown.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -44,6 +47,7 @@ impl AppState {
             allow_insecure_webhooks: config.control.allow_insecure_webhooks,
             cors_allow_origin: config.http.cors_allow_origin.clone(),
             internal: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

@@ -83,4 +83,7 @@ pub struct NodeRecord {
     pub address: Option<String>,
     /// Seconds since the node's last heartbeat.
     pub heartbeat_age_secs: f64,
+    /// Draining nodes keep serving reads but receive no new object copies;
+    /// the control leader copies their objects off (12.6).
+    pub draining: bool,
 }

@@ -51,6 +51,10 @@ pub fn router(state: AppState) -> Router {
             "/_rsearch/streams/{name}/retention",
             axum::routing::put(crate::admin_api::put_retention),
         )
+        .route(
+            "/_rsearch/nodes/{id}/drain",
+            post(crate::admin_api::drain_node).delete(crate::admin_api::undrain_node),
+        )
         .route("/_rsearch/login", post(crate::auth_api::login))
         .route("/_rsearch/alerts", get(crate::alerts_api::list_alerts))
         .route(
@@ -197,6 +201,7 @@ async fn cat_nodes(State(state): State<AppState>) -> Json<Value> {
                     "address": n.address,
                     "heartbeat_age_secs": n.heartbeat_age_secs,
                     "live": n.heartbeat_age_secs < 30.0,
+                    "draining": n.draining,
                 })
             })
             .collect(),

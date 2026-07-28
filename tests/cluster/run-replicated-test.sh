@@ -36,6 +36,7 @@ start_node() { # name port
     RSEARCH_STORAGE__REPLICATION_FACTOR=2 \
     RSEARCH_CLUSTER__INTERNAL_TOKEN="$TOKEN" \
     RSEARCH_INGEST__MAX_BATCH_SECS=1 \
+    RSEARCH_CONTROL__MERGE_MIN_MB=0 \
     RSEARCH_CONTROL__INTERVAL_SECS=3 \
     RSEARCH_CONTROL__GC_GRACE_SECS=5 \
     RSEARCH_CONTROL__REPAIR_STALE_SECS=10 \
@@ -135,9 +136,43 @@ grep -qh "repair: copy restored" "$LOGDIR"/node-*.log || fail "no repair logged"
 [ "$(count_docs 9313 rlogs)" = "200" ] || fail "docs lost after repair"
 say "PASS: all splits back at factor 2 on live nodes"
 
+# ---------- graceful drain ----------
+say "TEST: drain node-2 — copies move off, reads keep working, bulk refused"
+# A fresh node joins as the drain target (3 live, rf=2). Deliberately NOT
+# a restart of node-1: its WAL would replay the acked-but-unconfirmed
+# batch (at-least-once) and duplicate rlogs docs, which is a separate
+# accepted behavior, not what this test measures.
+start_node node-4 9314
+wait_health 9314 || fail "node-4 unhealthy"
+[ "$(bulk 9313 drain-logs 40 0)" = "false" ] || fail "bulk drain-logs errored"
+pause 4
+[ "$(count_docs 9314 drain-logs)" = "40" ] || fail "drain-logs not ingested"
+curl -s -XPOST http://127.0.0.1:9313/_rsearch/nodes/node-2/drain | jq -e '.acknowledged' >/dev/null \
+  || fail "drain request not acknowledged"
+for i in $(seq 1 45); do
+  LEFT=$(psql_t "SELECT count(*) FROM object_locations WHERE node_id='node-2'")
+  [ "$LEFT" = "0" ] && break; pause 1
+done
+[ "$LEFT" = "0" ] || fail "drain left $LEFT placement rows on node-2"
+UNDER=$(under_held all 2 "'node-3','node-4'")
+[ "$UNDER" = "0" ] || fail "$UNDER splits under-held on remaining nodes after drain"
+[ "$(count_docs 9314 rlogs)" = "200" ] || fail "rlogs lost after drain"
+[ "$(count_docs 9313 drain-logs)" = "40" ] || fail "drain-logs lost after drain"
+# The flag reaches the node on its next 5s heartbeat; wait for it.
+for i in $(seq 1 15); do
+  CODE=$(printf '{"index":{"_index":"rlogs"}}\n{"@timestamp":1,"n":1}\n' | \
+    curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9312/_bulk \
+      -H 'Content-Type: application/x-ndjson' --data-binary @-)
+  [ "$CODE" = "503" ] && break; pause 1
+done
+[ "$CODE" = "503" ] || fail "draining node accepted bulk (got $CODE)"
+pause 4  # one more leader tick so "drain complete" lands in the log
+grep -qh "drain complete" "$LOGDIR"/node-*.log || fail "no drain completion logged"
+say "PASS: node-2 drained cleanly and refuses new ingest"
+
 # ---------- retention + fan-out delete ----------
 say "TEST: retention expiry fans the delete out and clears placement"
-[ "$(bulk 9312 rep-ret 40 0)" = "false" ] || fail "bulk rep-ret errored"
+[ "$(bulk 9313 rep-ret 40 0)" = "false" ] || fail "bulk rep-ret errored"
 pause 4
 [ "$(count_docs 9313 rep-ret)" = "40" ] || fail "rep-ret not ingested"
 docker exec "$PG_CONTAINER" psql -U rsearch -qc \

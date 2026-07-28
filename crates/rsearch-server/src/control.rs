@@ -121,6 +121,9 @@ impl ControlPlane {
         if let Err(e) = self.repair_job().await {
             error!(error = %e, "repair job failed");
         }
+        if let Err(e) = self.drain_job().await {
+            error!(error = %e, "drain job failed");
+        }
         if let Err(e) = self.alert_job().await {
             error!(error = %e, "alert job failed");
         }
@@ -248,6 +251,74 @@ impl ControlPlane {
             self.metastore
                 .record_alert_run(&alert.name, &status, Some(count))
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// Copy objects off draining nodes (replicated backend only). Each
+    /// key gets `replication_factor` copies on non-draining live nodes,
+    /// then the draining node's placement row is dropped; once a node has
+    /// no rows left it can be shut down. The node keeps serving reads the
+    /// whole time, so there is no availability dip.
+    async fn drain_job(&self) -> anyhow::Result<()> {
+        let Some(ctl) = &self.replication else {
+            return Ok(());
+        };
+        let factor = ctl.replication_factor as usize;
+        let nodes = self.metastore.list_nodes().await?;
+        for node in nodes.iter().filter(|n| n.draining) {
+            let keys = self.metastore.locations_on_node(&node.id, 50).await?;
+            if keys.is_empty() {
+                info!(node = %node.id, "drain complete: node holds no objects and can be shut down");
+                continue;
+            }
+            for key in &keys {
+                let holders = self.metastore.live_holders_of(key, 30.0).await?;
+                let Some(source) = holders.iter().find_map(|h| h.address.as_deref()) else {
+                    warn!(key, "drain: no live holder to copy from; skipping");
+                    continue;
+                };
+                // Copies already safe on nodes that are staying.
+                let mut safe = holders.iter().filter(|h| !h.draining).count();
+                if safe < factor {
+                    let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
+                    let targets = self
+                        .metastore
+                        .replication_targets(30.0, &exclude, (factor - safe) as i64)
+                        .await?;
+                    for target in targets {
+                        let Some(addr) = target.address.as_deref() else { continue };
+                        match tokio::time::timeout(
+                            Duration::from_secs(600),
+                            ctl.client.replicate(addr, key, source),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                safe += 1;
+                                info!(key, target = %target.id, "drain: copy moved");
+                            }
+                            Ok(Err(e)) => {
+                                warn!(key, target = %target.id, error = %e, "drain: replicate failed");
+                            }
+                            Err(_) => {
+                                warn!(key, target = %target.id, "drain: replicate timed out");
+                            }
+                        }
+                    }
+                }
+                if safe >= factor {
+                    self.metastore.remove_object_location(key, &node.id).await?;
+                } else {
+                    warn!(
+                        key,
+                        node = %node.id,
+                        safe,
+                        factor,
+                        "drain: not enough non-draining nodes to hold the factor"
+                    );
+                }
+            }
         }
         Ok(())
     }

@@ -151,27 +151,41 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(plane.run());
     }
 
-    // Every node heartbeats its liveness row.
+    // Every node heartbeats its liveness row; the response carries the
+    // draining flag so an operator drain reaches the node within one beat.
+    let draining_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let metastore = metastore.clone();
         let node_id = config.node_id();
         let role_names: Vec<String> = roles.iter().map(ToString::to_string).collect();
         let address = config.advertise_url();
+        let draining_flag = draining_flag.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                if let Err(e) = metastore
+                match metastore
                     .heartbeat(&node_id, &role_names, Some(&address))
                     .await
                 {
-                    warn!(error = %e, "heartbeat failed");
+                    Ok(draining) => {
+                        use std::sync::atomic::Ordering;
+                        if draining != draining_flag.swap(draining, Ordering::Relaxed) {
+                            if draining {
+                                warn!("node is draining: refusing new bulk ingest");
+                            } else {
+                                info!("drain cancelled: accepting bulk ingest again");
+                            }
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "heartbeat failed"),
                 }
             }
         });
     }
 
     let mut state = AppState::new(&config, &roles, metastore, pipeline, search);
+    state.draining = draining_flag;
     if config.storage.backend == "replicated" {
         state.internal = Some(std::sync::Arc::new(internal_api::InternalState {
             fs: rsearch_storage::FsStorage::new(config.storage.root.clone()),

@@ -248,14 +248,15 @@ Design decisions (locked):
       with a replicated-backend topology (3 nodes, rf=2, kill a holder,
       verify search still answers and repair restores rf); README + example
       config section on HA-on-block-storage
-- [ ] 12.6 Graceful drain/decommission: `draining` flag on the nodes table
-      + admin endpoint (`POST /_rsearch/nodes/{id}/drain`); draining nodes
-      are excluded from write-target selection; drain job on the control
-      leader copies everything in the node's `object_locations` to healthy
-      nodes while it still serves reads; node deletes cleanly once empty
-      (ingest listeners stop + WAL flushes to published splits on the
-      draining node before shutdown, closing the RPO gap for planned
-      scale-in)
+- [x] 12.6 Graceful drain/decommission: `draining` flag on the nodes table
+      + admin endpoint (`POST /_rsearch/nodes/{id}/drain`, DELETE cancels);
+      draining nodes are excluded from write-target selection; drain job on
+      the control leader copies everything in the node's `object_locations`
+      to healthy nodes while it still serves reads; node deletes cleanly
+      once empty. Implementation note: bulk ingest returns 503 on the
+      draining node (flag propagates via heartbeat) so the WAL empties as
+      batches age out; syslog/GELF listeners keep running — operators
+      repoint shippers (documented in README)
 
 ## Deferred (explicitly out of v1)
 

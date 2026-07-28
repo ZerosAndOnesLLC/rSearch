@@ -120,6 +120,12 @@ internal_token = "<openssl rand -hex 32, same on every node>"
 
 Operational notes:
 
+- Scale in gracefully with `POST /_rsearch/nodes/{id}/drain`: the node
+  keeps serving reads while the leader copies its objects to the other
+  nodes, and it refuses new `_bulk` traffic (503) so its WAL empties out
+  (repoint syslog/GELF shippers yourself). When the leader logs "drain
+  complete" (its `object_locations` rows are gone) the node can be shut
+  down. `DELETE` on the same path cancels a drain.
 - Postgres holds placement and all metadata — run it HA too, or it is
   the single point of failure.
 - With factor 2, the window between a node dying and repair completing

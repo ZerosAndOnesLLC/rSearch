@@ -83,6 +83,37 @@ pub async fn delete_rule(State(state): State<AppState>, Path(name): Path<String>
     }
 }
 
+/// POST /_rsearch/nodes/{id}/drain — begin graceful decommission: the
+/// node stops receiving new object copies and bulk writes; the control
+/// leader copies its objects off. Poll `GET /_cat/nodes` +
+/// `object_locations` until empty, then shut the node down.
+pub async fn drain_node(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    set_draining(state, id, true).await
+}
+
+/// DELETE /_rsearch/nodes/{id}/drain — cancel a drain.
+pub async fn undrain_node(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    set_draining(state, id, false).await
+}
+
+async fn set_draining(state: AppState, id: String, draining: bool) -> Response {
+    match state.metastore.set_node_draining(&id, draining).await {
+        Ok(true) => {
+            state
+                .audit(
+                    if draining { "node_drain" } else { "node_undrain" },
+                    &id,
+                    "operator request",
+                )
+                .await;
+            Json(json!({"acknowledged": true, "node": id, "draining": draining}))
+                .into_response()
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, &format!("no node named '{id}'")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// PUT /_rsearch/streams/{name}/retention — body {"hours": n | null}
 pub async fn put_retention(
     State(state): State<AppState>,

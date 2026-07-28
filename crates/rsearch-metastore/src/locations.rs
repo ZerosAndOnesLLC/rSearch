@@ -56,7 +56,7 @@ impl Metastore {
         stale_after_secs: f64,
     ) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
-            "SELECT n.id, n.roles, n.address,
+            "SELECT n.id, n.roles, n.address, n.draining,
                     EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs
              FROM object_locations ol
              JOIN nodes n ON n.id = ol.node_id
@@ -99,7 +99,7 @@ impl Metastore {
         limit: i64,
     ) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
-            "SELECT n.id, n.roles, n.address,
+            "SELECT n.id, n.roles, n.address, n.draining,
                     EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs
              FROM nodes n
              LEFT JOIN (
@@ -108,6 +108,7 @@ impl Metastore {
              ) held ON held.node_id = n.id
              WHERE n.last_heartbeat > now() - make_interval(secs => $1)
                AND n.id <> ALL($2)
+               AND NOT n.draining
              ORDER BY COALESCE(held.bytes, 0) ASC, n.id
              LIMIT $3",
         )

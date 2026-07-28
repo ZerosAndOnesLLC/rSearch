@@ -4,32 +4,45 @@ use crate::types::NodeRecord;
 
 impl Metastore {
     /// Upsert this node's liveness row. Called periodically by every node.
+    /// Returns the node's draining flag so the node learns it was asked to
+    /// drain without a separate poll (the upsert never resets the flag).
     pub async fn heartbeat(
         &self,
         node_id: &str,
         roles: &[String],
         address: Option<&str>,
-    ) -> MetastoreResult<()> {
-        sqlx::query(
+    ) -> MetastoreResult<bool> {
+        let row: (bool,) = sqlx::query_as(
             "INSERT INTO nodes (id, roles, address)
              VALUES ($1, $2, $3)
              ON CONFLICT (id) DO UPDATE
              SET roles = EXCLUDED.roles,
                  address = EXCLUDED.address,
-                 last_heartbeat = now()",
+                 last_heartbeat = now()
+             RETURNING draining",
         )
         .bind(node_id)
         .bind(roles)
         .bind(address)
-        .execute(self.pool())
+        .fetch_one(self.pool())
         .await?;
-        Ok(())
+        Ok(row.0)
+    }
+
+    /// Flip a node's draining flag; false if the node is unknown.
+    pub async fn set_node_draining(&self, node_id: &str, draining: bool) -> MetastoreResult<bool> {
+        let result = sqlx::query("UPDATE nodes SET draining = $2 WHERE id = $1")
+            .bind(node_id)
+            .bind(draining)
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// All registered nodes with heartbeat age; callers decide staleness.
     pub async fn list_nodes(&self) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
-            "SELECT id, roles, address,
+            "SELECT id, roles, address, draining,
                     EXTRACT(EPOCH FROM (now() - last_heartbeat))::float8 AS heartbeat_age_secs
              FROM nodes ORDER BY id",
         )
@@ -40,7 +53,7 @@ impl Metastore {
     /// Nodes heartbeating within the last `stale_after_secs`.
     pub async fn live_nodes(&self, stale_after_secs: f64) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
-            "SELECT id, roles, address,
+            "SELECT id, roles, address, draining,
                     EXTRACT(EPOCH FROM (now() - last_heartbeat))::float8 AS heartbeat_age_secs
              FROM nodes
              WHERE last_heartbeat > now() - make_interval(secs => $1)

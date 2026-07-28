@@ -24,6 +24,14 @@ pub async fn bulk_index(
 
 async fn handle_bulk(state: AppState, default_index: Option<String>, body: String) -> Response {
     let started = Instant::now();
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        // Draining: refuse new writes so the WAL empties out before
+        // shutdown; shippers retry against another ingest node.
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node is draining; send bulk traffic to another ingest node",
+        );
+    }
     let Some(pipeline) = state.pipeline.clone() else {
         return error_response(
             StatusCode::BAD_REQUEST,
