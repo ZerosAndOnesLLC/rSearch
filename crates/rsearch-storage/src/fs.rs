@@ -86,6 +86,53 @@ impl FsStorage {
         Ok(())
     }
 
+    /// Atomic streamed write for peer transfers: chunks land in a temp
+    /// sibling, fsync, rename, parent fsync — same durability discipline
+    /// as `put`/`put_file`. Returns the byte count written.
+    pub async fn put_stream<S, E>(&self, key: &str, mut stream: S) -> StorageResult<u64>
+    where
+        S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        use futures::StreamExt;
+        let path = self.resolve(key)?;
+        self.prepare_parent(&path, key).await?;
+        let tmp = path.with_extension(format!("tmp-recv-{}", std::process::id()));
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| Self::io_err(key, e))?;
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| StorageError::Backend {
+                key: key.to_string(),
+                message: format!("transfer stream failed: {e}"),
+            })?;
+            file.write_all(&chunk).await.map_err(|e| Self::io_err(key, e))?;
+            written += chunk.len() as u64;
+        }
+        file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| Self::io_err(key, e))?;
+        self.sync_parent(&path, key).await?;
+        Ok(written)
+    }
+
+    /// Open an object for streamed reading (peer GET). Returns the file
+    /// handle and its length.
+    pub async fn open_read(&self, key: &str) -> StorageResult<(tokio::fs::File, u64)> {
+        let path = self.resolve(key)?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| Self::io_err(key, e))?;
+        let len = file
+            .metadata()
+            .await
+            .map_err(|e| Self::io_err(key, e))?
+            .len();
+        Ok((file, len))
+    }
+
     /// fsync the directory holding `path` so a rename survives power loss.
     async fn sync_parent(&self, path: &Path, key: &str) -> StorageResult<()> {
         if let Some(parent) = path.parent() {

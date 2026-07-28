@@ -19,7 +19,7 @@ pub fn router(state: AppState) -> Router {
         HeaderValue::from_str(&state.cors_allow_origin)
             .unwrap_or_else(|_| HeaderValue::from_static("*")),
     );
-    Router::new()
+    let router = Router::new()
         .route("/", get(search_api::root))
         .route("/health", get(health))
         .route("/_cluster/health", get(cluster_health))
@@ -92,8 +92,15 @@ pub fn router(state: AppState) -> Router {
                 }
                 cors_headers(next.run(request).await, &origin)
             },
-        ))
-        .with_state(state)
+        ));
+    // Peer endpoints authenticate with the cluster token, not user auth,
+    // so they merge in outside the middleware stack above.
+    let router = if state.internal.is_some() {
+        router.merge(crate::internal_api::router())
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 fn cors_headers(

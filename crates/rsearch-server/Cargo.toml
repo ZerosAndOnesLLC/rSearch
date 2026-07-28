@@ -32,3 +32,5 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 hyper-rustls.workspace = true
 url.workspace = true
+serde.workspace = true
+tokio-util.workspace = true

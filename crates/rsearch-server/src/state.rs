@@ -21,6 +21,8 @@ pub struct AppState {
     /// Mirror of control.allow_insecure_webhooks for the alerts API.
     pub allow_insecure_webhooks: bool,
     pub cors_allow_origin: String,
+    /// Peer-transfer state, present only on replicated-backend nodes.
+    pub internal: Option<Arc<crate::internal_api::InternalState>>,
 }
 
 impl AppState {
@@ -41,6 +43,7 @@ impl AppState {
             auth: crate::auth::AuthState::default(),
             allow_insecure_webhooks: config.control.allow_insecure_webhooks,
             cors_allow_origin: config.http.cors_allow_origin.clone(),
+            internal: None,
         }
     }
 

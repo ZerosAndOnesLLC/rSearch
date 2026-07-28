@@ -222,7 +222,7 @@ Design decisions (locked):
       under_replicated_keys); `node.advertise_addr` config wired into the
       heartbeat; `storage.replication_factor`, `storage.write_quorum`,
       `cluster.internal_token` config fields + example toml
-- [ ] 12.2 Internal object API on the axum server (mounted only for the
+- [x] 12.2 Internal object API on the axum server (mounted only for the
       replicated backend, token-gated): ranged
       `GET /_rsearch/internal/objects/{key}` served from the local root;
       streamed `PUT /_rsearch/internal/objects/{key}` (atomic tmp+rename,

@@ -46,6 +46,7 @@ http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs", "webpki-roots", "tls12"] }
 url = "2"
 futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 lru = "0.12"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 async-trait = "0.1"

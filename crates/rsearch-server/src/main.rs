@@ -4,6 +4,7 @@ mod auth;
 mod auth_api;
 mod bulk_api;
 mod control;
+mod internal_api;
 mod routes;
 mod search_api;
 mod state;
@@ -149,7 +150,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let state = AppState::new(&config, &roles, metastore, pipeline, search);
+    let mut state = AppState::new(&config, &roles, metastore, pipeline, search);
+    if config.storage.backend == "replicated" {
+        if config.cluster.internal_token.is_empty() {
+            anyhow::bail!(
+                "storage.backend = \"replicated\" requires cluster.internal_token \
+                 (generate one with `openssl rand -hex 32`)"
+            );
+        }
+        state.internal = Some(std::sync::Arc::new(internal_api::InternalState {
+            fs: rsearch_storage::FsStorage::new(config.storage.root.clone()),
+            token_digest: rsearch_common::crypto::token_digest(&config.cluster.internal_token),
+            metastore: state.metastore.clone(),
+            node_id: config.node_id(),
+            client: rsearch_storage::PeerClient::new(&config.cluster.internal_token)
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("building peer client")?,
+        }));
+    }
     state.auth.spawn_refresher(state.metastore.clone());
     let app = routes::router(state);
 
