@@ -65,9 +65,14 @@ impl Metastore {
     }
 
     /// Remove nodes that have not heartbeated for `expire_after_secs`,
-    /// along with their object placement rows (an expired node's copies
-    /// are unreachable; repair has had ample time to replace them, and a
-    /// returning node must not resurrect stale placement).
+    /// along with their object placement rows — EXCEPT rows that are a
+    /// key's only remaining copies. Purging those would permanently erase
+    /// the object from the placement table (unreachable even after the
+    /// node's volume returns intact); keeping them means the key stays
+    /// visible as 0-live-holders, and a rejoining node revives its rows
+    /// simply by heartbeating again. Rows are purged only when another
+    /// copy survives on a non-expired node — i.e. repair actually did
+    /// replace them, so a returning node can't resurrect stale placement.
     pub async fn expire_dead_nodes(&self, expire_after_secs: f64) -> MetastoreResult<u64> {
         let mut tx = self.pool().begin().await?;
         let expired: Vec<(String,)> = sqlx::query_as(
@@ -79,10 +84,19 @@ impl Metastore {
         .await?;
         if !expired.is_empty() {
             let ids: Vec<String> = expired.iter().map(|(id,)| id.clone()).collect();
-            sqlx::query("DELETE FROM object_locations WHERE node_id = ANY($1)")
-                .bind(&ids)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "DELETE FROM object_locations ol
+                 WHERE ol.node_id = ANY($1)
+                   AND EXISTS (
+                       SELECT 1 FROM object_locations survivor
+                       WHERE survivor.storage_key = ol.storage_key
+                         AND NOT (survivor.node_id = ANY($1))
+                         AND survivor.node_id IN (SELECT id FROM nodes)
+                   )",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(expired.len() as u64)

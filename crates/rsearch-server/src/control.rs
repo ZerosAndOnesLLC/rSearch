@@ -47,8 +47,10 @@ impl ControlPlane {
         let search =
             rsearch_search::SearchService::new(metastore.clone(), storage.clone(), cache.clone());
         let replication = if config.storage.backend == "replicated" {
+            let ca = (!config.cluster.peer_ca_file.is_empty())
+                .then_some(config.cluster.peer_ca_file.as_str());
             Some(ReplicationCtl {
-                client: rsearch_storage::PeerClient::new(&config.cluster.internal_token)
+                client: rsearch_storage::PeerClient::new(&config.cluster.internal_token, ca)
                     .map_err(|e| anyhow::anyhow!("building repair peer client: {e}"))?,
                 replication_factor: config.storage.replication_factor as i64,
                 repair_stale_secs: config.control.repair_stale_secs,
@@ -137,9 +139,17 @@ impl ControlPlane {
         let Some(ctl) = &self.replication else {
             return Ok(());
         };
+        // repair_stale_secs doubles as the fresh-write grace: a key whose
+        // newest row is younger may still be mid-push (quorum acks detach
+        // the remaining replica pushes).
         let under = self
             .metastore
-            .under_replicated_keys(ctl.replication_factor, ctl.repair_stale_secs, 20)
+            .under_replicated_keys(
+                ctl.replication_factor,
+                ctl.repair_stale_secs,
+                ctl.repair_stale_secs,
+                20,
+            )
             .await?;
         for entry in under {
             let key = &entry.storage_key;
@@ -308,7 +318,18 @@ impl ControlPlane {
                     }
                 }
                 if safe >= factor {
-                    self.metastore.remove_object_location(key, &node.id).await?;
+                    // Prefer a peer DELETE: the draining node drops the
+                    // file AND its own row, so the disk space returns and
+                    // an undrained node can't later serve cluster-deleted
+                    // objects from leftovers. Fall back to just the row if
+                    // the node is unreachable.
+                    let deleted = match node.address.as_deref() {
+                        Some(addr) => ctl.client.delete(addr, key).await.is_ok(),
+                        None => false,
+                    };
+                    if !deleted {
+                        self.metastore.remove_object_location(key, &node.id).await?;
+                    }
                 } else {
                     warn!(
                         key,

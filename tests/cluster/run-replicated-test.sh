@@ -166,7 +166,11 @@ for i in $(seq 1 15); do
   [ "$CODE" = "503" ] && break; pause 1
 done
 [ "$CODE" = "503" ] || fail "draining node accepted bulk (got $CODE)"
-pause 4  # one more leader tick so "drain complete" lands in the log
+# "drain complete" logs on the first tick after the last row clears —
+# wait for a tick rather than racing it.
+for i in $(seq 1 20); do
+  grep -qh "drain complete" "$LOGDIR"/node-*.log && break; pause 1
+done
 grep -qh "drain complete" "$LOGDIR"/node-*.log || fail "no drain completion logged"
 say "PASS: node-2 drained cleanly and refuses new ingest"
 

@@ -89,16 +89,49 @@ impl FsStorage {
     /// Atomic streamed write for peer transfers: chunks land in a temp
     /// sibling, fsync, rename, parent fsync — same durability discipline
     /// as `put`/`put_file`. Returns the byte count written.
-    pub async fn put_stream<S, E>(&self, key: &str, mut stream: S) -> StorageResult<u64>
+    ///
+    /// The temp name carries a process-unique counter so concurrent
+    /// transfers of the same key (origin push racing a repair pull) can
+    /// never interleave writes into one file, and the temp is removed on
+    /// any failure so aborted transfers don't accumulate on disk.
+    pub async fn put_stream<S, E>(&self, key: &str, stream: S) -> StorageResult<u64>
+    where
+        S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        static RECV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = self.resolve(key)?;
+        self.prepare_parent(&path, key).await?;
+        let seq = RECV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-recv-{}-{seq}", std::process::id()));
+        let result = self.write_stream_to(&tmp, key, stream).await;
+        match result {
+            Ok(written) => {
+                tokio::fs::rename(&tmp, &path)
+                    .await
+                    .map_err(|e| Self::io_err(key, e))?;
+                self.sync_parent(&path, key).await?;
+                Ok(written)
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn write_stream_to<S, E>(
+        &self,
+        tmp: &Path,
+        key: &str,
+        mut stream: S,
+    ) -> StorageResult<u64>
     where
         S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
         use futures::StreamExt;
-        let path = self.resolve(key)?;
-        self.prepare_parent(&path, key).await?;
-        let tmp = path.with_extension(format!("tmp-recv-{}", std::process::id()));
-        let mut file = tokio::fs::File::create(&tmp)
+        let mut file = tokio::fs::File::create(tmp)
             .await
             .map_err(|e| Self::io_err(key, e))?;
         let mut written: u64 = 0;
@@ -111,11 +144,14 @@ impl FsStorage {
             written += chunk.len() as u64;
         }
         file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| Self::io_err(key, e))?;
-        self.sync_parent(&path, key).await?;
         Ok(written)
+    }
+
+    /// Absolute path of an object in the root — for in-crate callers that
+    /// need a durable source path (peer pushes outlive the caller's
+    /// staging file).
+    pub(crate) fn object_path(&self, key: &str) -> StorageResult<PathBuf> {
+        self.resolve(key)
     }
 
     /// Open an object for streamed reading (peer GET). Returns the file
@@ -192,9 +228,18 @@ impl Storage for FsStorage {
         let mut file = tokio::fs::File::open(&path)
             .await
             .map_err(|e| Self::io_err(key, e))?;
-        let len = range.end.saturating_sub(range.start) as usize;
+        // Clamp to the file before allocating, so an oversized range (the
+        // internal API forwards attacker-controlled Range headers) cannot
+        // demand an arbitrary-size buffer.
+        let size = file
+            .metadata()
+            .await
+            .map_err(|e| Self::io_err(key, e))?
+            .len();
+        let start = range.start.min(size);
+        let len = range.end.min(size).saturating_sub(start) as usize;
         let mut buf = vec![0u8; len];
-        file.seek(SeekFrom::Start(range.start))
+        file.seek(SeekFrom::Start(start))
             .await
             .map_err(|e| Self::io_err(key, e))?;
         file.read_exact(&mut buf)

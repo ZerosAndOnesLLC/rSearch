@@ -56,6 +56,9 @@ write_quorum = 0         # copies required to ack a write; 0 = min(2, factor)
 # Shared bearer token authenticating internal peer requests. Required when
 # storage.backend = "replicated"; generate with e.g. `openssl rand -hex 32`.
 internal_token = ""
+# PEM bundle for a private cluster CA (peer TLS). Empty = public webpki
+# roots; set this when node certs are signed by an internal CA.
+peer_ca_file = ""
 
 [metastore]
 # Empty reads the DATABASE_URL environment variable. Postgres must use

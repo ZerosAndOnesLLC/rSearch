@@ -68,10 +68,69 @@ async fn main() -> anyhow::Result<()> {
                      (generate one with `openssl rand -hex 32`)"
                 );
             }
+            // A wildcard advertise address makes peers dial themselves:
+            // self-pushes would count toward the quorum and the cluster
+            // would ack writes with a single physical copy. Refuse to
+            // start rather than run with silent zero redundancy.
+            let advertise = config.advertise_url();
+            let dialable = url::Url::parse(&advertise)
+                .ok()
+                .and_then(|u| {
+                    u.host().map(|h| match h {
+                        url::Host::Ipv4(ip) => !ip.is_unspecified(),
+                        url::Host::Ipv6(ip) => !ip.is_unspecified(),
+                        url::Host::Domain(_) => true,
+                    })
+                })
+                .unwrap_or(false);
+            if !dialable {
+                anyhow::bail!(
+                    "storage.backend = \"replicated\" requires a peer-dialable \
+                     node.advertise_addr (got '{advertise}'; 0.0.0.0/[::] is not dialable)"
+                );
+            }
+            let ca = (!config.cluster.peer_ca_file.is_empty())
+                .then_some(config.cluster.peer_ca_file.as_str());
+            // Re-announce local files whose keys the placement table still
+            // knows: a node rejoining after registry expiry has real
+            // copies on disk but may have lost its rows. The if-known
+            // guard means cluster-deleted objects are never resurrected.
+            {
+                let fs = rsearch_storage::FsStorage::new(config.storage.root.clone());
+                let metastore = metastore.clone();
+                let node_id = config.node_id();
+                tokio::spawn(async move {
+                    use rsearch_storage::Storage;
+                    let keys = match fs.list("").await {
+                        Ok(keys) => keys,
+                        Err(e) => {
+                            warn!(error = %e, "rejoin scan: listing local objects failed");
+                            return;
+                        }
+                    };
+                    let mut announced = 0u64;
+                    for key in keys {
+                        let Ok(size) = fs.size(&key).await else { continue };
+                        match metastore
+                            .record_object_location_if_known(&key, &node_id, size as i64)
+                            .await
+                        {
+                            Ok(true) => announced += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(key, error = %e, "rejoin scan: record failed");
+                            }
+                        }
+                    }
+                    if announced > 0 {
+                        info!(announced, "rejoin scan: re-announced local object copies");
+                    }
+                });
+            }
             std::sync::Arc::new(rsearch_storage::ReplicatedStorage::new(
                 rsearch_storage::FsStorage::new(config.storage.root.clone()),
                 std::sync::Arc::new(placement::MetastorePlacement::new(metastore.clone())),
-                rsearch_storage::PeerClient::new(&config.cluster.internal_token)
+                rsearch_storage::PeerClient::new(&config.cluster.internal_token, ca)
                     .map_err(|e| anyhow::anyhow!(e))
                     .context("building peer client")?,
                 config.node_id(),
@@ -192,9 +251,13 @@ async fn main() -> anyhow::Result<()> {
             token_digest: rsearch_common::crypto::token_digest(&config.cluster.internal_token),
             metastore: state.metastore.clone(),
             node_id: config.node_id(),
-            client: rsearch_storage::PeerClient::new(&config.cluster.internal_token)
-                .map_err(|e| anyhow::anyhow!(e))
-                .context("building peer client")?,
+            client: rsearch_storage::PeerClient::new(
+                &config.cluster.internal_token,
+                (!config.cluster.peer_ca_file.is_empty())
+                    .then_some(config.cluster.peer_ca_file.as_str()),
+            )
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("building peer client")?,
         }));
     }
     state.auth.spawn_refresher(state.metastore.clone());

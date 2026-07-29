@@ -150,8 +150,13 @@ Operational notes:
 - The ingest WAL stays node-local: docs acked but not yet published when
   a node dies are recovered by WAL replay when that node (or its volume)
   returns — same recovery story as the fs backend.
-- TLS between peers uses the FIPS provider with webpki roots, so
-  internal certificates must chain to a trusted root.
+- TLS between peers uses the FIPS provider; set `cluster.peer_ca_file`
+  to a PEM bundle when node certificates are signed by an internal CA
+  (otherwise the public webpki roots apply). Peer endpoints share the
+  API listener — keep the port on a trusted network segment.
+- The server refuses to start the replicated backend with a wildcard
+  (`0.0.0.0`/`[::]`) advertise address — peers must be able to dial
+  `node.advertise_addr`.
 
 A containerized reference topology (3 nodes, per-node volumes standing
 in for block devices) is in `docker-compose-replicated.yml`. Two test

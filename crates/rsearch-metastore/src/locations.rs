@@ -25,6 +25,33 @@ impl Metastore {
         Ok(())
     }
 
+    /// Record a copy only if the object is still known to the placement
+    /// table (some row for the key exists). Used by late-completing
+    /// transfers — a replicate pull that outlives the leader's timeout,
+    /// or a rejoining node re-announcing local files — so they can never
+    /// resurrect placement for an object that was deleted cluster-wide.
+    /// Returns whether the row was recorded.
+    pub async fn record_object_location_if_known(
+        &self,
+        storage_key: &str,
+        node_id: &str,
+        size_bytes: i64,
+    ) -> MetastoreResult<bool> {
+        let result = sqlx::query(
+            "INSERT INTO object_locations (storage_key, node_id, size_bytes)
+             SELECT $1, $2, $3
+             WHERE EXISTS (SELECT 1 FROM object_locations WHERE storage_key = $1)
+             ON CONFLICT (storage_key, node_id)
+             DO UPDATE SET size_bytes = EXCLUDED.size_bytes",
+        )
+        .bind(storage_key)
+        .bind(node_id)
+        .bind(size_bytes)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Remove one node's copy record for an object.
     pub async fn remove_object_location(
         &self,
@@ -151,10 +178,16 @@ impl Metastore {
     /// Keys with fewer than `replication_factor` copies on live nodes
     /// (heartbeat within `stale_after_secs`), most endangered first.
     /// Keys whose holders are all dead surface with live_holders = 0.
+    ///
+    /// Keys whose newest placement row is younger than `min_age_secs` are
+    /// skipped: a fresh write may still be pushing its remaining replicas
+    /// (the quorum ack detaches the stragglers), and repairing mid-push
+    /// would double-transfer the object and race the write's rollback.
     pub async fn under_replicated_keys(
         &self,
         replication_factor: i64,
         stale_after_secs: f64,
+        min_age_secs: f64,
         limit: i64,
     ) -> MetastoreResult<Vec<UnderReplicatedKey>> {
         Ok(sqlx::query_as::<_, UnderReplicatedKey>(
@@ -168,11 +201,13 @@ impl Metastore {
              HAVING COUNT(n.id) FILTER (
                         WHERE n.last_heartbeat > now() - make_interval(secs => $2)
                     ) < $1
+                AND MAX(ol.created_at) < now() - make_interval(secs => $3)
              ORDER BY live_holders ASC, ol.storage_key
-             LIMIT $3",
+             LIMIT $4",
         )
         .bind(replication_factor)
         .bind(stale_after_secs)
+        .bind(min_age_secs)
         .bind(limit)
         .fetch_all(self.pool())
         .await?)

@@ -81,13 +81,16 @@ fn storage_error(key: &str, e: &StorageError) -> Response {
     }
 }
 
-/// Parse a single `bytes=start-end` (inclusive) range header.
+/// Parse a single `bytes=start-end` (inclusive) range header. Oversized
+/// ranges are clamped to the file by `FsStorage::get_range`, and the
+/// checked add rejects the u64::MAX edge instead of overflowing.
 fn parse_range(headers: &HeaderMap) -> Option<std::ops::Range<u64>> {
     let value = headers.get(header::RANGE)?.to_str().ok()?;
     let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
     let start: u64 = start.parse().ok()?;
     let end: u64 = end.parse().ok()?;
-    (end >= start).then_some(start..end + 1)
+    let end_exclusive = end.checked_add(1)?;
+    (end_exclusive > start).then_some(start..end_exclusive)
 }
 
 async fn get_object(
@@ -198,6 +201,24 @@ async fn replicate(
         return r;
     }
     let ReplicateRequest { key, source_addr } = body.0;
+    // Only registered node addresses may serve as pull sources — without
+    // this, any token holder could use the endpoint as an SSRF primitive
+    // that forwards the cluster token to arbitrary internal hosts.
+    match internal.metastore.list_nodes().await {
+        Ok(nodes) => {
+            if !nodes.iter().any(|n| n.address.as_deref() == Some(source_addr.as_str())) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "source_addr is not a registered node address",
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "listing nodes for replicate source check failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "node lookup failed").into_response();
+        }
+    }
     let size = match internal
         .client
         .download_to(&source_addr, &key, &internal.fs)
@@ -209,13 +230,25 @@ async fn replicate(
             return storage_error(&key, &e);
         }
     };
-    if let Err(e) = internal
+    // Guarded record: a pull that outlives the leader's timeout can land
+    // after the object was deleted cluster-wide — never resurrect
+    // placement for it, and don't keep the freshly-pulled file either.
+    match internal
         .metastore
-        .record_object_location(&key, &internal.node_id, size as i64)
+        .record_object_location_if_known(&key, &internal.node_id, size as i64)
         .await
     {
-        warn!(key, error = %e, "recording object location failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "placement record failed").into_response();
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = internal.fs.delete(&key).await;
+            warn!(key, "replicate finished for a deleted object; copy discarded");
+            return (StatusCode::CONFLICT, "object no longer exists").into_response();
+        }
+        Err(e) => {
+            warn!(key, error = %e, "recording object location failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "placement record failed")
+                .into_response();
+        }
     }
     info!(key, source = %source_addr, size, "replicated object from peer");
     axum::Json(json!({ "key": key, "size": size })).into_response()

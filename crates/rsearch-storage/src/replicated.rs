@@ -19,6 +19,15 @@ use crate::peer::PeerClient;
 use crate::placement::{PeerNode, Placement};
 use crate::storage::Storage;
 
+/// What a detached peer push reads from: small objects travel as bytes,
+/// splits stream from the durable copy in the local root (never the
+/// caller's staging file, which may be deleted once the write is acked).
+#[derive(Clone)]
+enum PushSource {
+    Bytes(Bytes),
+    File(std::path::PathBuf),
+}
+
 pub struct ReplicatedStorage {
     local: FsStorage,
     placement: Arc<dyn Placement>,
@@ -48,15 +57,15 @@ impl ReplicatedStorage {
     }
 
     /// Replicate a just-written local object to peers. Counts the local
-    /// copy toward the quorum; receivers record their own placement rows.
-    /// Under quorum the local copy and row are rolled back so a failed
-    /// write leaves nothing behind (the caller's WAL retry re-drives it).
-    async fn fan_out<'a, F, Fut>(&'a self, key: &'a str, push: F) -> StorageResult<()>
-    where
-        F: Fn(&'a PeerClient, String) -> Fut,
-        Fut: Future<Output = StorageResult<()>> + Send,
-    {
+    /// copy toward the quorum and acks as soon as the quorum holds —
+    /// remaining pushes finish detached (they read from the durable root
+    /// copy) and the repair job closes any gap to the full factor. Under
+    /// quorum, the local copy, the placement rows, AND any copies that
+    /// did land on peers are rolled back, so a failed write leaves
+    /// nothing behind for the caller's WAL retry to collide with.
+    async fn fan_out(&self, key: &str, source: PushSource) -> StorageResult<()> {
         let needed = self.replication_factor.saturating_sub(1);
+        let quorum = self.write_quorum.min(self.replication_factor).max(1);
         let targets = if needed == 0 {
             Vec::new()
         } else {
@@ -64,37 +73,66 @@ impl ReplicatedStorage {
                 .write_targets(std::slice::from_ref(&self.node_id), needed)
                 .await?
         };
-        let pushes = targets.iter().filter_map(|t| {
-            let address = t.address.clone()?;
-            Some(async {
-                match push(&self.client, address).await {
-                    Ok(()) => true,
+        let mut pushes = futures::stream::FuturesUnordered::new();
+        for target in targets {
+            let Some(address) = target.address.clone() else { continue };
+            let client = self.client.clone();
+            let key = key.to_string();
+            let source = source.clone();
+            let id = target.id.clone();
+            pushes.push(tokio::spawn(async move {
+                let result = match &source {
+                    PushSource::Bytes(data) => {
+                        client.push_bytes(&address, &key, data.clone()).await
+                    }
+                    PushSource::File(path) => client.push_file(&address, &key, path).await,
+                };
+                match result {
+                    Ok(()) => (id, address, true),
                     Err(e) => {
-                        warn!(key, peer = %t.id, error = %e, "replica push failed");
-                        false
+                        warn!(key, peer = %id, error = %e, "replica push failed");
+                        (id, address, false)
                     }
                 }
-            })
-        });
-        let copies = 1 + futures::future::join_all(pushes)
-            .await
-            .into_iter()
-            .filter(|ok| *ok)
-            .count();
-        if copies < self.write_quorum.min(self.replication_factor).max(1) {
-            // Roll back the local copy so a retried batch (new split id)
-            // doesn't strand an orphan object outside split GC.
-            let _ = self.local.delete(key).await;
-            let _ = self.placement.remove_all(key).await;
-            return Err(StorageError::Backend {
-                key: key.to_string(),
-                message: format!(
-                    "write quorum not met: {copies} of {} copies (factor {})",
-                    self.write_quorum, self.replication_factor
-                ),
-            });
+            }));
         }
-        Ok(())
+
+        use futures::StreamExt;
+        let mut copies = 1usize; // the local copy
+        let mut pushed: Vec<(String, String)> = Vec::new();
+        while copies < quorum {
+            match pushes.next().await {
+                Some(Ok((id, address, true))) => {
+                    copies += 1;
+                    pushed.push((id, address));
+                }
+                Some(Ok((_, _, false))) | Some(Err(_)) => {}
+                None => break,
+            }
+        }
+        if copies >= quorum {
+            // Stragglers keep running toward the full factor; their
+            // receivers record their own rows on completion.
+            drop(pushes);
+            return Ok(());
+        }
+        // Quorum failed: every push has resolved, so `pushed` is the
+        // complete set of peers holding a copy — delete those too (their
+        // DELETE handler drops the file and its placement row).
+        let _ = self.local.delete(key).await;
+        for (id, address) in &pushed {
+            if let Err(e) = self.client.delete(address, key).await {
+                warn!(key, peer = %id, error = %e, "rollback delete failed; copy orphaned");
+            }
+        }
+        let _ = self.placement.remove_all(key).await;
+        Err(StorageError::Backend {
+            key: key.to_string(),
+            message: format!(
+                "write quorum not met: {copies} of {quorum} copies (factor {})",
+                self.replication_factor
+            ),
+        })
     }
 
     /// Live holders other than this node, for read fallback.
@@ -113,24 +151,27 @@ impl ReplicatedStorage {
 impl Storage for ReplicatedStorage {
     async fn put(&self, key: &str, data: Bytes) -> StorageResult<()> {
         self.local.put(key, data.clone()).await?;
-        self.placement
+        if let Err(e) = self
+            .placement
             .record(key, &self.node_id, data.len() as i64)
-            .await?;
-        self.fan_out(key, |client, address| {
-            let data = data.clone();
-            async move { client.push_bytes(&address, key, data).await }
-        })
-        .await
+            .await
+        {
+            // Unrecorded local files are invisible to GC — don't keep one.
+            let _ = self.local.delete(key).await;
+            return Err(e);
+        }
+        self.fan_out(key, PushSource::Bytes(data)).await
     }
 
     async fn put_file(&self, key: &str, local: &Path) -> StorageResult<()> {
         self.local.put_file(key, local).await?;
         let size = self.local.size(key).await?;
-        self.placement.record(key, &self.node_id, size as i64).await?;
-        self.fan_out(key, |client, address| async move {
-            client.push_file(&address, key, local).await
-        })
-        .await
+        if let Err(e) = self.placement.record(key, &self.node_id, size as i64).await {
+            let _ = self.local.delete(key).await;
+            return Err(e);
+        }
+        self.fan_out(key, PushSource::File(self.local.object_path(key)?))
+            .await
     }
 
     async fn get(&self, key: &str) -> StorageResult<Bytes> {

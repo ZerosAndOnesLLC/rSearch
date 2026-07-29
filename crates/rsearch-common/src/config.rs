@@ -44,6 +44,10 @@ pub struct ClusterConfig {
     /// (object transfer/replication). Required when the replicated
     /// storage backend is enabled; compared in constant time.
     pub internal_token: String,
+    /// PEM bundle for a private cluster CA trusted for peer TLS. Empty
+    /// uses the public webpki roots — set this when node certificates
+    /// are signed by an internal CA.
+    pub peer_ca_file: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -282,6 +282,23 @@ Design decisions (locked):
       `cargo publish --dry-run` on rsearch-common (dependents can only
       verify once deps are live — publish order in RELEASING.md), ci.sh
       green. All 8 crate names confirmed free on crates.io (2026-07-29).
+- [x] 13.2 Review pass on phases 12–13 (single review agent, no workflow)
+      + all 11 findings fixed with blanket approval:
+      C1 dead-node expiry keeps a key's last placement rows + startup
+      rejoin scan re-announces local files (if-known guard);
+      H1 peer client connect/per-op timeouts + quorum acks detach
+      straggler pushes (sourced from the durable root copy);
+      H2 under_replicated_keys gains a fresh-write age grace
+      (repair_stale_secs); H3 unique streamed temp names + temp cleanup
+      on failure; M1 quorum rollback also deletes copies that landed on
+      peers (and local-record failure deletes the local file);
+      M2 late replicate completions use record-if-known and discard the
+      file if the object was deleted; M3 replicated backend refuses
+      wildcard advertise addresses at startup; L1 cluster.peer_ca_file
+      for private-CA peer TLS; L2 replicate source_addr restricted to
+      registered node addresses; L3 range-header checked math + fs-level
+      range clamping; L4 drain deletes the file on the draining node via
+      peer DELETE (row-only fallback if unreachable)
 
 ## Deferred (explicitly out of v1)
 
