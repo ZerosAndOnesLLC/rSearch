@@ -1,7 +1,10 @@
 # Build stage — the FIPS module builds from source and needs CMake + Go.
+# Clang is required: the aws-lc FIPS delocator rejects assembly emitted by
+# newer GCC releases.
 FROM rust:1.97-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake golang-go perl && rm -rf /var/lib/apt/lists/*
+    cmake golang-go perl clang && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p rsearch-server

@@ -140,8 +140,12 @@ Operational notes:
 - TLS between peers uses the FIPS provider with webpki roots, so
   internal certificates must chain to a trusted root.
 
-The 3-node kill-a-holder/repair test suite is
-`tests/cluster/run-replicated-test.sh`.
+A containerized reference topology (3 nodes, per-node volumes standing
+in for block devices) is in `docker-compose-replicated.yml`. Two test
+suites exercise the backend: `tests/cluster/run-replicated-test.sh`
+(process-level: kill-a-holder, repair, drain, fan-out GC) and
+`tests/cluster/run-ha-compose-test.sh` (container-level: data-node
+death, leader failover, volume-reattach rejoin).
 
 ## Configuration
 

@@ -1,0 +1,70 @@
+# Reference HA topology on plain block storage: 3 all-role nodes running
+# the replicated backend (factor 2) over Postgres — no external object
+# store. Each node's named volume stands in for its attached block device
+# (EBS, iSCSI, local disk); killing a node and starting it again with the
+# same volume is the reattach/recovery story.
+#
+# Replace the internal token before real use (`openssl rand -hex 32`) and
+# run Postgres HA (Patroni or managed) in production — it holds placement
+# and all metadata. The HA test suite that exercises this topology is
+# tests/cluster/run-ha-compose-test.sh.
+
+x-rsearch-env: &rsearch-env
+  DATABASE_URL: postgres://rsearch:rsearch@postgres:5432/rsearch
+  RSEARCH_STORAGE__BACKEND: replicated
+  RSEARCH_STORAGE__ROOT: /var/lib/rsearch/objects
+  RSEARCH_STORAGE__REPLICATION_FACTOR: "2"
+  RSEARCH_CLUSTER__INTERNAL_TOKEN: change-me-openssl-rand-hex-32
+
+x-rsearch-node: &rsearch-node
+  build: .
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rsearch
+      POSTGRES_PASSWORD: rsearch
+      POSTGRES_DB: rsearch
+    volumes: [ha-pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rsearch"]
+      interval: 2s
+      retries: 30
+
+  node-1:
+    <<: *rsearch-node
+    environment:
+      <<: *rsearch-env
+      RSEARCH_NODE__ID: node-1
+      RSEARCH_NODE__ADVERTISE_ADDR: http://node-1:9200
+    ports: ["9201:9200"]
+    volumes: [node1-data:/var/lib/rsearch]
+
+  node-2:
+    <<: *rsearch-node
+    environment:
+      <<: *rsearch-env
+      RSEARCH_NODE__ID: node-2
+      RSEARCH_NODE__ADVERTISE_ADDR: http://node-2:9200
+    ports: ["9202:9200"]
+    volumes: [node2-data:/var/lib/rsearch]
+
+  node-3:
+    <<: *rsearch-node
+    environment:
+      <<: *rsearch-env
+      RSEARCH_NODE__ID: node-3
+      RSEARCH_NODE__ADVERTISE_ADDR: http://node-3:9200
+    ports: ["9203:9200"]
+    volumes: [node3-data:/var/lib/rsearch]
+
+volumes:
+  ha-pg-data:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -1,0 +1,16 @@
+# Fast timings for the HA compose test — layered over
+# docker-compose-replicated.yml so the reference topology keeps
+# production-ish defaults. Merging is disabled so the repair test is
+# deterministic (the S3 cluster suite covers merge).
+services:
+  node-1:
+    environment: &fast-env
+      RSEARCH_INGEST__MAX_BATCH_SECS: "1"
+      RSEARCH_CONTROL__INTERVAL_SECS: "3"
+      RSEARCH_CONTROL__GC_GRACE_SECS: "5"
+      RSEARCH_CONTROL__REPAIR_STALE_SECS: "10"
+      RSEARCH_CONTROL__MERGE_MIN_MB: "0"
+  node-2:
+    environment: *fast-env
+  node-3:
+    environment: *fast-env

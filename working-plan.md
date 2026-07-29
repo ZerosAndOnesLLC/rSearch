@@ -258,6 +258,16 @@ Design decisions (locked):
       batches age out; syslog/GELF listeners keep running — operators
       repoint shippers (documented in README)
 
+- [x] 12.7 Containerized HA topology + test: `docker-compose-replicated.yml`
+      reference stack (3 all-role nodes, per-node volumes as block-device
+      stand-ins, factor 2) and `tests/cluster/run-ha-compose-test.sh` —
+      container-level checks the process suite can't do: hard-stop a data
+      node (volume persists), repair on survivors proving leader failover,
+      rejoin with the original volume (block-device reattach), rejoined
+      node taking new replica writes. Dockerfile builds with clang (the
+      aws-lc FIPS delocator rejects newer GCC asm) + .dockerignore so the
+      build context excludes target/bench-data
+
 ## Deferred (explicitly out of v1)
 
 - Distributed search fan-out across searchers (any searcher answers alone in v1)

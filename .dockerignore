@@ -1,0 +1,9 @@
+target
+bench-data
+data
+.git
+.env
+ui/node_modules
+ui/.next
+ui/out
+*.log
