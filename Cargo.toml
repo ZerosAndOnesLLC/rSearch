@@ -16,15 +16,19 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
-publish = false
+publish = true
+repository = "https://github.com/ZerosAndOnesLLC/rSearch"
+readme = "README.md"
+keywords = ["search", "logging", "opensearch", "fips", "tantivy"]
+categories = ["database-implementations", "text-processing"]
 
 [workspace.dependencies]
-rsearch-common = { path = "crates/rsearch-common" }
-rsearch-storage = { path = "crates/rsearch-storage" }
-rsearch-index = { path = "crates/rsearch-index" }
-rsearch-metastore = { path = "crates/rsearch-metastore" }
-rsearch-ingest = { path = "crates/rsearch-ingest" }
-rsearch-search = { path = "crates/rsearch-search" }
+rsearch-common = { path = "crates/rsearch-common", version = "0.1.0" }
+rsearch-storage = { path = "crates/rsearch-storage", version = "0.1.0" }
+rsearch-index = { path = "crates/rsearch-index", version = "0.1.0" }
+rsearch-metastore = { path = "crates/rsearch-metastore", version = "0.1.0" }
+rsearch-ingest = { path = "crates/rsearch-ingest", version = "0.1.0" }
+rsearch-search = { path = "crates/rsearch-search", version = "0.1.0" }
 
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

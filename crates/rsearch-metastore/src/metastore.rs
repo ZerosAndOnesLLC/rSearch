@@ -32,7 +32,7 @@ impl Metastore {
             .max_connections(cfg.max_connections)
             .connect(&url)
             .await?;
-        sqlx::migrate!("../../migrations").run(&pool).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
     }
 

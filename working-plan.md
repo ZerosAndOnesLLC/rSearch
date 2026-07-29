@@ -268,6 +268,21 @@ Design decisions (locked):
       aws-lc FIPS delocator rejects newer GCC asm) + .dockerignore so the
       build context excludes target/bench-data
 
+## Phase 13 — Release prep (crates.io)
+
+- [x] 13.1 Publish readiness: workspace `publish = true` with per-crate
+      description/repository/readme/keywords/categories; internal path deps
+      carry registry versions; migrations moved into `rsearch-metastore`
+      (embedded in its package; `sqlx migrate run` now takes
+      `--source crates/rsearch-metastore/migrations`); rsearch-bench stays
+      unpublished; deny.toml GPL exceptions for the workspace's own crates
+      (allowlist remains third-party-only); RELEASING.md with versioning
+      policy + dependency-order publish; README install section + crate
+      table. Verified: `cargo package --list` per crate, full
+      `cargo publish --dry-run` on rsearch-common (dependents can only
+      verify once deps are live — publish order in RELEASING.md), ci.sh
+      green. All 8 crate names confirmed free on crates.io (2026-07-29).
+
 ## Deferred (explicitly out of v1)
 
 - Distributed search fan-out across searchers (any searcher answers alone in v1)
@@ -281,5 +296,8 @@ Design decisions (locked):
 ## Execution rules
 
 One sub-phase at a time; mark [x] when done. `cargo check` clean, then commit
-after each sub-phase. Test migrations with `sqlx migrate run` before committing.
-Update README on significant changes. Commit progress if context gets long.
+after each sub-phase. Test migrations with
+`sqlx migrate run --source crates/rsearch-metastore/migrations` before
+committing (migrations live inside the metastore crate so they ship in its
+crates.io package). Update README on significant changes. Commit progress if
+context gets long.

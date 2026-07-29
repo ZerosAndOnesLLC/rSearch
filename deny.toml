@@ -20,7 +20,7 @@ deny = [
     # legacy Postgres md5 auth method; deployments MUST use scram-sha-256
     # (the Postgres 14+ default), making it dead code on the wire.
     # Any other consumer of md-5 stays banned.
-    { crate = "md-5", reason = "MD5 is not FIPS-approved", wrappers = ["aws-smithy-checksums", "sqlx-postgres", "sqlx-macros-core"] },
+    { crate = "md-5", reason = "MD5 is not FIPS-approved", wrappers = ["aws-smithy-checksums", "sqlx-postgres"] },
     { crate = "md5", reason = "MD5 is not FIPS-approved" },
     { crate = "sha1_smol", reason = "SHA-1 is not FIPS-approved for new signatures" },
     { crate = "argon2", reason = "not FIPS-approved; use PBKDF2-HMAC-SHA256" },
@@ -34,8 +34,18 @@ deny = [
 ]
 
 [licenses]
-# Workspace crates are proprietary and unpublished.
+# rsearch-bench stays unpublished; published workspace crates are GPL and
+# carry explicit exceptions below (the allowlist is for third-party deps).
 private = { ignore = true }
+exceptions = [
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-common" },
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-storage" },
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-index" },
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-metastore" },
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-ingest" },
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-search" },
+    { allow = ["GPL-3.0-or-later"], name = "rsearch-server" },
+]
 allow = [
     "MIT",
     "Apache-2.0",

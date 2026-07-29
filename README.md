@@ -66,14 +66,27 @@ search nodes prune splits by time range via the metastore and execute
 queries directly against storage through a local cache. One binary runs any
 combination of roles: `rsearch --roles ingest,search,control`.
 
+## Install
+
+From crates.io (builds the FIPS module from source — needs CMake, Go,
+and clang on the build host):
+
+```bash
+CC=clang CXX=clang++ cargo install rsearch-server   # installs the `rsearch` binary
+```
+
+Or build from a checkout with `CC=clang CXX=clang++ cargo build
+--release` (clang is required: the aws-lc FIPS delocator rejects newer
+GCC assembly). Container images build from the included `Dockerfile`.
+
 ## Quick start
 
 ```bash
 # 1. dependencies (Postgres 14+ with scram-sha-256, object storage or local disk)
 docker compose up -d postgres minio    # or bring your own
 
-# 2. build (FIPS module needs CMake + Go on the build host)
-cargo build --release
+# 2. build (see Install above for toolchain requirements)
+CC=clang CXX=clang++ cargo build --release
 
 # 3. run a single-node cluster (all roles)
 export DATABASE_URL=postgres://rsearch:rsearch@localhost:5432/rsearch
@@ -176,6 +189,20 @@ percentiles, cardinality, …).
 
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
+
+## Workspace crates
+
+| Crate | What it is |
+|-------|------------|
+| `rsearch-server` | The `rsearch` binary: HTTP API, roles, control plane |
+| `rsearch-common` | Config, roles, FIPS TLS, crypto helpers |
+| `rsearch-storage` | Storage backends: local fs, S3/MinIO, node-replicated |
+| `rsearch-index` | ES-style mappings on Tantivy; immutable split files |
+| `rsearch-metastore` | Postgres metastore: streams, splits, placement, leadership (migrations embedded) |
+| `rsearch-ingest` | `_bulk`/syslog/GELF parsing, WAL, indexer pipeline |
+| `rsearch-search` | Query-DSL subset executed over published splits |
+
+Release procedure (versioning, publish order) is in `RELEASING.md`.
 
 ## Web console
 
