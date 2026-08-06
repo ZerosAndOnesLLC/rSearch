@@ -86,4 +86,7 @@ pub struct NodeRecord {
     /// Draining nodes keep serving reads but receive no new object copies;
     /// the control leader copies their objects off (12.6).
     pub draining: bool,
+    /// Seconds since the drain began; None when not draining. Surfaces
+    /// long-lived (possibly forgotten) draining flags (#4).
+    pub draining_since_secs: Option<f64>,
 }

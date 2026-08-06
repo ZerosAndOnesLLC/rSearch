@@ -149,3 +149,90 @@ async fn node_heartbeats() {
     let expired = ms.expire_dead_nodes(60.0).await.unwrap();
     assert!(expired >= 1);
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn draining_flag_tracks_start_time() {
+    let Some(ms) = metastore().await else { return };
+    let node_id = unique("drain");
+    ms.heartbeat(&node_id, &["data".to_string()], Some("10.0.0.2:9200"))
+        .await
+        .unwrap();
+
+    let me = |nodes: Vec<rsearch_metastore::NodeRecord>| {
+        nodes.into_iter().find(|n| n.id == node_id).unwrap()
+    };
+    assert_eq!(me(ms.list_nodes().await.unwrap()).draining_since_secs, None);
+
+    assert!(ms.set_node_draining(&node_id, true).await.unwrap());
+    let node = me(ms.list_nodes().await.unwrap());
+    assert!(node.draining);
+    let age = node.draining_since_secs.expect("stamped on drain");
+    assert!(age < 5.0);
+
+    // Backdate the drain start; a repeated drain request must NOT reset it.
+    sqlx::query("UPDATE nodes SET draining_since = now() - interval '2 hours' WHERE id = $1")
+        .bind(&node_id)
+        .execute(ms.pool())
+        .await
+        .unwrap();
+    assert!(ms.set_node_draining(&node_id, true).await.unwrap());
+    let age = me(ms.list_nodes().await.unwrap())
+        .draining_since_secs
+        .unwrap();
+    assert!(age > 7000.0, "repeated drain reset draining_since (age {age})");
+
+    // Undrain clears the timestamp.
+    assert!(ms.set_node_draining(&node_id, false).await.unwrap());
+    let node = me(ms.list_nodes().await.unwrap());
+    assert!(!node.draining);
+    assert_eq!(node.draining_since_secs, None);
+
+    // Unknown node is reported, not silently ignored.
+    assert!(!ms.set_node_draining(&unique("ghost"), true).await.unwrap());
+
+    sqlx::query("DELETE FROM nodes WHERE id = $1")
+        .bind(&node_id)
+        .execute(ms.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn replication_targets_draining_last_resort() {
+    let Some(ms) = metastore().await else { return };
+    let normal = unique("rt-normal");
+    let draining = unique("rt-draining");
+    for id in [&normal, &draining] {
+        ms.heartbeat(id, &["data".to_string()], Some("10.0.0.3:9200"))
+            .await
+            .unwrap();
+    }
+    ms.set_node_draining(&draining, true).await.unwrap();
+
+    let ours = |nodes: Vec<rsearch_metastore::NodeRecord>| -> Vec<String> {
+        nodes
+            .into_iter()
+            .map(|n| n.id)
+            .filter(|id| id == &normal || id == &draining)
+            .collect()
+    };
+
+    // Default: draining nodes are never write/repair targets.
+    let targets = ours(ms.replication_targets(30.0, &[], 100, false).await.unwrap());
+    assert!(targets.contains(&normal));
+    assert!(!targets.contains(&draining));
+
+    // Last resort: draining nodes are eligible, ranked after the rest.
+    let targets = ours(ms.replication_targets(30.0, &[], 100, true).await.unwrap());
+    assert!(targets.contains(&draining));
+
+    for id in [&normal, &draining] {
+        sqlx::query("DELETE FROM nodes WHERE id = $1")
+            .bind(id)
+            .execute(ms.pool())
+            .await
+            .unwrap();
+    }
+}

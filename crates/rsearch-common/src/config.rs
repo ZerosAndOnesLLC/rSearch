@@ -133,6 +133,11 @@ pub struct ControlConfig {
     /// only governs registry row cleanup) — with factor 2, every second
     /// of this window is one failure away from data loss.
     pub repair_stale_secs: f64,
+    /// Warn (every control tick) when a node has been draining longer
+    /// than this — a long-lived draining flag is usually a forgotten
+    /// DELETE /_rsearch/nodes/{id}/drain, and the node silently takes no
+    /// writes or repair copies while it lasts.
+    pub drain_warn_secs: f64,
 }
 
 impl Default for ControlConfig {
@@ -145,6 +150,7 @@ impl Default for ControlConfig {
             allow_insecure_webhooks: false,
             staged_orphan_secs: 3600.0,
             repair_stale_secs: 300.0,
+            drain_warn_secs: 3600.0,
         }
     }
 }

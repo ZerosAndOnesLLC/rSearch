@@ -63,7 +63,7 @@ impl Placement for MetastorePlacement {
     ) -> StorageResult<Vec<PeerNode>> {
         Ok(self
             .metastore
-            .replication_targets(LIVE_AFTER_SECS, exclude, count as i64)
+            .replication_targets(LIVE_AFTER_SECS, exclude, count as i64, false)
             .await
             .map_err(|e| placement_err("", e))?
             .into_iter()

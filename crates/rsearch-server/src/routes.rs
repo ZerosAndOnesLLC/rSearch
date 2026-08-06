@@ -202,6 +202,7 @@ async fn cat_nodes(State(state): State<AppState>) -> Json<Value> {
                     "heartbeat_age_secs": n.heartbeat_age_secs,
                     "live": n.heartbeat_age_secs < 30.0,
                     "draining": n.draining,
+                    "draining_since_secs": n.draining_since_secs,
                 })
             })
             .collect(),

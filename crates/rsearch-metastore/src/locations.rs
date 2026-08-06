@@ -84,7 +84,8 @@ impl Metastore {
     ) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
             "SELECT n.id, n.roles, n.address, n.draining,
-                    EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs
+                    EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs,
+                    EXTRACT(EPOCH FROM (now() - n.draining_since))::float8 AS draining_since_secs
              FROM object_locations ol
              JOIN nodes n ON n.id = ol.node_id
              WHERE ol.storage_key = $1
@@ -118,16 +119,21 @@ impl Metastore {
     /// Up to `limit` live nodes to receive new object copies, excluding
     /// `exclude` (typically the writer and existing holders), preferring
     /// nodes holding the fewest total bytes so fresh/empty nodes absorb
-    /// writes first.
+    /// writes first. With `include_draining`, draining nodes are eligible
+    /// too, ranked after non-draining ones — repair's last resort when
+    /// nothing else can take a copy (#4); the drain job moves such copies
+    /// off again later.
     pub async fn replication_targets(
         &self,
         stale_after_secs: f64,
         exclude: &[String],
         limit: i64,
+        include_draining: bool,
     ) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
             "SELECT n.id, n.roles, n.address, n.draining,
-                    EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs
+                    EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs,
+                    EXTRACT(EPOCH FROM (now() - n.draining_since))::float8 AS draining_since_secs
              FROM nodes n
              LEFT JOIN (
                  SELECT node_id, SUM(size_bytes)::bigint AS bytes
@@ -135,13 +141,14 @@ impl Metastore {
              ) held ON held.node_id = n.id
              WHERE n.last_heartbeat > now() - make_interval(secs => $1)
                AND n.id <> ALL($2)
-               AND NOT n.draining
-             ORDER BY COALESCE(held.bytes, 0) ASC, n.id
+               AND (NOT n.draining OR $4)
+             ORDER BY n.draining ASC, COALESCE(held.bytes, 0) ASC, n.id
              LIMIT $3",
         )
         .bind(stale_after_secs)
         .bind(exclude)
         .bind(limit)
+        .bind(include_draining)
         .fetch_all(self.pool())
         .await?)
     }

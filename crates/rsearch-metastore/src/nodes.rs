@@ -29,13 +29,24 @@ impl Metastore {
         Ok(row.0)
     }
 
-    /// Flip a node's draining flag; false if the node is unknown.
+    /// Flip a node's draining flag; false if the node is unknown. The
+    /// drain start time is stamped on false→true, kept on repeated drain
+    /// requests, and cleared on undrain.
     pub async fn set_node_draining(&self, node_id: &str, draining: bool) -> MetastoreResult<bool> {
-        let result = sqlx::query("UPDATE nodes SET draining = $2 WHERE id = $1")
-            .bind(node_id)
-            .bind(draining)
-            .execute(self.pool())
-            .await?;
+        let result = sqlx::query(
+            "UPDATE nodes
+             SET draining = $2,
+                 draining_since = CASE
+                     WHEN NOT $2 THEN NULL
+                     WHEN draining THEN draining_since
+                     ELSE now()
+                 END
+             WHERE id = $1",
+        )
+        .bind(node_id)
+        .bind(draining)
+        .execute(self.pool())
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -43,7 +54,8 @@ impl Metastore {
     pub async fn list_nodes(&self) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
             "SELECT id, roles, address, draining,
-                    EXTRACT(EPOCH FROM (now() - last_heartbeat))::float8 AS heartbeat_age_secs
+                    EXTRACT(EPOCH FROM (now() - last_heartbeat))::float8 AS heartbeat_age_secs,
+                    EXTRACT(EPOCH FROM (now() - draining_since))::float8 AS draining_since_secs
              FROM nodes ORDER BY id",
         )
         .fetch_all(self.pool())
@@ -54,7 +66,8 @@ impl Metastore {
     pub async fn live_nodes(&self, stale_after_secs: f64) -> MetastoreResult<Vec<NodeRecord>> {
         Ok(sqlx::query_as::<_, NodeRecord>(
             "SELECT id, roles, address, draining,
-                    EXTRACT(EPOCH FROM (now() - last_heartbeat))::float8 AS heartbeat_age_secs
+                    EXTRACT(EPOCH FROM (now() - last_heartbeat))::float8 AS heartbeat_age_secs,
+                    EXTRACT(EPOCH FROM (now() - draining_since))::float8 AS draining_since_secs
              FROM nodes
              WHERE last_heartbeat > now() - make_interval(secs => $1)
              ORDER BY id",

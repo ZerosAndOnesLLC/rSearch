@@ -138,7 +138,14 @@ Operational notes:
   nodes, and it refuses new `_bulk` traffic (503) so its WAL empties out
   (repoint syslog/GELF shippers yourself). When the leader logs "drain
   complete" (its `object_locations` rows are gone) the node can be shut
-  down. `DELETE` on the same path cancels a drain.
+  down. `DELETE` on the same path cancels a drain. A draining node takes
+  no writes or repair copies, so don't leave the flag set on a node you
+  mean to keep: `GET /_cat/nodes` reports `draining_since_secs`, and the
+  leader warns every tick once a drain outlives
+  `control.drain_warn_secs` (default 1h). If under-replicated data has
+  nowhere else to go, repair will fall back to a draining node rather
+  than leave a key one failure from loss (the drain job moves the copy
+  off again later).
 - Postgres holds placement and all metadata — run it HA too, or it is
   the single point of failure.
 - With factor 2, the window between a node dying and repair completing

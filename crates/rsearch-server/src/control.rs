@@ -164,12 +164,45 @@ impl ControlPlane {
                 continue;
             }
             let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
-            let targets = self
+            let mut targets = self
                 .metastore
-                .replication_targets(30.0, &exclude, missing as i64)
+                .replication_targets(30.0, &exclude, missing as i64, false)
                 .await?;
+            if targets.len() < missing {
+                // Last resort: a draining node beats losing the last copy.
+                // The drain job moves the copy off again once a real
+                // target exists (#4).
+                let mut exclude_more = exclude.clone();
+                exclude_more.extend(targets.iter().map(|t| t.id.clone()));
+                let fallback = self
+                    .metastore
+                    .replication_targets(
+                        30.0,
+                        &exclude_more,
+                        (missing - targets.len()) as i64,
+                        true,
+                    )
+                    .await?;
+                for target in fallback {
+                    warn!(
+                        key,
+                        target = %target.id,
+                        "repair: using draining node as last-resort copy target"
+                    );
+                    targets.push(target);
+                }
+            }
             if targets.is_empty() {
-                warn!(key, "repair: no eligible target nodes");
+                // Even draining nodes were considered above, so this means
+                // every live node already holds a copy — the cluster is
+                // simply short of nodes for the factor.
+                warn!(
+                    key,
+                    live_holders = holders.len(),
+                    missing,
+                    "repair: no eligible target nodes — every live node \
+                     already holds a copy"
+                );
                 continue;
             }
             for target in targets {
@@ -271,11 +304,27 @@ impl ControlPlane {
     /// no rows left it can be shut down. The node keeps serving reads the
     /// whole time, so there is no availability dip.
     async fn drain_job(&self) -> anyhow::Result<()> {
+        let nodes = self.metastore.list_nodes().await?;
+        // A draining flag outliving the warn window is likely a forgotten
+        // DELETE: the node looks healthy but silently takes no writes and
+        // no new copies (#4). Warn every tick until cleared.
+        for node in nodes.iter().filter(|n| n.draining) {
+            if let Some(age) = node.draining_since_secs
+                && age > self.config.drain_warn_secs
+            {
+                warn!(
+                    node = %node.id,
+                    draining_hours = format!("{:.1}", age / 3600.0),
+                    "node has been draining for a long time — it takes no \
+                     writes or repair copies; if unintended, clear with \
+                     DELETE /_rsearch/nodes/{{id}}/drain"
+                );
+            }
+        }
         let Some(ctl) = &self.replication else {
             return Ok(());
         };
         let factor = ctl.replication_factor as usize;
-        let nodes = self.metastore.list_nodes().await?;
         for node in nodes.iter().filter(|n| n.draining) {
             let keys = self.metastore.locations_on_node(&node.id, 50).await?;
             if keys.is_empty() {
@@ -294,7 +343,7 @@ impl ControlPlane {
                     let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
                     let targets = self
                         .metastore
-                        .replication_targets(30.0, &exclude, (factor - safe) as i64)
+                        .replication_targets(30.0, &exclude, (factor - safe) as i64, false)
                         .await?;
                     for target in targets {
                         let Some(addr) = target.address.as_deref() else { continue };
