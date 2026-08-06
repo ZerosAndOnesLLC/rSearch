@@ -15,4 +15,4 @@ pub use syslog::parse_syslog;
 pub use bulk::{BulkAction, BulkItem, BulkParseOutcome, parse_bulk_body};
 pub use error::{IngestError, IngestResult};
 pub use pipeline::{IngestPipeline, PipelineConfig};
-pub use wal::{Wal, WalPos, WalRecord};
+pub use wal::{Wal, WalPos, WalRecord, WalReplay};

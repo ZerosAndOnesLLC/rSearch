@@ -17,7 +17,7 @@ use rsearch_metastore::Metastore;
 use rsearch_storage::Storage;
 
 use crate::error::{IngestError, IngestResult};
-use crate::wal::{Wal, WalPos, WalRecord};
+use crate::wal::{Wal, WalPos, WalReplay};
 
 #[derive(Clone)]
 pub struct PipelineConfig {
@@ -231,10 +231,15 @@ impl IngestPipeline {
     }
 
     /// Feed WAL records recovered at startup back through the pipeline.
-    /// Uses blocking sends — replay must not be dropped for backpressure.
-    pub async fn replay(&self, records: Vec<WalRecord>) -> IngestResult<usize> {
-        let count = records.len();
+    /// Records are streamed from the segment files one at a time and the
+    /// worker queues are bounded, so replaying a large backlog holds at
+    /// most O(queue depth) in memory. Uses blocking sends — replay must
+    /// not be dropped for backpressure.
+    pub async fn replay(&self, records: WalReplay) -> IngestResult<usize> {
+        let mut count = 0usize;
         for record in records {
+            let record = record.map_err(IngestError::Wal)?;
+            count += 1;
             // Validate the payload is parseable JSON; the WAL payload IS
             // the source bytes, so we don't keep the parsed value.
             if serde_json::from_slice::<serde::de::IgnoredAny>(&record.doc).is_err() {
