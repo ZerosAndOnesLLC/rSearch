@@ -5,6 +5,7 @@ mod auth_api;
 mod bulk_api;
 mod control;
 mod internal_api;
+mod metrics;
 mod placement;
 mod routes;
 mod search_api;
@@ -203,12 +204,22 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Control role: contend for leadership and run background jobs.
-    if roles.contains(&Role::Control) {
-        let plane = control::ControlPlane::new(&config, metastore.clone(), storage.clone())
-            .context("initializing control plane")?;
+    // Control role: contend for leadership and run background jobs. The
+    // metrics handle is shared with /metrics via AppState.
+    let control_metrics = if roles.contains(&Role::Control) {
+        let metrics = std::sync::Arc::new(metrics::ControlMetrics::default());
+        let plane = control::ControlPlane::new(
+            &config,
+            metastore.clone(),
+            storage.clone(),
+            metrics.clone(),
+        )
+        .context("initializing control plane")?;
         tokio::spawn(plane.run());
-    }
+        Some(metrics)
+    } else {
+        None
+    };
 
     // Every node heartbeats its liveness row; the response carries the
     // draining flag so an operator drain reaches the node within one beat.
@@ -245,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut state = AppState::new(&config, &roles, metastore, pipeline, search);
     state.draining = draining_flag;
+    state.control = control_metrics;
     if config.storage.backend == "replicated" {
         state.internal = Some(std::sync::Arc::new(internal_api::InternalState {
             fs: rsearch_storage::FsStorage::new(config.storage.root.clone()),

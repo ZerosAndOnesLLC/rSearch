@@ -148,6 +148,9 @@ fn classify(method: &str, path: &str) -> Action {
         ("POST", ["_msearch"]) => Action::Search(None),
         ("GET", [index, "_mapping"]) => Action::Search(Some(index.to_string())),
         ("GET", ["_cat", ..]) | ("GET", ["_rsearch", "stats"]) => Action::Search(None),
+        // Prometheus scrape — same read level as stats; scrape configs
+        // pass a session or API-key token as a bearer credential.
+        ("GET", ["metrics"]) => Action::Search(None),
         // Everything else that mutates: admin.
         _ => Action::Admin,
     }

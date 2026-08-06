@@ -193,6 +193,7 @@ and IMDS are never touched.
 | Streams | `PUT /_rsearch/streams/{name}/retention`, routing rules under `/_rsearch/routing_rules` |
 | Alerts | `PUT/GET/DELETE /_rsearch/alerts[/{name}]` (scheduled query → webhook) |
 | Auth | `POST /_rsearch/login`, users/api_keys under `/_rsearch/` |
+| Observability | `GET /metrics` (Prometheus), `GET /_rsearch/stats` (JSON) |
 
 Query DSL subset: `match_all`, `bool`, `term`, `terms`, `range`,
 `exists`, `match`, `match_phrase`, `query_string`. Aggregations pass
@@ -201,6 +202,24 @@ percentiles, cardinality, …).
 
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
+
+`GET /metrics` serves Prometheus text format: ingest throughput and
+queue depth, WAL backlog (`rsearch_wal_outstanding_records` — watch this
+for restart-replay memory pressure), cluster node liveness/draining
+gauges, and on control nodes leadership plus repair/drain activity. It
+requires search-level auth like `/_rsearch/stats`; point a scrape job at
+it with an API key:
+
+```yaml
+scrape_configs:
+  - job_name: rsearch
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: <api key from POST /_rsearch/api_keys>
+    static_configs:
+      - targets: ["node-a:9200", "node-b:9200", "node-c:9200"]
+```
 
 ## Workspace crates
 

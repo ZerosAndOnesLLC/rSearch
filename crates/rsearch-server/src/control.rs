@@ -28,6 +28,8 @@ pub struct ControlPlane {
     /// Present when the replicated storage backend is active: the leader
     /// re-replicates under-held objects between peers.
     replication: Option<ReplicationCtl>,
+    /// Shared with the /metrics handler.
+    metrics: Arc<crate::metrics::ControlMetrics>,
 }
 
 struct ReplicationCtl {
@@ -41,6 +43,7 @@ impl ControlPlane {
         config: &RsearchConfig,
         metastore: Metastore,
         storage: Arc<dyn Storage>,
+        metrics: Arc<crate::metrics::ControlMetrics>,
     ) -> anyhow::Result<Self> {
         let data_dir = std::path::PathBuf::from(&config.node.data_dir);
         let cache = Arc::new(SplitCache::new(data_dir.join("cache/control"), 1 << 30)?);
@@ -69,6 +72,7 @@ impl ControlPlane {
             search,
             webhook: crate::webhook::WebhookClient::new(config.control.allow_insecure_webhooks)?,
             replication,
+            metrics,
         })
     }
 
@@ -88,6 +92,7 @@ impl ControlPlane {
                 }
             };
             info!(node = %self.node_id, "acquired control leadership");
+            self.metrics.leader.store(true, std::sync::atomic::Ordering::Relaxed);
             loop {
                 self.tick().await;
                 tokio::time::sleep(Duration::from_secs(self.config.interval_secs)).await;
@@ -98,6 +103,7 @@ impl ControlPlane {
                     break;
                 }
             }
+            self.metrics.leader.store(false, std::sync::atomic::Ordering::Relaxed);
             // Explicitly release the advisory lock so a healthy connection
             // doesn't keep leadership pinned in the pool (M7).
             Metastore::release_leadership(leader_conn).await;
@@ -151,6 +157,9 @@ impl ControlPlane {
                 20,
             )
             .await?;
+        self.metrics
+            .repair_pending_keys
+            .store(under.len() as u64, std::sync::atomic::Ordering::Relaxed);
         for entry in under {
             let key = &entry.storage_key;
             // Holders must be reachable *now* to serve as copy sources.
@@ -214,12 +223,21 @@ impl ControlPlane {
                 .await
                 {
                     Ok(Ok(())) => {
+                        self.metrics
+                            .repair_copies_restored
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         info!(key, target = %target.id, "repair: copy restored");
                     }
                     Ok(Err(e)) => {
+                        self.metrics
+                            .repair_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(key, target = %target.id, error = %e, "repair: replicate failed");
                     }
                     Err(_) => {
+                        self.metrics
+                            .repair_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(key, target = %target.id, "repair: replicate timed out");
                     }
                 }
@@ -355,12 +373,21 @@ impl ControlPlane {
                         {
                             Ok(Ok(())) => {
                                 safe += 1;
+                                self.metrics
+                                    .drain_copies_moved
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 info!(key, target = %target.id, "drain: copy moved");
                             }
                             Ok(Err(e)) => {
+                                self.metrics
+                                    .drain_failures
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 warn!(key, target = %target.id, error = %e, "drain: replicate failed");
                             }
                             Err(_) => {
+                                self.metrics
+                                    .drain_failures
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 warn!(key, target = %target.id, "drain: replicate timed out");
                             }
                         }

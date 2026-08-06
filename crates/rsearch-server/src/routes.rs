@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_cluster/health", get(cluster_health))
         .route("/_cat/nodes", get(cat_nodes))
         .route("/_rsearch/stats", get(node_stats))
+        .route("/metrics", get(crate::metrics::metrics))
         .route(
             "/_bulk",
             post(bulk_api::bulk_root).layer(DefaultBodyLimit::max(BULK_BODY_LIMIT)),

@@ -26,6 +26,9 @@ pub struct AppState {
     /// Set when the operator drains this node (learned via heartbeat):
     /// bulk ingest is refused so the WAL empties out ahead of shutdown.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Repair/drain/leadership counters for /metrics, shared with the
+    /// control loop. Present only on nodes running the control role.
+    pub control: Option<Arc<crate::metrics::ControlMetrics>>,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             cors_allow_origin: config.http.cors_allow_origin.clone(),
             internal: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control: None,
         }
     }
 
