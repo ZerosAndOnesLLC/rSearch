@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { IBM_Plex_Mono, Inter } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 import { Nav } from "./nav";
 
@@ -21,6 +22,8 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${mono.variable} ${body.variable}`}>
+        {/* Runtime API base override — see public/env.js. */}
+        <Script src="/env.js" strategy="beforeInteractive" />
         <div className="flex min-h-screen">
           <aside
             className="w-48 shrink-0 border-r p-4 flex flex-col gap-6"

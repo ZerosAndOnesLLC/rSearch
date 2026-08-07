@@ -238,8 +238,17 @@ Release procedure (versioning, publish order) is in `RELEASING.md`.
 ## Web console
 
 `ui/` is a Next.js app (search, streams/retention, alerts, users & API
-keys). `cd ui && npm install && npm run build`. Point it at the API with
-`NEXT_PUBLIC_RSEARCH_API`.
+keys). `cd ui && npm install && npm run build`. The API base is resolved
+at runtime: replace the served `/env.js` (bind-mount, S3 object
+overwrite, or a container entrypoint writing it) with
+
+```js
+window.__RSEARCH_API__ = "https://rsearch.example.com:9200"; // "" = same origin
+```
+
+to point an already-built console at any cluster — no rebuild. When
+`/env.js` sets nothing, the `NEXT_PUBLIC_RSEARCH_API` build-time value
+applies (default `http://localhost:9200`).
 
 ## License
 

@@ -1,8 +1,23 @@
 // Thin client for the rSearch API. Token lives in localStorage; every
 // call goes through rq() so auth and errors are handled once.
 
-export const API_BASE =
-  process.env.NEXT_PUBLIC_RSEARCH_API ?? "http://localhost:9200";
+declare global {
+  interface Window {
+    /** Set by /env.js at runtime to repoint a built UI at another API. */
+    __RSEARCH_API__?: string;
+  }
+}
+
+// Resolved per call, not baked in at build: /env.js can set
+// window.__RSEARCH_API__ ("" = same origin) so one built console image
+// serves any cluster; the NEXT_PUBLIC_RSEARCH_API build arg and the
+// localhost dev default remain as fallbacks (#6).
+export function apiBase(): string {
+  if (typeof window !== "undefined" && window.__RSEARCH_API__ !== undefined) {
+    return window.__RSEARCH_API__;
+  }
+  return process.env.NEXT_PUBLIC_RSEARCH_API ?? "http://localhost:9200";
+}
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -31,7 +46,7 @@ export async function rq<T = unknown>(
     headers.set("content-type", "application/json");
   const token = getToken();
   if (token) headers.set("authorization", `Bearer ${token}`);
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const response = await fetch(`${apiBase()}${path}`, { ...init, headers });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const reason =
