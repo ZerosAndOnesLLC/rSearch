@@ -411,6 +411,17 @@ mod tests {
             Action::Search(Some("app-logs".into()))
         );
         assert_eq!(classify("GET", "/_cat/indices"), Action::Search(None));
+        // Loki-compatible surface: everything under /loki/api/v1 needs
+        // global search access; /ready is health-equivalent and open.
+        assert_eq!(classify("GET", "/loki/api/v1/query_range"), Action::Search(None));
+        assert_eq!(classify("POST", "/loki/api/v1/query"), Action::Search(None));
+        assert_eq!(
+            classify("GET", "/loki/api/v1/label/level/values"),
+            Action::Search(None)
+        );
+        assert_eq!(classify("GET", "/loki/api/v1/tail"), Action::Search(None));
+        assert_eq!(classify("GET", "/loki/api/v1/index/volume"), Action::Search(None));
+        assert_eq!(classify("GET", "/ready"), Action::Open);
         assert_eq!(classify("PUT", "/app-logs"), Action::Admin);
         assert_eq!(classify("PUT", "/_rsearch/users/alice"), Action::Admin);
         assert_eq!(

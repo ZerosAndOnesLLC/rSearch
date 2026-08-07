@@ -227,10 +227,21 @@ keyword-mapped fields, with values served from terms aggregations
 `_source` JSON when there is none.
 
 LogQL coverage is the subset Grafana sends: selectors with
-`=`, `!=`, `=~`, `!~`; line filters `|=` and `!=` (regex line filters
-return a clear error); `count_over_time` and `rate`, optionally wrapped
-in `sum` / `sum by (label)`. Like `/_msearch`, the Loki surface requires
-search-level auth with global stream access.
+`=`, `!=`, `=~`, `!~`; line filters `|=`, `!=`, `|~`, `!~`;
+`count_over_time` and `rate` (correct sliding-window math for any
+step/range combination), optionally wrapped in `sum` / `sum by (label)`
+— one grouping label. Like `/_msearch`, the Loki surface requires
+search-level auth with global stream access, and selectors must contain
+at least one matcher that doesn't match the empty string.
+
+Line filters are true substring/regex tests against the rendered line —
+never a tokenized index match that could miss "error" when searching
+"err". The trade-off: a filtered query (or filtered metric) examines up
+to 5000 selector-matching docs per stream, newest first, and sets a
+response warning when that scan window saturates. Per-stream failures in
+multi-stream queries degrade to `warnings` with partial results instead
+of failing the whole query. Tails are capped at 16 concurrent sessions
+and 1 hour per session, with WebSocket pings reaping dead peers.
 
 `GET /metrics` serves Prometheus text format: ingest throughput and
 queue depth, WAL backlog (`rsearch_wal_outstanding_records` — watch this

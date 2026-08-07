@@ -41,3 +41,4 @@ serde.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 regex = "1.13.1"
+time = { version = "0.3.55", features = ["parsing", "formatting"] }

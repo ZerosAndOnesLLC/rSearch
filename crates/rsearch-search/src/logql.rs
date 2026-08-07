@@ -156,13 +156,44 @@ impl<'a> Parser<'a> {
                         Some(b'\\') => {
                             self.pos += 1;
                             match self.peek() {
-                                Some(b'n') => out.push('\n'),
-                                Some(b't') => out.push('\t'),
-                                Some(b'r') => out.push('\r'),
-                                Some(other) => out.push(other as char),
+                                Some(b'n') => {
+                                    out.push('\n');
+                                    self.pos += 1;
+                                }
+                                Some(b't') => {
+                                    out.push('\t');
+                                    self.pos += 1;
+                                }
+                                Some(b'r') => {
+                                    out.push('\r');
+                                    self.pos += 1;
+                                }
+                                // Go-style hex/unicode escapes (LogQL strings
+                                // follow Go string literal syntax).
+                                Some(b'x') => {
+                                    self.pos += 1;
+                                    out.push(self.hex_escape(2)?);
+                                }
+                                Some(b'u') => {
+                                    self.pos += 1;
+                                    out.push(self.hex_escape(4)?);
+                                }
+                                Some(b'U') => {
+                                    self.pos += 1;
+                                    out.push(self.hex_escape(8)?);
+                                }
+                                Some(_) => {
+                                    // Any other escaped char passes through
+                                    // verbatim — decoded as a full UTF-8
+                                    // scalar, not a single byte.
+                                    let rest = std::str::from_utf8(&self.input[self.pos..])
+                                        .map_err(|_| "invalid UTF-8 in string".to_string())?;
+                                    let ch = rest.chars().next().unwrap();
+                                    out.push(ch);
+                                    self.pos += ch.len_utf8();
+                                }
                                 None => return Err("unterminated escape".into()),
                             }
-                            self.pos += 1;
                         }
                         Some(_) => {
                             // Consume one UTF-8 scalar, not one byte.
@@ -190,6 +221,18 @@ impl<'a> Parser<'a> {
             }
             _ => Err(format!("expected string at byte {}", self.pos)),
         }
+    }
+
+    /// `\xNN` / `\uNNNN` / `\UNNNNNNNN` escape body: `digits` hex chars.
+    fn hex_escape(&mut self, digits: usize) -> Result<char, String> {
+        if self.pos + digits > self.input.len() {
+            return Err("truncated hex escape".into());
+        }
+        let text = std::str::from_utf8(&self.input[self.pos..self.pos + digits])
+            .map_err(|_| "invalid hex escape".to_string())?;
+        let code = u32::from_str_radix(text, 16).map_err(|_| "invalid hex escape".to_string())?;
+        self.pos += digits;
+        char::from_u32(code).ok_or_else(|| "escape is not a valid scalar".to_string())
     }
 
     /// `[5m]`-style range: sequence of number+unit components.
@@ -391,6 +434,18 @@ mod tests {
         let q = parse("{}").unwrap();
         let LogQlQuery::Log(sel) = q else { panic!() };
         assert!(sel.matchers.is_empty());
+    }
+
+    #[test]
+    fn string_escapes() {
+        let q = parse(r#"{a="\u0041\x42-\"q\"-é"}"#).unwrap();
+        let LogQlQuery::Log(sel) = q else { panic!() };
+        assert_eq!(sel.matchers[0].value, "AB-\"q\"-é");
+        // Escaped multibyte char passes through without desyncing.
+        let q = parse("{a=\"\\é\"}").unwrap();
+        let LogQlQuery::Log(sel) = q else { panic!() };
+        assert_eq!(sel.matchers[0].value, "é");
+        assert!(parse(r#"{a="\uD800"}"#).is_err()); // surrogate: not a scalar
     }
 
     #[test]
