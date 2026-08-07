@@ -5,27 +5,39 @@ use sqlx::Row;
 use crate::error::MetastoreResult;
 use crate::metastore::Metastore;
 
+/// A console user row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRecord {
+    /// Primary key; sessions reference it via `user_id`.
     pub id: i64,
+    /// Unique login name.
     pub username: String,
+    /// Hashed password (never the plaintext).
     pub password_hash: String,
     /// admin | user
     pub role: String,
+    /// Streams the user may access; `"*"` grants all streams.
     pub streams: Vec<String>,
 }
 
+/// An API key row. The key itself is never stored — only its hash —
+/// so this record is safe to serialize in listings.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct ApiKeyRecord {
+    /// Primary key.
     pub id: i64,
+    /// Unique key name (upsert key).
     pub name: String,
+    /// Granted actions: subset of ingest, search, admin.
     pub actions: Vec<String>,
+    /// Streams the key may access; `"*"` grants all streams.
     pub streams: Vec<String>,
 }
 
 const USER_COLUMNS: &str = "id, username, password_hash, role, streams";
 
 impl Metastore {
+    /// Total number of users (used for first-run admin bootstrap).
     pub async fn count_users(&self) -> MetastoreResult<i64> {
         let row = sqlx::query("SELECT count(*) AS n FROM users")
             .fetch_one(self.pool())
@@ -33,6 +45,7 @@ impl Metastore {
         Ok(row.get::<i64, _>("n"))
     }
 
+    /// Create or update (by username) a user.
     pub async fn upsert_user(
         &self,
         username: &str,
@@ -56,6 +69,7 @@ impl Metastore {
             .await?)
     }
 
+    /// Look up a user by username.
     pub async fn get_user(&self, username: &str) -> MetastoreResult<Option<UserRecord>> {
         let query = format!("SELECT {USER_COLUMNS} FROM users WHERE username = $1");
         Ok(sqlx::query_as::<_, UserRecord>(sqlx::AssertSqlSafe(query))
@@ -64,6 +78,7 @@ impl Metastore {
             .await?)
     }
 
+    /// All users, ordered by username.
     pub async fn list_users(&self) -> MetastoreResult<Vec<UserRecord>> {
         let query = format!("SELECT {USER_COLUMNS} FROM users ORDER BY username");
         Ok(sqlx::query_as::<_, UserRecord>(sqlx::AssertSqlSafe(query))
@@ -71,6 +86,7 @@ impl Metastore {
             .await?)
     }
 
+    /// Delete a user by username; false if no such user existed.
     pub async fn delete_user(&self, username: &str) -> MetastoreResult<bool> {
         let result = sqlx::query("DELETE FROM users WHERE username = $1")
             .bind(username)
@@ -81,6 +97,8 @@ impl Metastore {
 
     // ---- sessions ----
 
+    /// Store a login session keyed by token hash, expiring after
+    /// `ttl_secs`. Also sweeps already-expired sessions.
     pub async fn create_session(
         &self,
         token_hash: &str,
@@ -103,6 +121,8 @@ impl Metastore {
         Ok(())
     }
 
+    /// Resolve a session token hash to its user; None when the token
+    /// is unknown or the session has expired.
     pub async fn session_user(&self, token_hash: &str) -> MetastoreResult<Option<UserRecord>> {
         Ok(sqlx::query_as::<_, UserRecord>(
             "SELECT u.id, u.username, u.password_hash, u.role, u.streams
@@ -116,6 +136,7 @@ impl Metastore {
 
     // ---- api keys ----
 
+    /// Create or update (by name) an API key, storing only the hash.
     pub async fn create_api_key(
         &self,
         name: &str,
@@ -138,6 +159,8 @@ impl Metastore {
         .await?)
     }
 
+    /// Resolve an API key by its hash, stamping `last_used_at` at most
+    /// once per minute.
     pub async fn api_key_by_hash(&self, key_hash: &str) -> MetastoreResult<Option<ApiKeyRecord>> {
         // Throttle the last_used_at write to at most once per minute per
         // key so shipper auth doesn't generate a row write (+ dead tuples)
@@ -164,6 +187,7 @@ impl Metastore {
         .await?)
     }
 
+    /// All API keys, ordered by name.
     pub async fn list_api_keys(&self) -> MetastoreResult<Vec<ApiKeyRecord>> {
         Ok(sqlx::query_as::<_, ApiKeyRecord>(
             "SELECT id, name, actions, streams FROM api_keys ORDER BY name",
@@ -172,6 +196,7 @@ impl Metastore {
         .await?)
     }
 
+    /// Delete an API key by name; false if no such key existed.
     pub async fn delete_api_key(&self, name: &str) -> MetastoreResult<bool> {
         let result = sqlx::query("DELETE FROM api_keys WHERE name = $1")
             .bind(name)

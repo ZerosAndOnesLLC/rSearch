@@ -21,6 +21,8 @@ pub struct FsStorage {
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl FsStorage {
+    /// Create a backend rooted at `root`; spawns a background sweep of
+    /// temp files stranded by earlier crashes.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = root.into();
         // Failed writes delete their temp on the error path, but a crash

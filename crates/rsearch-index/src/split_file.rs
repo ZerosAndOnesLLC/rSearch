@@ -22,7 +22,9 @@ pub const FOOTER_TAIL_LEN: u64 = 16;
 /// Location of one bundled file within the split object.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileSpan {
+    /// Byte offset of the file within the split object.
     pub offset: u64,
+    /// File length in bytes.
     pub len: u64,
 }
 
@@ -30,11 +32,15 @@ pub struct FileSpan {
 /// the metastore when the split is published.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SplitMeta {
+    /// Unique split identifier (UUID, simple format).
     pub split_id: String,
+    /// Stream the split's documents belong to.
     pub stream: String,
+    /// Number of documents in the split.
     pub doc_count: u64,
     /// Inclusive document-timestamp range, epoch milliseconds.
     pub time_start_millis: i64,
+    /// Upper end of the inclusive timestamp range, epoch millis.
     pub time_end_millis: i64,
     /// The index mapping the split was built with (ES mapping shape).
     pub mapping: serde_json::Value,
@@ -43,7 +49,9 @@ pub struct SplitMeta {
 /// Full footer contents: bundled file map + split metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleMeta {
+    /// Bundled file name -> its byte span within the object.
     pub files: BTreeMap<String, FileSpan>,
+    /// Descriptive split metadata.
     pub split: SplitMeta,
 }
 

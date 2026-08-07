@@ -5,6 +5,7 @@ use crate::error::StorageResult;
 /// A peer node that can hold object copies.
 #[derive(Debug, Clone)]
 pub struct PeerNode {
+    /// Stable node identifier (nodes-table primary key).
     pub id: String,
     /// Dialable base URL from the node's heartbeat (advertise_url).
     pub address: Option<String>,

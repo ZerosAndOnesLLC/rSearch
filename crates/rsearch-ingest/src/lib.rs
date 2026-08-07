@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Ingest path: `_bulk` parsing, append-before-ack WAL, and the per-stream
 //! indexer pipeline that turns buffered documents into published splits.
 

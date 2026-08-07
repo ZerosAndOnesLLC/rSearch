@@ -1,14 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// Lifecycle state of a split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitState {
+    /// Uploaded to storage but not yet visible to search.
     Staged,
+    /// Live: visible to search queries.
     Published,
+    /// Retired; the janitor deletes the object then the row.
     MarkedForDelete,
 }
 
 impl SplitState {
+    /// The snake_case string stored in the `state` column.
     pub fn as_str(&self) -> &'static str {
         match self {
             SplitState::Staged => "staged",
@@ -30,56 +35,86 @@ impl std::str::FromStr for SplitState {
     }
 }
 
+/// A stream (index) row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct StreamRecord {
+    /// Primary key; splits reference it via `stream_id`.
     pub id: i64,
+    /// Unique stream (index) name.
     pub name: String,
+    /// ES-style field mapping JSON the index schema is built from.
     pub mapping: serde_json::Value,
+    /// Retention window in hours; None = keep forever.
     pub retention_hours: Option<i32>,
 }
 
+/// A split (immutable index file) row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SplitRecord {
+    /// Primary key.
     pub id: i64,
+    /// Globally unique split identifier.
     pub split_id: String,
+    /// Owning stream's `StreamRecord::id`.
     pub stream_id: i64,
+    /// Raw state string; parse via [`SplitRecord::state`].
     pub state: String,
+    /// Object key of the split file in storage.
     pub storage_key: String,
+    /// Number of documents in the split.
     pub doc_count: i64,
+    /// Split file size in bytes.
     pub size_bytes: i64,
+    /// Earliest document timestamp (epoch millis, inclusive).
     pub time_start_millis: i64,
+    /// Latest document timestamp (epoch millis, inclusive).
     pub time_end_millis: i64,
+    /// Byte length of the split file's footer metadata, so readers can
+    /// open the split with ranged reads of just the tail.
     pub footer_len: i64,
+    /// Id of the node that built the split, when known.
     pub created_by: Option<String>,
 }
 
 impl SplitRecord {
+    /// Parsed [`SplitState`]; unknown strings fall back to `Staged`.
     pub fn state(&self) -> SplitState {
         self.state.parse().unwrap_or(SplitState::Staged)
     }
 }
 
+/// Per-stream rollup over published splits (for `_cat/indices`).
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct StreamStats {
+    /// Stream name.
     pub name: String,
+    /// Retention window in hours; None = keep forever.
     pub retention_hours: Option<i32>,
+    /// Number of published splits.
     pub split_count: i64,
+    /// Total documents across published splits.
     pub doc_count: i64,
+    /// Total split bytes across published splits.
     pub size_bytes: i64,
 }
 
 /// A storage object with fewer live copies than the replication factor.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UnderReplicatedKey {
+    /// Object key that needs more copies.
     pub storage_key: String,
     /// Copies on nodes whose heartbeat is within the staleness threshold.
     pub live_holders: i64,
 }
 
+/// A registered cluster node (for `_cat/nodes` and placement).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct NodeRecord {
+    /// Unique node id.
     pub id: String,
+    /// Roles the node serves (e.g. ingest, search, control).
     pub roles: Vec<String>,
+    /// Advertised peer address; None if the node never announced one.
     pub address: Option<String>,
     /// Seconds since the node's last heartbeat.
     pub heartbeat_age_secs: f64,

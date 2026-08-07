@@ -24,8 +24,11 @@ pub struct SplitBuilder {
 /// A finished split: a single bundled file on local disk plus its
 /// metadata, ready to upload and publish.
 pub struct PackagedSplit {
+    /// The split's descriptive metadata (also in the bundle footer).
     pub meta: SplitMeta,
+    /// Path of the bundled split file on local disk.
     pub file_path: PathBuf,
+    /// Total size of the bundled file in bytes.
     pub size_bytes: u64,
     /// Length of the footer metadata JSON (for single-range-read opens).
     pub footer_len: u64,
@@ -63,10 +66,12 @@ impl SplitBuilder {
         })
     }
 
+    /// The generated id this split will be published under.
     pub fn split_id(&self) -> &str {
         &self.split_id
     }
 
+    /// Documents buffered so far.
     pub fn doc_count(&self) -> u64 {
         self.doc_count
     }

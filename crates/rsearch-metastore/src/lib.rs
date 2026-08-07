@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Postgres metastore: the cluster's coordination layer. Tracks streams,
 //! split lifecycle (staged → published → marked_for_delete), and node
 //! liveness. All cross-node state lives here or in object storage.

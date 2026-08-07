@@ -19,7 +19,7 @@ rust-version = "1.97"
 publish = true
 repository = "https://github.com/ZerosAndOnesLLC/rSearch"
 readme = "README.md"
-keywords = ["search", "logging", "opensearch", "fips", "tantivy"]
+keywords = ["search", "logging", "opensearch", "loki", "fips"]
 categories = ["database-implementations", "text-processing"]
 
 [workspace.dependencies]

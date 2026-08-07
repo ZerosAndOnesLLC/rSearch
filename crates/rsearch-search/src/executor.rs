@@ -52,12 +52,19 @@ const MAX_QUERY_SPLITS: usize = 10_000;
 
 /// A parsed `_search` request body.
 pub struct SearchRequest {
+    /// Stream (index) the search runs against.
     pub stream: String,
+    /// ES query DSL clause; defaults to `match_all`.
     pub query: Value,
+    /// Result offset (pagination); from+size is capped at 10k.
     pub from: usize,
+    /// Page size; defaults to 10.
     pub size: usize,
+    /// Timestamp sort direction; true (default) = newest first.
     pub sort_desc: bool,
+    /// ES `aggs`/`aggregations` body, if present.
     pub aggs: Option<Value>,
+    /// Whether hits include `_source` (`"_source": false` disables).
     pub include_source: bool,
     /// Exact-count ceiling; None = unbounded (always exact).
     pub track_total_hits: Option<usize>,
@@ -181,6 +188,8 @@ pub struct SearchService {
 }
 
 impl SearchService {
+    /// Build a search service over the given metastore, storage, and
+    /// shared split cache.
     pub fn new(metastore: Metastore, storage: Arc<dyn Storage>, cache: Arc<SplitCache>) -> Self {
         Self {
             metastore,

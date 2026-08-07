@@ -18,6 +18,7 @@ use crate::split_file::{BundleMeta, FOOTER_TAIL_LEN, parse_footer_tail, parse_me
 /// Opening reads only the footer; internal files are range-read from
 /// storage on first use and cached on local disk.
 pub struct SplitReader {
+    /// Footer metadata: bundled file map plus split metadata.
     pub meta: BundleMeta,
     index: Index,
     /// Built once and reused: splits are immutable, so re-opening every
@@ -91,6 +92,7 @@ impl SplitReader {
         })
     }
 
+    /// The underlying lazily-fetching Tantivy index.
     pub fn index(&self) -> &Index {
         &self.index
     }

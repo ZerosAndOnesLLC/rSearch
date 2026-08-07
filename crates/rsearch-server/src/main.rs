@@ -1,3 +1,6 @@
+//! rSearch server binary: role-driven node (ingest, search, control)
+//! exposing the OpenSearch- and Loki-compatible HTTP APIs.
+
 mod admin_api;
 mod alerts_api;
 mod auth;

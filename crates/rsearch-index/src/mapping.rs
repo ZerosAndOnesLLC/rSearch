@@ -16,12 +16,19 @@ pub const DYNAMIC_FIELD: &str = "_dynamic";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
+    /// Exact-match string (indexed untokenized, fast field).
     Keyword,
+    /// Full-text string (tokenized, scored).
     Text,
+    /// 64-bit signed integer (also covers ES integer/short/byte).
     Long,
+    /// 64-bit float (also covers ES float/half_float).
     Double,
+    /// Boolean flag.
     Boolean,
+    /// Timestamp, indexed at millisecond precision.
     Date,
+    /// IP address (v4 mapped to v6), range-queryable.
     Ip,
 }
 
@@ -47,6 +54,7 @@ impl FieldType {
 /// indexed dynamically under the `_dynamic` JSON field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IndexMapping {
+    /// Field name -> declared type for explicitly mapped fields.
     pub properties: BTreeMap<String, FieldType>,
 }
 
@@ -98,15 +106,23 @@ impl IndexMapping {
 /// reserved fields and every mapped field.
 #[derive(Clone)]
 pub struct MappedSchema {
+    /// The built Tantivy schema.
     pub schema: Schema,
+    /// Handle to the stored `_source` field.
     pub source: Field,
+    /// Handle to the indexed `_timestamp` fast field.
     pub timestamp: Field,
+    /// Handle to the `_dynamic` JSON field for unmapped keys.
     pub dynamic: Field,
+    /// Handles and types for every explicitly mapped field.
     pub fields: BTreeMap<String, (Field, FieldType)>,
+    /// The mapping this schema was built from.
     pub mapping: IndexMapping,
 }
 
 impl MappedSchema {
+    /// Build the Tantivy schema: reserved fields plus one field per
+    /// mapping entry, typed per [`FieldType`].
     pub fn build(mapping: IndexMapping) -> Self {
         let mut builder = Schema::builder();
         let source = builder.add_text_field(SOURCE_FIELD, STORED);
