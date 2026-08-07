@@ -8,12 +8,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// Accepts writes: runs the WAL, batching, and split building.
     Ingest,
+    /// Serves queries: downloads and caches splits, executes searches.
     Search,
+    /// Runs leader-elected cluster jobs: merge, GC, repair, alerts.
     Control,
 }
 
 impl Role {
+    /// Every role, in canonical order; the default role set for a node.
     pub const ALL: [Role; 3] = [Role::Ingest, Role::Search, Role::Control];
 }
 

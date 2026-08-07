@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Search path: OpenSearch query-DSL subset translated onto Tantivy,
 //! executed across published splits, merged into ES-shaped responses.
 

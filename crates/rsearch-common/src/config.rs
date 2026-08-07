@@ -9,14 +9,23 @@ use crate::role::Role;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RsearchConfig {
+    /// Node identity, roles, data directory, and advertise address.
     pub node: NodeConfig,
+    /// HTTP API bind address, TLS, and CORS settings.
     pub http: HttpConfig,
+    /// Object storage backend (fs, s3, or replicated) settings.
     pub storage: StorageConfig,
+    /// Postgres metastore connection settings.
     pub metastore: MetastoreConfig,
+    /// Ingest batching, queue, and WAL settings.
     pub ingest: IngestConfig,
+    /// Search-node settings (split cache budget).
     pub search: SearchConfig,
+    /// Control-plane (leader) job settings.
     pub control: ControlConfig,
+    /// Syslog/GELF input listener settings.
     pub inputs: InputsConfig,
+    /// Node-to-node settings for the replicated storage backend.
     pub cluster: ClusterConfig,
 }
 
@@ -50,16 +59,21 @@ pub struct ClusterConfig {
     pub peer_ca_file: String,
 }
 
+/// Built-in log input listeners (syslog and GELF).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InputsConfig {
+    /// Syslog (UDP/TCP) listener settings.
     pub syslog: SyslogInputConfig,
+    /// GELF (TCP) listener settings.
     pub gelf: GelfInputConfig,
 }
 
+/// Syslog input listener (RFC3164/RFC5424 over UDP and TCP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyslogInputConfig {
+    /// Whether the syslog listeners run at all. Default false.
     pub enabled: bool,
     /// UDP bind address; empty disables UDP.
     pub bind_udp: String,
@@ -67,6 +81,7 @@ pub struct SyslogInputConfig {
     pub bind_tcp: String,
     /// TLS for the TCP listener (FIPS provider); both paths set = enabled.
     pub tls_cert_path: String,
+    /// TLS private key path for the TCP listener.
     pub tls_key_path: String,
     /// Stream syslog messages are routed to by default.
     pub stream: String,
@@ -85,14 +100,19 @@ impl Default for SyslogInputConfig {
     }
 }
 
+/// GELF input listener (Graylog Extended Log Format over TCP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GelfInputConfig {
+    /// Whether the GELF listener runs at all. Default false.
     pub enabled: bool,
     /// TCP bind address (null-byte-framed GELF).
     pub bind_tcp: String,
+    /// TLS certificate path; both paths set = TLS enabled.
     pub tls_cert_path: String,
+    /// TLS private key path for the listener.
     pub tls_key_path: String,
+    /// Stream GELF messages are routed to by default.
     pub stream: String,
 }
 
@@ -108,6 +128,7 @@ impl Default for GelfInputConfig {
     }
 }
 
+/// Leader-run control-plane jobs: merge, GC, orphan sweeps, repair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControlConfig {
@@ -155,6 +176,7 @@ impl Default for ControlConfig {
     }
 }
 
+/// Search-node settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
@@ -168,6 +190,7 @@ impl Default for SearchConfig {
     }
 }
 
+/// Identity and local layout of this node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
@@ -198,10 +221,13 @@ impl Default for NodeConfig {
     }
 }
 
+/// HTTP API server settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
+    /// Listen address for the HTTP API. Default "0.0.0.0:9200".
     pub bind_addr: String,
+    /// TLS settings for the HTTP listener.
     pub tls: TlsConfig,
     /// Value for Access-Control-Allow-Origin. Defaults to "*"; set to a
     /// specific origin to restrict browser access (auth is header-based,
@@ -219,11 +245,15 @@ impl Default for HttpConfig {
     }
 }
 
+/// TLS material for the HTTP listener (FIPS rustls provider).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TlsConfig {
+    /// Serve HTTPS instead of plain HTTP. Default false.
     pub enabled: bool,
+    /// Path to the PEM certificate chain.
     pub cert_path: String,
+    /// Path to the PEM private key.
     pub key_path: String,
 }
 
@@ -237,6 +267,7 @@ impl Default for TlsConfig {
     }
 }
 
+/// Object storage settings shared by all backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
@@ -260,6 +291,7 @@ pub struct StorageConfig {
     /// When empty, the AWS credential chain is used (env, profile,
     /// task role, IMDS) — intended for real AWS with IAM roles.
     pub access_key_id: String,
+    /// Secret half of the static credentials; see access_key_id.
     pub secret_access_key: String,
     /// Replicated backend: copies kept per object across storage nodes.
     pub replication_factor: usize,
@@ -301,11 +333,13 @@ impl StorageConfig {
     }
 }
 
+/// Postgres metastore connection settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetastoreConfig {
     /// Postgres connection URL; empty means read DATABASE_URL.
     pub database_url: String,
+    /// Connection pool size. Default 10.
     pub max_connections: u32,
 }
 
@@ -318,6 +352,7 @@ impl Default for MetastoreConfig {
     }
 }
 
+/// Ingest pipeline batching, queueing, and WAL settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IngestConfig {
@@ -385,6 +420,8 @@ impl RsearchConfig {
         Ok(loaded)
     }
 
+    /// Configured node id, falling back to "rsearch-node" when neither
+    /// config nor hostname provided one.
     pub fn node_id(&self) -> String {
         self.node
             .id

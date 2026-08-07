@@ -67,10 +67,12 @@ pub struct DocumentConverter {
 }
 
 impl DocumentConverter {
+    /// Create a converter for the given schema.
     pub fn new(schema: MappedSchema) -> Self {
         Self { schema }
     }
 
+    /// The schema documents are converted against.
     pub fn schema(&self) -> &MappedSchema {
         &self.schema
     }

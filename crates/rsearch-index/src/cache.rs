@@ -27,6 +27,8 @@ struct CacheState {
 }
 
 impl SplitCache {
+    /// Open a cache rooted at `root` with a `max_bytes` budget, adopting
+    /// any entries already on disk from a previous run.
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
@@ -194,10 +196,12 @@ impl SplitCache {
         Ok(path)
     }
 
+    /// Current bytes held across all cached entries.
     pub fn total_bytes(&self) -> u64 {
         self.state.lock().unwrap().total_bytes
     }
 
+    /// The cache's on-disk root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }

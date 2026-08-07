@@ -19,6 +19,8 @@ pub struct S3Storage {
 }
 
 impl S3Storage {
+    /// Build a client from config: FIPS TLS, optional custom endpoint /
+    /// path-style / static credentials. Requires storage.bucket to be set.
     pub async fn from_config(cfg: &StorageConfig) -> StorageResult<Self> {
         if cfg.bucket.is_empty() {
             return Err(StorageError::Backend {

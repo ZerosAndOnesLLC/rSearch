@@ -19,13 +19,22 @@ use rsearch_storage::Storage;
 use crate::error::{IngestError, IngestResult};
 use crate::wal::{Wal, WalPos, WalReplay};
 
+/// Tuning knobs for the ingest pipeline.
 #[derive(Clone)]
 pub struct PipelineConfig {
+    /// Flush a batch into a split once it holds this many documents.
     pub max_batch_docs: usize,
+    /// Flush a non-empty batch after this many seconds regardless of
+    /// size (bounds time-to-searchable).
     pub max_batch_secs: u64,
+    /// Per-stream bounded queue depth in documents; a full queue
+    /// rejects with [`IngestError::Saturated`].
     pub queue_capacity: usize,
+    /// Local scratch directory splits are built in before upload.
     pub work_dir: PathBuf,
+    /// Indexer memory budget in bytes for each split build.
     pub memory_budget: usize,
+    /// This node's id, recorded as each split's creator.
     pub node_id: String,
 }
 
@@ -41,11 +50,17 @@ struct WorkItem {
 /// Ingest metrics counters (monotonic).
 #[derive(Default)]
 pub struct IngestMetrics {
+    /// Documents accepted onto worker queues.
     pub docs_enqueued: AtomicU64,
+    /// Source bytes accepted onto worker queues.
     pub bytes_enqueued: AtomicU64,
+    /// Documents indexed into built splits.
     pub docs_indexed: AtomicU64,
+    /// Splits published in the metastore.
     pub splits_published: AtomicU64,
+    /// Failed split flushes (build/upload/publish errors).
     pub flush_failures: AtomicU64,
+    /// Current documents queued across all streams (gauge).
     pub queue_depth: AtomicU64,
 }
 
@@ -67,6 +82,8 @@ struct PipelineInner {
     rules: std::sync::RwLock<Arc<Vec<rsearch_metastore::RoutingRuleRecord>>>,
 }
 
+/// Cloneable handle to the shared ingest pipeline: routes documents,
+/// appends them to the WAL, and feeds per-stream indexer workers.
 #[derive(Clone)]
 pub struct IngestPipeline {
     inner: Arc<PipelineInner>,
@@ -81,6 +98,8 @@ fn now_datetime() -> rsearch_index::DateTime {
 }
 
 impl IngestPipeline {
+    /// Build the pipeline and spawn the periodic routing-rule refresh
+    /// task. Workers are created lazily per stream on first enqueue.
     pub fn new(
         config: PipelineConfig,
         storage: Arc<dyn Storage>,
@@ -209,10 +228,12 @@ impl IngestPipeline {
         Ok((accepted, dropped))
     }
 
+    /// The pipeline's metrics counters.
     pub fn metrics(&self) -> &IngestMetrics {
         &self.inner.metrics
     }
 
+    /// The shared WAL handle.
     pub fn wal(&self) -> &Arc<Wal> {
         &self.inner.wal
     }

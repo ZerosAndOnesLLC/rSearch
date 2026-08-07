@@ -13,14 +13,18 @@ use std::sync::Mutex;
 /// Position of a record: the segment that holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalPos {
+    /// Sequence number of the segment file holding the record.
     pub segment: u64,
 }
 
 /// A replayed record.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
+    /// Target stream the document was accepted for.
     pub stream: String,
+    /// Raw document JSON bytes as originally appended.
     pub doc: Vec<u8>,
+    /// Position to confirm once the document is published.
     pub pos: WalPos,
 }
 

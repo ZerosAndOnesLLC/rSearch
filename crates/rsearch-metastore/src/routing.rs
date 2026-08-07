@@ -4,21 +4,31 @@
 use crate::error::{MetastoreError, MetastoreResult};
 use crate::metastore::Metastore;
 
+/// A routing rule: if `field` matches per `op`/`value`, the document is
+/// moved (or, with `copy`, also written) to `target_stream`.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct RoutingRuleRecord {
+    /// Primary key.
     pub id: i64,
+    /// Unique rule name (upsert key).
     pub name: String,
+    /// Top-level document field the condition inspects.
     pub field: String,
     /// eq | contains | exists
     pub op: String,
+    /// Comparison value; unused for `exists`.
     pub value: String,
+    /// Stream matching documents are routed to.
     pub target_stream: String,
+    /// true = copy (also keep the original destination);
+    /// false = move (replace it).
     pub copy: bool,
 }
 
 const RULE_COLUMNS: &str = "id, name, field, op, value, target_stream, copy";
 
 impl Metastore {
+    /// All routing rules, ordered by id (creation order).
     pub async fn list_routing_rules(&self) -> MetastoreResult<Vec<RoutingRuleRecord>> {
         let query = format!("SELECT {RULE_COLUMNS} FROM routing_rules ORDER BY id");
         Ok(sqlx::query_as::<_, RoutingRuleRecord>(sqlx::AssertSqlSafe(query))
@@ -26,6 +36,8 @@ impl Metastore {
             .await?)
     }
 
+    /// Create or update (by name) a routing rule. Rejects any `op`
+    /// other than eq, contains, or exists.
     pub async fn create_routing_rule(
         &self,
         name: &str,
@@ -59,6 +71,7 @@ impl Metastore {
             .await?)
     }
 
+    /// Delete a rule by name; false if no such rule existed.
     pub async fn delete_routing_rule(&self, name: &str) -> MetastoreResult<bool> {
         let result = sqlx::query("DELETE FROM routing_rules WHERE name = $1")
             .bind(name)

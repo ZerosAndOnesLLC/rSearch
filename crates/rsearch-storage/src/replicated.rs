@@ -28,6 +28,8 @@ enum PushSource {
     File(std::path::PathBuf),
 }
 
+/// Storage backend that replicates every object across peer nodes,
+/// backed by a local [`FsStorage`] root plus HTTP pushes/reads to peers.
 pub struct ReplicatedStorage {
     local: FsStorage,
     placement: Arc<dyn Placement>,
@@ -38,6 +40,9 @@ pub struct ReplicatedStorage {
 }
 
 impl ReplicatedStorage {
+    /// Build a replicated backend over a local root, a placement tracker,
+    /// and a peer HTTP client. `write_quorum` is clamped to
+    /// `replication_factor` (floor 1) at write time.
     pub fn new(
         local: FsStorage,
         placement: Arc<dyn Placement>,

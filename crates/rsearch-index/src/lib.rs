@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Index engine: ES-style mappings translated onto Tantivy schemas, and
 //! immutable split files built from batches of log documents.
 

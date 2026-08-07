@@ -3,51 +3,80 @@
 //! Grafana's Loki datasource and Logs Drilldown actually send —
 //! `count_over_time`, `rate`, optionally wrapped in `sum` / `sum by (…)`.
 
+/// Label matcher operator inside a stream selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchOp {
+    /// `=` — label equals the value.
     Eq,
+    /// `!=` — label differs from the value.
     Neq,
+    /// `=~` — label matches the regex.
     Re,
+    /// `!~` — label does not match the regex.
     NotRe,
 }
 
+/// One `label op "value"` matcher from a `{…}` stream selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelMatcher {
+    /// Label name on the left of the operator.
     pub label: String,
+    /// The comparison operator.
     pub op: MatchOp,
+    /// The (unquoted) right-hand value or regex.
     pub value: String,
 }
 
+/// Line filter operator applied to log line contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterOp {
+    /// `|=` — line contains the text.
     Contains,    // |=
+    /// `!=` — line does not contain the text.
     NotContains, // !=
+    /// `|~` — line matches the regex.
     Regex,       // |~
+    /// `!~` — line does not match the regex.
     NotRegex,    // !~
 }
 
+/// One line filter stage, e.g. `|= "error"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineFilter {
+    /// The filter operator.
     pub op: FilterOp,
+    /// The (unquoted) text or regex to match lines against.
     pub text: String,
 }
 
+/// A log stream selector: `{matchers} filters…` — the log-query form
+/// and the inner part of every metric query.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogSelector {
+    /// Label matchers from the `{…}` selector.
     pub matchers: Vec<LabelMatcher>,
+    /// Line filter stages, applied in order.
     pub filters: Vec<LineFilter>,
 }
 
+/// Range-aggregation function of a metric query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricOp {
+    /// `count_over_time(…)` — log lines per range interval.
     CountOverTime,
+    /// `rate(…)` — log lines per second over the range interval.
     Rate,
 }
 
+/// A metric query: `count_over_time`/`rate` over a selector and range,
+/// optionally wrapped in `sum` / `sum by (…)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricQuery {
+    /// The wrapped stream selector.
     pub selector: LogSelector,
+    /// The `[range]` window converted to milliseconds.
     pub range_millis: i64,
+    /// Which range function was applied.
     pub op: MetricOp,
     /// Labels from `sum by (…)`; empty for plain `sum(…)` or no sum.
     pub group_by: Vec<String>,
@@ -56,9 +85,12 @@ pub struct MetricQuery {
     pub summed: bool,
 }
 
+/// A parsed LogQL query: either a plain log query or a metric query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogQlQuery {
+    /// A log query: stream selector plus line filters.
     Log(LogSelector),
+    /// A metric query over a range aggregation.
     Metric(MetricQuery),
 }
 
@@ -77,6 +109,8 @@ struct Parser<'a> {
     pos: usize,
 }
 
+/// Parse a LogQL query string (the supported subset); the error is a
+/// human-readable reason suitable for an HTTP 400 body.
 pub fn parse(input: &str) -> Result<LogQlQuery, String> {
     let mut parser = Parser {
         input: input.as_bytes(),

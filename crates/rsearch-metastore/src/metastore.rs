@@ -9,6 +9,9 @@ use crate::types::{SplitRecord, SplitState, StreamRecord, StreamStats};
 const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
      size_bytes, time_start_millis, time_end_millis, footer_len, created_by";
 
+/// Postgres-backed metadata store shared by every node role: streams,
+/// splits, nodes, placement, auth, routing rules, and alerts. Cloning
+/// is cheap (shared pool).
 #[derive(Clone)]
 pub struct Metastore {
     pool: PgPool,
@@ -46,6 +49,7 @@ impl Metastore {
         })
     }
 
+    /// The underlying connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -65,6 +69,7 @@ impl Metastore {
         Ok(row)
     }
 
+    /// Look up a stream by name; `StreamNotFound` if missing.
     pub async fn get_stream(&self, name: &str) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
             "SELECT id, name, mapping, retention_hours FROM streams WHERE name = $1",
@@ -91,6 +96,7 @@ impl Metastore {
         .await?)
     }
 
+    /// Look up a stream by id; `StreamNotFound` if missing.
     pub async fn get_stream_by_id(&self, id: i64) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
             "SELECT id, name, mapping, retention_hours FROM streams WHERE id = $1",
@@ -101,6 +107,7 @@ impl Metastore {
         .ok_or_else(|| MetastoreError::StreamNotFound(format!("id={id}")))
     }
 
+    /// All streams, ordered by name.
     pub async fn list_streams(&self) -> MetastoreResult<Vec<StreamRecord>> {
         Ok(sqlx::query_as::<_, StreamRecord>(
             "SELECT id, name, mapping, retention_hours FROM streams ORDER BY name",
@@ -109,6 +116,8 @@ impl Metastore {
         .await?)
     }
 
+    /// Replace a stream's mapping JSON (PUT /{index}); existing splits
+    /// keep the schema they were built with.
     pub async fn update_stream_mapping(
         &self,
         name: &str,
@@ -127,6 +136,7 @@ impl Metastore {
         Ok(())
     }
 
+    /// Set (or clear, with None) a stream's retention window in hours.
     pub async fn set_stream_retention(
         &self,
         name: &str,
@@ -145,6 +155,7 @@ impl Metastore {
         Ok(())
     }
 
+    /// Delete a stream row by name (idempotent).
     pub async fn delete_stream(&self, name: &str) -> MetastoreResult<()> {
         sqlx::query("DELETE FROM streams WHERE name = $1")
             .bind(name)
@@ -251,6 +262,8 @@ impl Metastore {
             .await?)
     }
 
+    /// Up to `limit` splits in `state`, oldest update first (so the
+    /// janitor and publisher drain backlogs in order).
     pub async fn splits_in_state(
         &self,
         state: SplitState,
@@ -267,6 +280,7 @@ impl Metastore {
             .await?)
     }
 
+    /// Look up a split by its split id.
     pub async fn get_split(&self, split_id: &str) -> MetastoreResult<Option<SplitRecord>> {
         let query = format!("SELECT {SPLIT_COLUMNS} FROM splits WHERE split_id = $1");
         Ok(sqlx::query_as::<_, SplitRecord>(sqlx::AssertSqlSafe(query))

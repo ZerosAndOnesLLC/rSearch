@@ -4,13 +4,18 @@
 
 use serde_json::Value;
 
+/// Accepted bulk action kinds (both index the document; the immutable
+/// log store makes no update-vs-create distinction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkAction {
+    /// An `{"index": …}` action line.
     Index,
+    /// A `{"create": …}` action line.
     Create,
 }
 
 impl BulkAction {
+    /// The action name as it appears on the wire (for responses).
     pub fn as_str(&self) -> &'static str {
         match self {
             BulkAction::Index => "index",
@@ -22,9 +27,13 @@ impl BulkAction {
 /// One accepted document.
 #[derive(Debug)]
 pub struct BulkItem {
+    /// The action kind that carried the document.
     pub action: BulkAction,
+    /// Target stream: the action line's `_index`, or the URL default.
     pub stream: String,
+    /// Document id: the action line's `_id`, or a generated UUID.
     pub doc_id: String,
+    /// The parsed document body.
     pub doc: Value,
     /// The client's original document line, stored verbatim as `_source`
     /// and written to the WAL — avoids re-serializing the parsed value.
