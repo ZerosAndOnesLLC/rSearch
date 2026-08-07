@@ -39,6 +39,38 @@ pub fn router(state: AppState) -> Router {
             post(search_api::search).get(search_api::search),
         )
         .route("/_msearch", post(search_api::msearch))
+        // Loki-compatible query API subset (#11): lets Grafana's built-in
+        // Loki datasource and Logs Drilldown run against rSearch.
+        .route("/ready", get(crate::loki_api::ready))
+        .route(
+            "/loki/api/v1/query_range",
+            get(crate::loki_api::query_range).post(crate::loki_api::query_range),
+        )
+        .route(
+            "/loki/api/v1/query",
+            get(crate::loki_api::query_instant).post(crate::loki_api::query_instant),
+        )
+        .route(
+            "/loki/api/v1/labels",
+            get(crate::loki_api::labels).post(crate::loki_api::labels),
+        )
+        .route(
+            "/loki/api/v1/label/{name}/values",
+            get(crate::loki_api::label_values),
+        )
+        .route(
+            "/loki/api/v1/series",
+            get(crate::loki_api::series).post(crate::loki_api::series),
+        )
+        .route(
+            "/loki/api/v1/index/volume",
+            get(crate::loki_api::volume).post(crate::loki_api::volume),
+        )
+        .route(
+            "/loki/api/v1/index/volume_range",
+            get(crate::loki_api::volume_range).post(crate::loki_api::volume_range),
+        )
+        .route("/loki/api/v1/tail", get(crate::loki_api::tail))
         .route("/{index}/_mapping", get(search_api::get_mapping))
         .route("/{index}", axum::routing::put(search_api::put_index))
         .route("/_cat/indices", get(crate::admin_api::cat_indices))

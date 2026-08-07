@@ -5,6 +5,7 @@ mod auth_api;
 mod bulk_api;
 mod control;
 mod internal_api;
+mod loki_api;
 mod metrics;
 mod placement;
 mod routes;

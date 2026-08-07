@@ -33,6 +33,15 @@ pub struct AppState {
     /// `_msearch` refresh resolves `logs-*` once per TTL instead of one
     /// `list_streams` query per header/body pair per viewer.
     pub stream_names: Arc<std::sync::Mutex<Option<(Arc<Vec<String>>, std::time::Instant)>>>,
+    /// Stream → keyword-mapped field names (its Loki "labels"), cached
+    /// briefly: the Loki endpoints and every tail poll would otherwise
+    /// hit the metastore once per stream per request.
+    #[allow(clippy::type_complexity)]
+    pub label_fields: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+        >,
+    >,
 }
 
 impl AppState {
@@ -57,7 +66,47 @@ impl AppState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control: None,
             stream_names: Arc::new(std::sync::Mutex::new(None)),
+            label_fields: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// A stream's keyword-mapped field names, cached for a few seconds.
+    /// Missing streams resolve to an empty list (not an error).
+    pub async fn cached_label_fields(&self, stream: &str) -> Arc<Vec<String>> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(10);
+        if let Some((fields, at)) = self.label_fields.lock().unwrap().get(stream)
+            && at.elapsed() < TTL
+        {
+            return fields.clone();
+        }
+        let fields: Arc<Vec<String>> = Arc::new(match self.metastore.get_stream(stream).await {
+            Ok(record) => {
+                let mut fields: Vec<String> = record
+                    .mapping
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .map(|props| {
+                        props
+                            .iter()
+                            .filter(|(_, spec)| {
+                                spec.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("keyword")
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                fields.sort();
+                fields
+            }
+            Err(_) => Vec::new(),
+        });
+        let mut cache = self.label_fields.lock().unwrap();
+        if cache.len() > 10_000 {
+            cache.clear();
+        }
+        cache.insert(stream.to_string(), (fields.clone(), std::time::Instant::now()));
+        fields
     }
 
     /// All stream names, cached briefly (see `stream_names`).

@@ -203,6 +203,46 @@ percentiles, cardinality, …).
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
 
+### Loki-compatible API (Grafana Logs Drilldown)
+
+rSearch also speaks a subset of Loki's HTTP query API, so Grafana's
+built-in **Loki datasource** — and with it **Logs Drilldown** — works
+with no plugins: point a Loki datasource at the rSearch URL (Basic auth
+or an API key as a bearer credential) and browse.
+
+| Endpoint | Notes |
+|----------|-------|
+| `GET/POST /loki/api/v1/query_range` | log selectors → `streams`, metric queries → `matrix` |
+| `GET/POST /loki/api/v1/query` | instant queries |
+| `GET /loki/api/v1/labels`, `/label/{name}/values` | label discovery |
+| `GET/POST /loki/api/v1/series` | series matching |
+| `GET/POST /loki/api/v1/index/volume`, `/index/volume_range` | Drilldown's volume breakdowns |
+| `GET /loki/api/v1/tail` | WebSocket live tail (poll-backed) |
+| `GET /ready` | Loki readiness probe (open, like `/health`) |
+
+Model mapping: the `service_name` label is the stream name (every stream
+appears as a browsable service); other labels are the stream's
+keyword-mapped fields, with values served from terms aggregations
+(capped at 1000). A log line is the doc's `message` field, or the raw
+`_source` JSON when there is none.
+
+LogQL coverage is the subset Grafana sends: selectors with
+`=`, `!=`, `=~`, `!~`; line filters `|=`, `!=`, `|~`, `!~`;
+`count_over_time` and `rate` (correct sliding-window math for any
+step/range combination), optionally wrapped in `sum` / `sum by (label)`
+— one grouping label. Like `/_msearch`, the Loki surface requires
+search-level auth with global stream access, and selectors must contain
+at least one matcher that doesn't match the empty string.
+
+Line filters are true substring/regex tests against the rendered line —
+never a tokenized index match that could miss "error" when searching
+"err". The trade-off: a filtered query (or filtered metric) examines up
+to 5000 selector-matching docs per stream, newest first, and sets a
+response warning when that scan window saturates. Per-stream failures in
+multi-stream queries degrade to `warnings` with partial results instead
+of failing the whole query. Tails are capped at 16 concurrent sessions
+and 1 hour per session, with WebSocket pings reaping dead peers.
+
 `GET /metrics` serves Prometheus text format: ingest throughput and
 queue depth, WAL backlog (`rsearch_wal_outstanding_records` — watch this
 for restart-replay memory pressure), cluster node liveness/draining
