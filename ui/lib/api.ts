@@ -75,6 +75,7 @@ export async function search(
   query: string,
   fromMillis: number | null,
   size = 100,
+  signal?: AbortSignal,
 ): Promise<{ total: number; hits: Hit[] }> {
   const filters: unknown[] = [];
   if (fromMillis)
@@ -90,6 +91,7 @@ export async function search(
   }>(`/${encodeURIComponent(index)}/_search`, {
     method: "POST",
     body: JSON.stringify(body),
+    signal,
   });
   return { total: result.hits.total.value, hits: result.hits.hits };
 }

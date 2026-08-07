@@ -99,7 +99,12 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
         let mut saturated = false;
         let mut internal_error: Option<String> = None;
         for stream in routes.iter() {
-            let pos = position_iter.next().expect("position per routed copy");
+            // One WAL position exists per routed copy by construction; if
+            // a refactor ever breaks that, fail the item — not the process.
+            let Some(pos) = position_iter.next() else {
+                internal_error = Some("internal: missing WAL position for routed copy".into());
+                break;
+            };
             match pipeline.enqueue(stream, raw.clone(), pos).await {
                 Ok(()) => accepted += 1,
                 Err(IngestError::Saturated) => {

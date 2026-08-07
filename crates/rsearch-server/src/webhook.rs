@@ -114,15 +114,31 @@ impl WebhookClient {
             .uri(url)
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(payload.to_string())))?;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.client.request(request),
-        )
+        // The timeout covers the whole exchange including the body drain:
+        // a response that returns headers and then drips its body forever
+        // must not hang the control loop (every leader job runs on it).
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let response = self.client.request(request).await?;
+            let status = response.status().as_u16();
+            // Drain a bounded amount so the connection can be reused; a
+            // larger body is abandoned — dropping it closes the connection
+            // instead of buffering an arbitrary payload in memory.
+            const DRAIN_CAP: usize = 64 * 1024;
+            let mut body = response.into_body();
+            let mut drained = 0usize;
+            while let Some(frame) = body.frame().await {
+                let Ok(frame) = frame else { break };
+                if let Some(data) = frame.data_ref() {
+                    drained += data.len();
+                    if drained > DRAIN_CAP {
+                        break;
+                    }
+                }
+            }
+            Ok::<u16, anyhow::Error>(status)
+        })
         .await
         .map_err(|_| anyhow::anyhow!("webhook timed out"))??;
-        let status = response.status().as_u16();
-        // Drain the body so the connection can be reused.
-        let _ = response.into_body().collect().await;
         Ok(status)
     }
 }

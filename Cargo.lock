@@ -2312,6 +2312,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -3159,6 +3160,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eac258c2c6390673f2685813afeeafcb8c4e0ee7de8dd3fc46838dcc37263f98"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "temp-env"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]

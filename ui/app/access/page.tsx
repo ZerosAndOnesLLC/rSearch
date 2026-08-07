@@ -14,15 +14,22 @@ export default function AccessPage() {
   const [userForm, setUserForm] = useState({ name: "", password: "", role: "user" });
   const [keyForm, setKeyForm] = useState({ name: "", actions: "ingest", streams: "*" });
 
-  const load = () => {
-    rq<{ users: User[] }>("/_rsearch/users")
+  const load = (signal?: AbortSignal) => {
+    rq<{ users: User[] }>("/_rsearch/users", { signal })
       .then((r) => setUsers(r.users))
-      .catch((e) => setError(String((e as Error).message ?? e)));
-    rq<{ api_keys: ApiKey[] }>("/_rsearch/api_keys")
+      .catch((e) => {
+        if (signal?.aborted) return;
+        setError(String((e as Error).message ?? e));
+      });
+    rq<{ api_keys: ApiKey[] }>("/_rsearch/api_keys", { signal })
       .then((r) => setKeys(r.api_keys))
       .catch(() => {});
   };
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    load(controller.signal);
+    return () => controller.abort();
+  }, []);
 
   async function saveUser(e: React.FormEvent) {
     e.preventDefault();

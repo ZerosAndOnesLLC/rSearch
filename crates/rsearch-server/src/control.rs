@@ -70,7 +70,12 @@ impl ControlPlane {
         metrics: Arc<crate::metrics::ControlMetrics>,
     ) -> anyhow::Result<Self> {
         let data_dir = std::path::PathBuf::from(&config.node.data_dir);
-        let cache = Arc::new(SplitCache::new(data_dir.join("cache/control"), 1 << 30)?);
+        // Same operator-configured budget as the search cache — a
+        // hard-coded size silently ate disk on small control nodes.
+        let cache = Arc::new(SplitCache::new(
+            data_dir.join("cache/control"),
+            config.search.cache_max_mb << 20,
+        )?);
         let search =
             rsearch_search::SearchService::new(metastore.clone(), storage.clone(), cache.clone());
         let replication = if config.storage.backend == "replicated" {

@@ -18,6 +18,13 @@ use crate::syslog::parse_syslog;
 
 const BATCH_MAX: usize = 500;
 const BATCH_AGE_MS: u64 = 200;
+/// Cap on concurrent TCP connections per input. Each connection holds up
+/// to a 1MB framing buffer, and syslog is often unauthenticated — without
+/// a cap a connection flood exhausts fds and memory.
+const MAX_INPUT_CONNECTIONS: usize = 1024;
+/// Backoff after a failed accept (fd exhaustion, transient error) —
+/// without it the accept loop busy-spins a core while hiding the cause.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Start all enabled inputs. Returns an error only for configuration
 /// problems (bad TLS material, unbindable ports).
@@ -123,13 +130,25 @@ async fn spawn_syslog(
         info!(addr = %config.bind_tcp, tls = acceptor.is_some(), "syslog TCP input listening");
         let tx = batcher.clone();
         tokio::spawn(async move {
+            let conn_limit =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INPUT_CONNECTIONS));
             loop {
-                let Ok((socket, peer)) = listener.accept().await else {
+                let (socket, peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(error = %e, "syslog TCP accept failed; backing off");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    warn!(%peer, "syslog connection limit reached; closing connection");
                     continue;
                 };
                 let tx = tx.clone();
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let result = match acceptor {
                         Some(acceptor) => match acceptor.accept(socket).await {
                             Ok(tls) => read_lines(tls, &tx).await,
@@ -199,13 +218,24 @@ async fn spawn_gelf(config: &GelfInputConfig, pipeline: IngestPipeline) -> Resul
         .map_err(|e| format!("binding GELF TCP {}: {e}", config.bind_tcp))?;
     info!(addr = %config.bind_tcp, tls = acceptor.is_some(), "GELF TCP input listening");
     tokio::spawn(async move {
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INPUT_CONNECTIONS));
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let (socket, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(error = %e, "GELF TCP accept failed; backing off");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                warn!(%peer, "GELF connection limit reached; closing connection");
                 continue;
             };
             let tx = batcher.clone();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let result = match acceptor {
                     Some(acceptor) => match acceptor.accept(socket).await {
                         Ok(tls) => read_gelf(tls, &tx).await,

@@ -187,7 +187,15 @@ fn classify(method: &str, path: &str) -> Action {
     }
 }
 
-async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Option<Identity> {
+/// `Ok(Some)` — authenticated. `Ok(None)` — definitely no valid
+/// credentials (→ 401). `Err(())` — a metastore error prevented deciding
+/// (→ 503): shippers treat 401 as fatal and stop, so a DB blip must not
+/// masquerade as bad credentials.
+async fn authenticate(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<Identity>, ()> {
+    let mut backend_error = false;
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -199,7 +207,7 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
     for token in [bearer, api_key_header].into_iter().flatten() {
         let hash = crypto::token_digest(token);
         if let Some(identity) = state.auth.cache_get(&hash) {
-            return Some(identity);
+            return Ok(Some(identity));
         }
         if state.auth.negative_get(&hash) {
             continue;
@@ -209,7 +217,7 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
         if let Ok(Some(user)) = session {
             let identity = user_identity(user);
             state.auth.cache_put(hash, identity.clone());
-            return Some(identity);
+            return Ok(Some(identity));
         }
         let api_key = state.metastore.api_key_by_hash(&hash).await;
         let api_key_missed = matches!(api_key, Ok(None));
@@ -221,12 +229,14 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
                 streams: key.streams,
             };
             state.auth.cache_put(hash, identity.clone());
-            return Some(identity);
+            return Ok(Some(identity));
         }
         // Only a definite miss goes in the negative cache — a metastore
         // error must not make a valid token unusable for the TTL.
         if session_missed && api_key_missed {
             state.auth.negative_put(hash);
+        } else {
+            backend_error = true;
         }
     }
 
@@ -249,9 +259,15 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
         // timing defense below.
         let basic_hash = crypto::token_digest(&format!("basic\0{username}\0{password}"));
         if let Some(identity) = state.auth.cache_get(&basic_hash) {
-            return Some(identity);
+            return Ok(Some(identity));
         }
-        let user = state.metastore.get_user(username).await.ok().flatten();
+        let user = match state.metastore.get_user(username).await {
+            Ok(user) => user,
+            Err(_) => {
+                backend_error = true;
+                None
+            }
+        };
         let hash = user
             .as_ref()
             .map(|u| u.password_hash.clone())
@@ -263,10 +279,10 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
         if ok && let Some(user) = user {
             let identity = user_identity(user);
             state.auth.cache_put(basic_hash, identity.clone());
-            return Some(identity);
+            return Ok(Some(identity));
         }
     }
-    None
+    if backend_error { Err(()) } else { Ok(None) }
 }
 
 fn user_identity(user: rsearch_metastore::UserRecord) -> Identity {
@@ -301,8 +317,12 @@ pub async fn require(
     }
 
     let headers = request.headers().clone();
-    let Some(identity) = authenticate(&state, &headers).await else {
-        return unauthorized("authentication required");
+    let identity = match authenticate(&state, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return unauthorized("authentication required"),
+        // Backend down ≠ bad credentials: return a retryable 5xx so
+        // shippers back off instead of treating it as a fatal 401.
+        Err(()) => return service_unavailable("authentication backend unavailable"),
     };
 
     let allowed = match &action {
@@ -341,6 +361,17 @@ fn unauthorized(reason: &str) -> Response {
         Json(json!({
             "error": {"type": "security_exception", "reason": reason},
             "status": 401,
+        })),
+    )
+        .into_response()
+}
+
+fn service_unavailable(reason: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {"type": "service_unavailable_exception", "reason": reason},
+            "status": 503,
         })),
     )
         .into_response()

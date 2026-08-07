@@ -185,11 +185,16 @@ impl Wal {
                 inner.writer.write_all(doc)?;
                 inner.current_len += 8 + payload_len as u64;
                 let seq = inner.current_seq;
-                inner
-                    .segments
-                    .get_mut(&seq)
-                    .expect("current segment tracked")
-                    .outstanding += 1;
+                match inner.segments.get_mut(&seq) {
+                    Some(state) => state.outstanding += 1,
+                    // Invariant breach (current segment always tracked):
+                    // fail the append instead of panicking the request.
+                    None => {
+                        return Err(std::io::Error::other(
+                            "WAL invariant violated: current segment untracked",
+                        ));
+                    }
+                }
                 positions.push(WalPos { segment: seq });
             }
             // Push buffered bytes to the OS, then clone the fd so the fsync
