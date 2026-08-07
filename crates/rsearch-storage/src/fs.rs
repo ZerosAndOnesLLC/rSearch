@@ -15,9 +15,23 @@ pub struct FsStorage {
     root: PathBuf,
 }
 
+/// Process-unique counter for temp-file names: two concurrent writers of
+/// the same key must never share a temp path, or their writes interleave
+/// and the rename can publish a corrupt object.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl FsStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root: PathBuf = root.into();
+        // Failed writes delete their temp on the error path, but a crash
+        // can still strand one, and `list` deliberately hides temp names —
+        // sweep leftovers in the background so they don't hold disk
+        // forever. A file is a leftover only if no writer is running,
+        // which holds at construction time (one FsStorage per process,
+        // built before serving).
+        let sweep_root = root.clone();
+        std::thread::spawn(move || sweep_temp_files(&sweep_root));
+        Self { root }
     }
 
     /// Resolve a key to a path under root, rejecting traversal. Keys are
@@ -67,24 +81,70 @@ impl FsStorage {
     }
 
     /// Atomic write: write to a temp sibling then rename over the key.
+    /// The temp name is process-unique (concurrent writers of one key can
+    /// never interleave into a shared temp) and removed on any failure.
     async fn write_atomic(&self, key: &str, data: &[u8]) -> StorageResult<()> {
         let path = self.resolve(key)?;
         self.prepare_parent(&path, key).await?;
-        let tmp = path.with_extension(format!(
-            "tmp-{}",
-            std::process::id() as u64 ^ path.as_os_str().len() as u64
-        ));
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .map_err(|e| Self::io_err(key, e))?;
-        file.write_all(data).await.map_err(|e| Self::io_err(key, e))?;
-        file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| Self::io_err(key, e))?;
+        let tmp = self.unique_tmp(&path);
+        let result = async {
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| Self::io_err(key, e))?;
+            file.write_all(data).await.map_err(|e| Self::io_err(key, e))?;
+            file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
+            tokio::fs::rename(&tmp, &path)
+                .await
+                .map_err(|e| Self::io_err(key, e))
+        }
+        .await;
+        if let Err(e) = result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
         self.sync_parent(&path, key).await?;
         Ok(())
     }
+
+    fn unique_tmp(&self, path: &Path) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        path.with_extension(format!("tmp-{}-{seq}", std::process::id()))
+    }
+}
+
+/// Recursively delete leftover temp files (`*.tmp-*`) under `dir`. Failed
+/// writes remove their temp on the error path, but a crash strands them,
+/// and `list` deliberately hides temp names — without this sweep they
+/// hold disk forever. Only temps past a generous age are removed: the
+/// sweep runs on a background thread concurrently with live writers, and
+/// an in-flight write's temp is always fresh. Best-effort: errors ignored.
+fn sweep_temp_files(dir: &Path) {
+    const MIN_LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            sweep_temp_files(&path);
+        } else if entry.file_name().to_string_lossy().contains(".tmp-")
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age > MIN_LEFTOVER_AGE)
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+impl FsStorage {
 
     /// Atomic streamed write for peer transfers: chunks land in a temp
     /// sibling, fsync, rename, parent fsync — same durability discipline
@@ -196,30 +256,37 @@ impl Storage for FsStorage {
     async fn put_file(&self, key: &str, local: &Path) -> StorageResult<()> {
         let path = self.resolve(key)?;
         self.prepare_parent(&path, key).await?;
-        let tmp = path.with_extension("tmp-upload");
-        // Publish via hard link when the staging dir and the storage root
-        // share a filesystem (both usually live under data_dir) — a copy
-        // would rewrite every split byte a second time (2x publish write
-        // amplification). Cross-device or unsupported links fall back to
-        // the copy. The link target must not exist, so clear any leftover
-        // temp from a crashed earlier attempt first.
-        let _ = tokio::fs::remove_file(&tmp).await;
-        if tokio::fs::hard_link(local, &tmp).await.is_err() {
-            tokio::fs::copy(local, &tmp)
+        // Process-unique temp (see write_atomic) — a fresh name also means
+        // the hard link below never collides with a leftover.
+        let tmp = self.unique_tmp(&path);
+        let result = async {
+            // Publish via hard link when the staging dir and the storage
+            // root share a filesystem (both usually live under data_dir) —
+            // a copy would rewrite every split byte a second time (2x
+            // publish write amplification). Cross-device or unsupported
+            // links fall back to the copy.
+            if tokio::fs::hard_link(local, &tmp).await.is_err() {
+                tokio::fs::copy(local, &tmp)
+                    .await
+                    .map_err(|e| Self::io_err(key, e))?;
+            }
+            // Durability: fsync the data before it becomes visible, so the
+            // ingest WAL is only truncated after the split is truly on disk.
+            {
+                let file = tokio::fs::File::open(&tmp)
+                    .await
+                    .map_err(|e| Self::io_err(key, e))?;
+                file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
+            }
+            tokio::fs::rename(&tmp, &path)
                 .await
-                .map_err(|e| Self::io_err(key, e))?;
+                .map_err(|e| Self::io_err(key, e))
         }
-        // Durability: fsync the data before it becomes visible, so the
-        // ingest WAL is only truncated after the split is truly on disk.
-        {
-            let file = tokio::fs::File::open(&tmp)
-                .await
-                .map_err(|e| Self::io_err(key, e))?;
-            file.sync_all().await.map_err(|e| Self::io_err(key, e))?;
+        .await;
+        if let Err(e) = result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
         }
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| Self::io_err(key, e))?;
         self.sync_parent(&path, key).await?;
         Ok(())
     }

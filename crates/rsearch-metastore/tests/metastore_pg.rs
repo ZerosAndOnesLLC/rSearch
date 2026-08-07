@@ -67,7 +67,7 @@ async fn split_state_machine() {
 
     // Staged splits are invisible to queries.
     assert!(
-        ms.splits_for_query(stream.id, None, None)
+        ms.splits_for_query(stream.id, None, None, 10_000)
             .await
             .unwrap()
             .is_empty()
@@ -82,20 +82,20 @@ async fn split_state_machine() {
 
     // Time-range pruning: overlapping window finds it, disjoint misses it.
     let hits = ms
-        .splits_for_query(stream.id, Some(1_753_300_030_000), None)
+        .splits_for_query(stream.id, Some(1_753_300_030_000), None, 10_000)
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].split_id, split_id);
     assert_eq!(hits[0].state(), SplitState::Published);
     assert!(
-        ms.splits_for_query(stream.id, Some(1_753_300_060_001), None)
+        ms.splits_for_query(stream.id, Some(1_753_300_060_001), None, 10_000)
             .await
             .unwrap()
             .is_empty()
     );
     assert!(
-        ms.splits_for_query(stream.id, None, Some(1_753_299_999_999))
+        ms.splits_for_query(stream.id, None, Some(1_753_299_999_999), 10_000)
             .await
             .unwrap()
             .is_empty()
@@ -112,7 +112,7 @@ async fn split_state_machine() {
         0
     );
     assert!(
-        ms.splits_for_query(stream.id, None, None)
+        ms.splits_for_query(stream.id, None, None, 10_000)
             .await
             .unwrap()
             .is_empty()

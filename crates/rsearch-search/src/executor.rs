@@ -44,6 +44,11 @@ const STREAM_CACHE_TTL: Duration = Duration::from_secs(10);
 const DEFAULT_TRACK_TOTAL_HITS: usize = 10_000;
 /// Hard ceiling on from+size (ES max_result_window).
 const MAX_RESULT_WINDOW: usize = 10_000;
+/// Max splits one query may touch. A query over more than this (an
+/// unbounded time range on a long-retention stream) is rejected with a
+/// clear error instead of silently materializing every split row and
+/// scheduling a search on each.
+const MAX_QUERY_SPLITS: usize = 10_000;
 
 /// A parsed `_search` request body.
 pub struct SearchRequest {
@@ -272,8 +277,13 @@ impl SearchService {
         let (t_start, t_end) = extract_time_bounds(&request.query);
         let splits = self
             .metastore
-            .splits_for_query(stream.id, t_start, t_end)
+            .splits_for_query(stream.id, t_start, t_end, MAX_QUERY_SPLITS as i64 + 1)
             .await?;
+        if splits.len() > MAX_QUERY_SPLITS {
+            return Err(SearchError::BadRequest(format!(
+                "query spans more than {MAX_QUERY_SPLITS} splits; narrow the time range"
+            )));
+        }
 
         // Rewrite/parse aggregations once, share across splits via Arc.
         let aggs_json = request

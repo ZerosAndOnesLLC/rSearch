@@ -21,3 +21,6 @@ config.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 aws-lc-rs.workspace = true
+
+[dev-dependencies]
+temp-env = "0.3.6"

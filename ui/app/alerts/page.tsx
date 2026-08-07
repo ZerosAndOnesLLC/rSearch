@@ -32,12 +32,17 @@ export default function AlertsPage() {
   const [form, setForm] = useState({ ...EMPTY });
   const [error, setError] = useState("");
 
-  const load = () =>
-    rq<{ alerts: Alert[] }>("/_rsearch/alerts")
+  const load = (signal?: AbortSignal) =>
+    rq<{ alerts: Alert[] }>("/_rsearch/alerts", { signal })
       .then((r) => setAlerts(r.alerts))
-      .catch((e) => setError(String((e as Error).message ?? e)));
+      .catch((e) => {
+        if (signal?.aborted) return;
+        setError(String((e as Error).message ?? e));
+      });
   useEffect(() => {
-    load();
+    const controller = new AbortController();
+    load(controller.signal);
+    return () => controller.abort();
   }, []);
 
   async function save(e: React.FormEvent) {
