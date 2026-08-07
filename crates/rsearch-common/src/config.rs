@@ -478,17 +478,18 @@ mod tests {
     #[test]
     fn stray_rsearch_env_var_does_not_crash_load() {
         // A prefixed var that targets no known section must be ignored,
-        // not error via deny_unknown_fields (M14). SAFETY: single-threaded
-        // test process.
-        unsafe {
-            std::env::set_var("RSEARCH_TEST_DATABASE_URL", "postgres://x");
-            std::env::set_var("RSEARCH_HOME", "/tmp");
-        }
-        let cfg = RsearchConfig::load(None).expect("stray RSEARCH_ vars must not crash load");
-        assert_eq!(cfg.http.bind_addr, "0.0.0.0:9200");
-        unsafe {
-            std::env::remove_var("RSEARCH_TEST_DATABASE_URL");
-            std::env::remove_var("RSEARCH_HOME");
-        }
+        // not error via deny_unknown_fields (M14). temp-env serializes
+        // env-mutating tests and restores the vars afterwards.
+        temp_env::with_vars(
+            [
+                ("RSEARCH_TEST_DATABASE_URL", Some("postgres://x")),
+                ("RSEARCH_HOME", Some("/tmp")),
+            ],
+            || {
+                let cfg =
+                    RsearchConfig::load(None).expect("stray RSEARCH_ vars must not crash load");
+                assert_eq!(cfg.http.bind_addr, "0.0.0.0:9200");
+            },
+        );
     }
 }

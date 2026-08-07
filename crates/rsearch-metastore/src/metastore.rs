@@ -225,23 +225,28 @@ impl Metastore {
     }
 
     /// Published splits of a stream overlapping [start, end] millis
-    /// (inclusive); pass None for an unbounded side.
+    /// (inclusive); pass None for an unbounded side. Bounded by `limit` so
+    /// an unbounded-time query on a long-retention stream can't load every
+    /// split row (callers request cap+1 to detect truncation).
     pub async fn splits_for_query(
         &self,
         stream_id: i64,
         time_start_millis: Option<i64>,
         time_end_millis: Option<i64>,
+        limit: i64,
     ) -> MetastoreResult<Vec<SplitRecord>> {
         let query = format!(
             "SELECT {SPLIT_COLUMNS} FROM splits
              WHERE stream_id = $1 AND state = 'published'
                AND time_end_millis >= $2 AND time_start_millis <= $3
-             ORDER BY time_start_millis"
+             ORDER BY time_start_millis
+             LIMIT $4"
         );
         Ok(sqlx::query_as::<_, SplitRecord>(sqlx::AssertSqlSafe(query))
             .bind(stream_id)
             .bind(time_start_millis.unwrap_or(i64::MIN))
             .bind(time_end_millis.unwrap_or(i64::MAX))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await?)
     }

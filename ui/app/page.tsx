@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, Hit, StreamInfo, rq, search } from "@/lib/api";
 import { useRouter } from "next/navigation";
 
@@ -39,37 +39,60 @@ export default function SearchPage() {
   const [error, setError] = useState("");
   const [open, setOpen] = useState<string | null>(null);
 
+  // Latest query text for auto-runs, tracked outside runSearch's identity
+  // so typing doesn't re-create the callback (and fire the auto-run
+  // effect) per keystroke.
+  const queryRef = useRef(query);
   useEffect(() => {
-    rq<StreamInfo[]>("/_cat/indices")
+    queryRef.current = query;
+  }, [query]);
+  // In-flight search; superseded/unmounted requests are aborted so a slow
+  // older response can never overwrite a newer result.
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    rq<StreamInfo[]>("/_cat/indices", { signal: controller.signal })
       .then((list) => {
         setStreams(list);
-        if (list.length && !stream) setStream(list[0].index);
+        if (list.length) setStream((current) => current || list[0].index);
       })
       .catch((e: unknown) => {
+        if (controller.signal.aborted) return;
         if (e instanceof ApiError && e.status === 401) router.push("/login");
         else setError(String((e as Error).message ?? e));
       });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    return () => controller.abort();
+  }, [router]);
 
-  const run = useCallback(() => {
-    if (!stream) return;
-    const from = range.millis ? Date.now() - range.millis : null;
-    search(stream, query, from)
-      .then((result) => {
-        setHits(result.hits);
-        setTotal(result.total);
-        setError("");
-      })
-      .catch((e: unknown) => {
-        if (e instanceof ApiError && e.status === 401) router.push("/login");
-        else setError(String((e as Error).message ?? e));
-      });
-  }, [stream, query, range, router]);
+  const runSearch = useCallback(
+    (q: string) => {
+      if (!stream) return;
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const from = range.millis ? Date.now() - range.millis : null;
+      search(stream, q, from, 100, controller.signal)
+        .then((result) => {
+          setHits(result.hits);
+          setTotal(result.total);
+          setError("");
+        })
+        .catch((e: unknown) => {
+          if (controller.signal.aborted) return;
+          if (e instanceof ApiError && e.status === 401) router.push("/login");
+          else setError(String((e as Error).message ?? e));
+        });
+    },
+    [stream, range, router],
+  );
 
+  // Auto-run only when the stream or window changes — typing in the query
+  // box searches on Enter or the button, not per keystroke.
   useEffect(() => {
-    run();
-  }, [stream, range, run]);
+    runSearch(queryRef.current);
+    return () => abortRef.current?.abort();
+  }, [runSearch]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -97,7 +120,7 @@ export default function SearchPage() {
             placeholder='status:500 AND "timeout"  (blank matches everything)'
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && run()}
+            onKeyDown={(e) => e.key === "Enter" && runSearch(query)}
           />
         </div>
         <div className="w-32">
@@ -115,7 +138,7 @@ export default function SearchPage() {
             ))}
           </select>
         </div>
-        <button className="btn" onClick={run}>
+        <button className="btn" onClick={() => runSearch(query)}>
           Search
         </button>
       </div>

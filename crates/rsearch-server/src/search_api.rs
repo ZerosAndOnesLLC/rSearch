@@ -68,7 +68,7 @@ pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
     // dashboard load time the sum of panels instead of the max (M13).
     let mut pairs: Vec<(Value, Value)> = Vec::new();
     let mut i = 0;
-    while i + 1 <= lines.len().saturating_sub(1) {
+    while i + 1 < lines.len() {
         let header: Value = match serde_json::from_str(lines[i]) {
             Ok(v) => v,
             Err(e) => {
@@ -91,6 +91,13 @@ pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
         };
         pairs.push((header, search_body));
         i += 2;
+    }
+    if i < lines.len() {
+        return es_error(
+            StatusCode::BAD_REQUEST,
+            "parse_exception",
+            "msearch body ends with a header line that has no body line",
+        );
     }
 
     let futures = pairs.into_iter().map(|(header, search_body)| {
@@ -128,7 +135,19 @@ pub async fn msearch(State(state): State<AppState>, body: String) -> Response {
             }
         }
     });
-    let responses = futures::future::join_all(futures).await;
+    // Bounded intra-request concurrency (ES: max_concurrent_searches).
+    // join_all ran every pair at once — thousands of tiny pairs fit in
+    // the body limit, and each search fans out into up to 16 blocking
+    // split searches, so an unbounded request could saturate the blocking
+    // pool it shares with bulk WAL appends.
+    use futures::StreamExt;
+    let max_concurrent = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let responses: Vec<Value> = futures::stream::iter(futures)
+        .buffered(max_concurrent)
+        .collect()
+        .await;
     Json(json!({"took": 0, "responses": responses})).into_response()
 }
 

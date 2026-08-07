@@ -8,12 +8,17 @@ export default function StreamsPage() {
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
 
-  const load = () =>
-    rq<StreamInfo[]>("/_cat/indices")
+  const load = (signal?: AbortSignal) =>
+    rq<StreamInfo[]>("/_cat/indices", { signal })
       .then(setStreams)
-      .catch((e) => setError(String((e as Error).message ?? e)));
+      .catch((e) => {
+        if (signal?.aborted) return;
+        setError(String((e as Error).message ?? e));
+      });
   useEffect(() => {
-    load();
+    const controller = new AbortController();
+    load(controller.signal);
+    return () => controller.abort();
   }, []);
 
   // Retention saves as soon as the value changes.

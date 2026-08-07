@@ -227,17 +227,33 @@ impl IngestPipeline {
         let size = source.len() as u64;
         match tx.try_send(WorkItem { source, pos }) {
             Ok(()) => {
-                self.inner.metrics.docs_enqueued.fetch_add(1, Ordering::Relaxed);
-                self.inner
-                    .metrics
-                    .bytes_enqueued
-                    .fetch_add(size, Ordering::Relaxed);
-                self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+                self.note_enqueued(size);
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => Err(IngestError::Saturated),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(IngestError::Saturated),
+            Err(mpsc::error::TrySendError::Closed(item)) => {
+                // The worker idled out between the lookup and the send; its
+                // map entry is already removed, so one retry resolves a
+                // fresh worker.
+                let tx = self.worker_for(stream).await?;
+                match tx.try_send(item) {
+                    Ok(()) => {
+                        self.note_enqueued(size);
+                        Ok(())
+                    }
+                    Err(_) => Err(IngestError::Saturated),
+                }
+            }
         }
+    }
+
+    fn note_enqueued(&self, size: u64) {
+        self.inner.metrics.docs_enqueued.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .bytes_enqueued
+            .fetch_add(size, Ordering::Relaxed);
+        self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Feed WAL records recovered at startup back through the pipeline.
@@ -273,7 +289,12 @@ impl IngestPipeline {
                 .await
                 .is_err()
             {
-                warn!(stream = %record.stream, "worker gone during replay");
+                // The item was dropped, so undo the gauge and confirm the
+                // position — otherwise the depth drifts and the segment
+                // stays pinned forever.
+                self.inner.metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                self.inner.wal.confirm(&[record.pos]);
+                warn!(stream = %record.stream, "worker gone during replay; record dropped");
             }
         }
         if count > 0 {
@@ -313,6 +334,12 @@ impl IngestPipeline {
     }
 }
 
+/// How long a stream worker sits idle (empty buffer, no incoming docs)
+/// before retiring itself. Stream names are client-controlled (bulk
+/// `_index` values), so without an exit path every name ever seen pins a
+/// task + bounded queue + schema for the life of the process.
+const WORKER_IDLE_EXIT_SECS: u64 = 600;
+
 async fn stream_worker(
     inner: Arc<PipelineInner>,
     stream: String,
@@ -322,9 +349,9 @@ async fn stream_worker(
 ) {
     let max_docs = inner.config.max_batch_docs.max(1);
     let max_age = Duration::from_secs(inner.config.max_batch_secs.max(1));
+    let idle_exit = Duration::from_secs(WORKER_IDLE_EXIT_SECS);
     let mut buffer: Vec<WorkItem> = Vec::new();
-    let far_future = Duration::from_secs(3600 * 24 * 365);
-    let mut deadline = tokio::time::Instant::now() + far_future;
+    let mut deadline = tokio::time::Instant::now() + idle_exit;
     // Re-resolved before each flush so a mapping change (PUT /{index})
     // takes effect on the next split, not only after a restart (L7).
     let mut schema = schema;
@@ -348,7 +375,27 @@ async fn stream_worker(
                     return;
                 }
             },
-            _ = tokio::time::sleep_until(deadline) => !buffer.is_empty(),
+            _ = tokio::time::sleep_until(deadline) => {
+                if buffer.is_empty() {
+                    // Idle: retire this worker so per-stream state doesn't
+                    // accumulate forever for streams that stopped writing.
+                    // Order matters — unpublish, close, drain — so no
+                    // in-flight send can slip a doc into a dropped queue:
+                    // after close() a racing try_send fails and the sender
+                    // re-creates a fresh worker via worker_for.
+                    inner.workers.write().unwrap().remove(&stream);
+                    rx.close();
+                    while let Ok(item) = rx.try_recv() {
+                        buffer.push(item);
+                    }
+                    if !buffer.is_empty() {
+                        flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+                    }
+                    info!(stream, "idle stream worker retired");
+                    return;
+                }
+                true
+            },
         };
         if flush_now {
             // Pick up mapping changes before building the split.
@@ -360,7 +407,7 @@ async fn stream_worker(
                 mapping_json = record.mapping;
             }
             flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
-            deadline = tokio::time::Instant::now() + far_future;
+            deadline = tokio::time::Instant::now() + idle_exit;
         }
     }
 }
@@ -379,10 +426,14 @@ async fn flush(
 
     // Retry the flush with capped backoff on transient errors (S3/DB
     // blips). Data is already WAL-durable, so an in-process retry recovers
-    // without a restart; the WAL still backstops a hard crash.
+    // without a restart; the WAL still backstops a hard crash. Retries
+    // never give up: abandoning the batch would strand its docs (invisible
+    // to search) and pin its WAL segments until an operator restarts the
+    // process. Backpressure is the bounded queue behind this worker.
     let mut backoff = Duration::from_millis(200);
-    let max_attempts = 8;
-    for attempt in 1..=max_attempts {
+    let mut attempt = 0u64;
+    loop {
+        attempt += 1;
         match flush_inner(inner, stream, stream_id, schema, batch).await {
             Ok(split_id) => {
                 inner.wal.confirm(&positions);
@@ -394,14 +445,16 @@ async fn flush(
             Err((e, returned)) => {
                 batch = returned;
                 inner.metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
-                if attempt == max_attempts {
+                // Escalate periodically so a long outage is loud without
+                // logging every attempt at error level.
+                if attempt % 8 == 0 {
                     error!(
-                        stream, docs = count, error = %e,
-                        "flush failed after retries; docs retained in WAL for replay on restart"
+                        stream, docs = count, attempt, error = %e,
+                        "flush still failing; docs held in WAL and retried until the backend recovers"
                     );
-                    return;
+                } else {
+                    warn!(stream, attempt, error = %e, "flush failed; retrying");
                 }
-                warn!(stream, attempt, error = %e, "flush failed; retrying");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
