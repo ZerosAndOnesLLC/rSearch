@@ -10,9 +10,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rsearch_common::config::{ControlConfig, RsearchConfig};
 use rsearch_index::{IndexMapping, MappedSchema, SplitBuilder, SplitCache, SplitReader};
-use rsearch_metastore::{Metastore, SplitRecord};
+use rsearch_metastore::{Metastore, NodeRecord, SplitRecord, UnderReplicatedKey};
 use rsearch_storage::Storage;
 use tracing::{error, info, warn};
+
+/// Peer transfers per repair/drain pass that run concurrently. Each key's
+/// metastore lookups and replicate calls are independent; running them
+/// serially made drain throughput a function of per-key latency.
+const REPAIR_DRAIN_CONCURRENCY: usize = 8;
+/// Ceiling on drain batches processed per node per tick — bounds how long
+/// one tick can run while still draining far faster than one batch/tick.
+const DRAIN_BATCHES_PER_TICK: usize = 10;
+/// How often the full under-replication scan must run even with no
+/// membership change — catches writes that never reached the factor.
+const REPAIR_FULL_SCAN_SECS: u64 = 300;
 
 pub struct ControlPlane {
     metastore: Metastore,
@@ -30,6 +41,19 @@ pub struct ControlPlane {
     replication: Option<ReplicationCtl>,
     /// Shared with the /metrics handler.
     metrics: Arc<crate::metrics::ControlMetrics>,
+    /// Gates the O(object_locations) under-replication aggregation so
+    /// healthy steady-state ticks don't pay a full-table scan every 15s.
+    repair_scan: std::sync::Mutex<RepairScanState>,
+}
+
+#[derive(Default)]
+struct RepairScanState {
+    /// Live-node set at the last scan; a change (death/join) triggers one.
+    last_live: std::collections::BTreeSet<String>,
+    last_scan: Option<std::time::Instant>,
+    /// The previous scan found under-replicated keys — keep scanning every
+    /// tick until a scan comes back clean.
+    last_found_work: bool,
 }
 
 struct ReplicationCtl {
@@ -73,6 +97,7 @@ impl ControlPlane {
             webhook: crate::webhook::WebhookClient::new(config.control.allow_insecure_webhooks)?,
             replication,
             metrics,
+            repair_scan: std::sync::Mutex::new(RepairScanState::default()),
         })
     }
 
@@ -142,9 +167,34 @@ impl ControlPlane {
     /// copy is a leader-instructed pull on the target so the transfer
     /// streams peer-to-peer, never through the leader.
     async fn repair_job(&self) -> anyhow::Result<()> {
+        use futures::stream::{self, StreamExt};
         let Some(ctl) = &self.replication else {
             return Ok(());
         };
+        // The under-replication query aggregates the whole placement
+        // table, so a healthy cluster shouldn't pay it every tick: scan
+        // when the live-node set changed (a node died or joined), while
+        // the previous scan still found work, and on a periodic deadline
+        // (catches writes that never reached the factor with no
+        // membership change at all).
+        let nodes = self.metastore.list_nodes().await?;
+        let live: std::collections::BTreeSet<String> = nodes
+            .into_iter()
+            .filter(|n| n.heartbeat_age_secs < ctl.repair_stale_secs)
+            .map(|n| n.id)
+            .collect();
+        {
+            let mut scan = self.repair_scan.lock().unwrap();
+            let deadline_due = scan
+                .last_scan
+                .map(|at| at.elapsed().as_secs() >= REPAIR_FULL_SCAN_SECS)
+                .unwrap_or(true);
+            if live == scan.last_live && !scan.last_found_work && !deadline_due {
+                return Ok(());
+            }
+            scan.last_live = live;
+            scan.last_scan = Some(std::time::Instant::now());
+        }
         // repair_stale_secs doubles as the fresh-write grace: a key whose
         // newest row is younger may still be mid-push (quorum acks detach
         // the remaining replica pushes).
@@ -160,86 +210,108 @@ impl ControlPlane {
         self.metrics
             .repair_pending_keys
             .store(under.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        for entry in under {
-            let key = &entry.storage_key;
-            // Holders must be reachable *now* to serve as copy sources.
-            let holders = self.metastore.live_holders_of(key, 30.0).await?;
-            let Some(source) = holders.iter().find_map(|h| h.address.as_deref()) else {
-                warn!(key, "repair: no live holder — object currently unavailable");
-                continue;
-            };
-            let missing = (ctl.replication_factor as usize).saturating_sub(holders.len());
-            if missing == 0 {
-                continue;
-            }
-            let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
-            let mut targets = self
-                .metastore
-                .replication_targets(30.0, &exclude, missing as i64, false)
-                .await?;
-            if targets.len() < missing {
-                // Last resort: a draining node beats losing the last copy.
-                // The drain job moves the copy off again once a real
-                // target exists (#4).
-                let mut exclude_more = exclude.clone();
-                exclude_more.extend(targets.iter().map(|t| t.id.clone()));
-                let fallback = self
-                    .metastore
-                    .replication_targets(
-                        30.0,
-                        &exclude_more,
-                        (missing - targets.len()) as i64,
-                        true,
-                    )
-                    .await?;
-                for target in fallback {
-                    warn!(
-                        key,
-                        target = %target.id,
-                        "repair: using draining node as last-resort copy target"
-                    );
-                    targets.push(target);
+        self.repair_scan.lock().unwrap().last_found_work = !under.is_empty();
+        // Keys repair independently; bounded concurrency overlaps their
+        // metastore lookups and peer transfers instead of running the
+        // whole batch serially.
+        let futs: Vec<_> = under
+            .iter()
+            .map(|entry| async move {
+                if let Err(e) = self.repair_one(ctl, entry).await {
+                    warn!(key = %entry.storage_key, error = %e, "repair: key failed");
                 }
-            }
-            if targets.is_empty() {
-                // Even draining nodes were considered above, so this means
-                // every live node already holds a copy — the cluster is
-                // simply short of nodes for the factor.
+            })
+            .collect();
+        stream::iter(futs)
+            .buffer_unordered(REPAIR_DRAIN_CONCURRENCY)
+            .collect::<Vec<()>>()
+            .await;
+        Ok(())
+    }
+
+    async fn repair_one(
+        &self,
+        ctl: &ReplicationCtl,
+        entry: &UnderReplicatedKey,
+    ) -> anyhow::Result<()> {
+        let key = &entry.storage_key;
+        // Holders must be reachable *now* to serve as copy sources.
+        let holders = self.metastore.live_holders_of(key, 30.0).await?;
+        let Some(source) = holders.iter().find_map(|h| h.address.as_deref()) else {
+            warn!(key, "repair: no live holder — object currently unavailable");
+            return Ok(());
+        };
+        let missing = (ctl.replication_factor as usize).saturating_sub(holders.len());
+        if missing == 0 {
+            return Ok(());
+        }
+        let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
+        let mut targets = self
+            .metastore
+            .replication_targets(30.0, &exclude, missing as i64, false)
+            .await?;
+        if targets.len() < missing {
+            // Last resort: a draining node beats losing the last copy.
+            // The drain job moves the copy off again once a real
+            // target exists (#4).
+            let mut exclude_more = exclude.clone();
+            exclude_more.extend(targets.iter().map(|t| t.id.clone()));
+            let fallback = self
+                .metastore
+                .replication_targets(
+                    30.0,
+                    &exclude_more,
+                    (missing - targets.len()) as i64,
+                    true,
+                )
+                .await?;
+            for target in fallback {
                 warn!(
                     key,
-                    live_holders = holders.len(),
-                    missing,
-                    "repair: no eligible target nodes — every live node \
-                     already holds a copy"
+                    target = %target.id,
+                    "repair: using draining node as last-resort copy target"
                 );
-                continue;
+                targets.push(target);
             }
-            for target in targets {
-                let Some(target_addr) = target.address.as_deref() else { continue };
-                match tokio::time::timeout(
-                    Duration::from_secs(600),
-                    ctl.client.replicate(target_addr, key, source),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {
-                        self.metrics
-                            .repair_copies_restored
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        info!(key, target = %target.id, "repair: copy restored");
-                    }
-                    Ok(Err(e)) => {
-                        self.metrics
-                            .repair_failures
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!(key, target = %target.id, error = %e, "repair: replicate failed");
-                    }
-                    Err(_) => {
-                        self.metrics
-                            .repair_failures
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!(key, target = %target.id, "repair: replicate timed out");
-                    }
+        }
+        if targets.is_empty() {
+            // Even draining nodes were considered above, so this means
+            // every live node already holds a copy — the cluster is
+            // simply short of nodes for the factor.
+            warn!(
+                key,
+                live_holders = holders.len(),
+                missing,
+                "repair: no eligible target nodes — every live node \
+                 already holds a copy"
+            );
+            return Ok(());
+        }
+        for target in targets {
+            let Some(target_addr) = target.address.as_deref() else { continue };
+            match tokio::time::timeout(
+                Duration::from_secs(600),
+                ctl.client.replicate(target_addr, key, source),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    self.metrics
+                        .repair_copies_restored
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!(key, target = %target.id, "repair: copy restored");
+                }
+                Ok(Err(e)) => {
+                    self.metrics
+                        .repair_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(key, target = %target.id, error = %e, "repair: replicate failed");
+                }
+                Err(_) => {
+                    self.metrics
+                        .repair_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(key, target = %target.id, "repair: replicate timed out");
                 }
             }
         }
@@ -322,6 +394,7 @@ impl ControlPlane {
     /// no rows left it can be shut down. The node keeps serving reads the
     /// whole time, so there is no availability dip.
     async fn drain_job(&self) -> anyhow::Result<()> {
+        use futures::stream::{self, StreamExt};
         let nodes = self.metastore.list_nodes().await?;
         // A draining flag outliving the warn window is likely a forgotten
         // DELETE: the node looks healthy but silently takes no writes and
@@ -344,80 +417,117 @@ impl ControlPlane {
         };
         let factor = ctl.replication_factor as usize;
         for node in nodes.iter().filter(|n| n.draining) {
-            let keys = self.metastore.locations_on_node(&node.id, 50).await?;
-            if keys.is_empty() {
-                info!(node = %node.id, "drain complete: node holds no objects and can be shut down");
-                continue;
-            }
-            for key in &keys {
-                let holders = self.metastore.live_holders_of(key, 30.0).await?;
-                let Some(source) = holders.iter().find_map(|h| h.address.as_deref()) else {
-                    warn!(key, "drain: no live holder to copy from; skipping");
-                    continue;
-                };
-                // Copies already safe on nodes that are staying.
-                let mut safe = holders.iter().filter(|h| !h.draining).count();
-                if safe < factor {
-                    let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
-                    let targets = self
-                        .metastore
-                        .replication_targets(30.0, &exclude, (factor - safe) as i64, false)
-                        .await?;
-                    for target in targets {
-                        let Some(addr) = target.address.as_deref() else { continue };
-                        match tokio::time::timeout(
-                            Duration::from_secs(600),
-                            ctl.client.replicate(addr, key, source),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                safe += 1;
-                                self.metrics
-                                    .drain_copies_moved
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                info!(key, target = %target.id, "drain: copy moved");
-                            }
-                            Ok(Err(e)) => {
-                                self.metrics
-                                    .drain_failures
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                warn!(key, target = %target.id, error = %e, "drain: replicate failed");
-                            }
-                            Err(_) => {
-                                self.metrics
-                                    .drain_failures
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                warn!(key, target = %target.id, "drain: replicate timed out");
+            // Multiple batches per tick with concurrent per-key transfers;
+            // one serial 50-key batch per 15s tick made draining a large
+            // node take days. A batch with any stuck key stops until the
+            // next tick rather than re-fetching the same keys in a loop.
+            for _ in 0..DRAIN_BATCHES_PER_TICK {
+                let keys = self.metastore.locations_on_node(&node.id, 50).await?;
+                if keys.is_empty() {
+                    info!(node = %node.id, "drain complete: node holds no objects and can be shut down");
+                    break;
+                }
+                let futs: Vec<_> = keys
+                    .iter()
+                    .map(|key| async move {
+                        match self.drain_one(ctl, node, factor, key).await {
+                            Ok(moved) => moved,
+                            Err(e) => {
+                                warn!(key = %key, error = %e, "drain: key failed");
+                                false
                             }
                         }
-                    }
-                }
-                if safe >= factor {
-                    // Prefer a peer DELETE: the draining node drops the
-                    // file AND its own row, so the disk space returns and
-                    // an undrained node can't later serve cluster-deleted
-                    // objects from leftovers. Fall back to just the row if
-                    // the node is unreachable.
-                    let deleted = match node.address.as_deref() {
-                        Some(addr) => ctl.client.delete(addr, key).await.is_ok(),
-                        None => false,
-                    };
-                    if !deleted {
-                        self.metastore.remove_object_location(key, &node.id).await?;
-                    }
-                } else {
-                    warn!(
-                        key,
-                        node = %node.id,
-                        safe,
-                        factor,
-                        "drain: not enough non-draining nodes to hold the factor"
-                    );
+                    })
+                    .collect();
+                let results: Vec<bool> = stream::iter(futs)
+                    .buffer_unordered(REPAIR_DRAIN_CONCURRENCY)
+                    .collect()
+                    .await;
+                if results.iter().any(|moved| !moved) {
+                    break;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Drain a single key off `node`: ensure `factor` copies exist on
+    /// non-draining nodes, then drop the draining node's copy. Returns
+    /// whether the node's placement row for the key is gone.
+    async fn drain_one(
+        &self,
+        ctl: &ReplicationCtl,
+        node: &NodeRecord,
+        factor: usize,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let holders = self.metastore.live_holders_of(key, 30.0).await?;
+        let Some(source) = holders.iter().find_map(|h| h.address.as_deref()) else {
+            warn!(key, "drain: no live holder to copy from; skipping");
+            return Ok(false);
+        };
+        // Copies already safe on nodes that are staying.
+        let mut safe = holders.iter().filter(|h| !h.draining).count();
+        if safe < factor {
+            let exclude: Vec<String> = holders.iter().map(|h| h.id.clone()).collect();
+            let targets = self
+                .metastore
+                .replication_targets(30.0, &exclude, (factor - safe) as i64, false)
+                .await?;
+            for target in targets {
+                let Some(addr) = target.address.as_deref() else { continue };
+                match tokio::time::timeout(
+                    Duration::from_secs(600),
+                    ctl.client.replicate(addr, key, source),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        safe += 1;
+                        self.metrics
+                            .drain_copies_moved
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        info!(key, target = %target.id, "drain: copy moved");
+                    }
+                    Ok(Err(e)) => {
+                        self.metrics
+                            .drain_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!(key, target = %target.id, error = %e, "drain: replicate failed");
+                    }
+                    Err(_) => {
+                        self.metrics
+                            .drain_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!(key, target = %target.id, "drain: replicate timed out");
+                    }
+                }
+            }
+        }
+        if safe >= factor {
+            // Prefer a peer DELETE: the draining node drops the
+            // file AND its own row, so the disk space returns and
+            // an undrained node can't later serve cluster-deleted
+            // objects from leftovers. Fall back to just the row if
+            // the node is unreachable.
+            let deleted = match node.address.as_deref() {
+                Some(addr) => ctl.client.delete(addr, key).await.is_ok(),
+                None => false,
+            };
+            if !deleted {
+                self.metastore.remove_object_location(key, &node.id).await?;
+            }
+            Ok(true)
+        } else {
+            warn!(
+                key,
+                node = %node.id,
+                safe,
+                factor,
+                "drain: not enough non-draining nodes to hold the factor"
+            );
+            Ok(false)
+        }
     }
 
     /// Combine the first group of >= 2 small published splits in one
@@ -452,32 +562,36 @@ impl ControlPlane {
             "merging small splits"
         );
 
-        // Export docs from every source split (blocking reads).
-        let mut all_docs: Vec<(serde_json::Value, i64)> = Vec::new();
+        // Stream every source split's docs straight into the new builder,
+        // one split at a time on blocking threads. Peak memory is one doc
+        // plus the Tantivy writer budget — the merge group's parsed corpus
+        // (GBs at default config) is never materialized.
+        let stream_name = stream.name.clone();
+        let work_dir = self.work_dir.clone();
+        let budget = self.memory_budget;
+        let mut builder = tokio::task::spawn_blocking(move || {
+            SplitBuilder::new(stream_name, schema, &work_dir, budget)
+        })
+        .await??;
         for split in &group {
             let reader = Arc::new(
                 SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
                     .await?,
             );
-            let docs =
-                tokio::task::spawn_blocking(move || reader.export_docs()).await??;
-            all_docs.extend(docs);
+            builder = tokio::task::spawn_blocking(move || {
+                reader.for_each_doc(|doc, ts_millis| {
+                    // Docs lacking their own timestamp keep the original
+                    // one via the fallback.
+                    builder.add_json(
+                        doc,
+                        rsearch_index::DateTime::from_timestamp_millis(ts_millis),
+                    )
+                })?;
+                Ok::<_, rsearch_index::IndexError>(builder)
+            })
+            .await??;
         }
-
-        // Re-index into one split.
-        let stream_name = stream.name.clone();
-        let work_dir = self.work_dir.clone();
-        let budget = self.memory_budget;
-        let packaged = tokio::task::spawn_blocking(move || {
-            let mut builder = SplitBuilder::new(stream_name, schema, &work_dir, budget)?;
-            for (doc, ts_millis) in &all_docs {
-                // Docs lacking their own timestamp keep the original one
-                // via the fallback.
-                builder.add_json(doc, rsearch_index::DateTime::from_timestamp_millis(*ts_millis))?;
-            }
-            builder.finish()
-        })
-        .await??;
+        let packaged = tokio::task::spawn_blocking(move || builder.finish()).await??;
 
         let key = format!("streams/{}/{}.split", stream.name, packaged.meta.split_id);
         self.storage.put_file(&key, &packaged.file_path).await?;
@@ -525,14 +639,24 @@ impl ControlPlane {
     }
 
     async fn retention_job(&self) -> anyhow::Result<()> {
+        const BATCH: i64 = 10_000;
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let expired = self.metastore.expired_splits(now_millis).await?;
-        if !expired.is_empty() {
+        // Batched: enabling retention on a large old stream marks its
+        // whole backlog without ever holding millions of ids in memory.
+        loop {
+            let expired = self.metastore.expired_splits(now_millis, BATCH).await?;
+            if expired.is_empty() {
+                break;
+            }
+            let finished = (expired.len() as i64) < BATCH;
             let marked = self.metastore.mark_splits_for_delete(&expired).await?;
             info!(marked, "retention: expired splits marked for delete");
+            if finished {
+                break;
+            }
         }
         Ok(())
     }

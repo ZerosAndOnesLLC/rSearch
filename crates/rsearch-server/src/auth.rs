@@ -33,17 +33,27 @@ pub struct AuthState {
     pub enforced: Arc<AtomicBool>,
     /// token-digest -> (identity, inserted_at). Short-TTL cache that keeps
     /// shipper auth off the DB hot path (no per-request session lookup or
-    /// `last_used_at` write). Cleared on user/key mutation.
+    /// `last_used_at` write). Also holds verified Basic credentials (keyed
+    /// by a digest of user+password) so shippers don't pay a full PBKDF2
+    /// per request. Cleared on user/key mutation.
     cache: Arc<Mutex<std::collections::HashMap<String, (Identity, Instant)>>>,
+    /// Digests of tokens that recently failed both DB lookups. Keeps a
+    /// misconfigured shipper (or a token-spraying client) from hammering
+    /// the metastore with two queries per request. Cleared on mutation
+    /// alongside the positive cache, so a just-created key is usable
+    /// immediately.
+    negative: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 const TOKEN_CACHE_TTL: Duration = Duration::from_secs(30);
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 impl Default for AuthState {
     fn default() -> Self {
         Self {
             enforced: Arc::new(AtomicBool::new(true)),
             cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            negative: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -69,10 +79,31 @@ impl AuthState {
         cache.insert(hash, (identity, Instant::now()));
     }
 
+    fn negative_get(&self, hash: &str) -> bool {
+        let mut negative = self.negative.lock().unwrap();
+        if let Some(at) = negative.get(hash) {
+            if at.elapsed() < NEGATIVE_CACHE_TTL {
+                return true;
+            }
+            negative.remove(hash);
+        }
+        false
+    }
+
+    fn negative_put(&self, hash: String) {
+        let mut negative = self.negative.lock().unwrap();
+        // Bounded to keep a token flood from growing it without limit.
+        if negative.len() > 10_000 {
+            negative.clear();
+        }
+        negative.insert(hash, Instant::now());
+    }
+
     /// Invalidate the whole token cache — called after any user/key change
     /// so revocations take effect within one request rather than one TTL.
     pub fn invalidate(&self) {
         self.cache.lock().unwrap().clear();
+        self.negative.lock().unwrap().clear();
     }
 }
 
@@ -170,12 +201,19 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
         if let Some(identity) = state.auth.cache_get(&hash) {
             return Some(identity);
         }
-        if let Ok(Some(user)) = state.metastore.session_user(&hash).await {
+        if state.auth.negative_get(&hash) {
+            continue;
+        }
+        let session = state.metastore.session_user(&hash).await;
+        let session_missed = matches!(session, Ok(None));
+        if let Ok(Some(user)) = session {
             let identity = user_identity(user);
             state.auth.cache_put(hash, identity.clone());
             return Some(identity);
         }
-        if let Ok(Some(key)) = state.metastore.api_key_by_hash(&hash).await {
+        let api_key = state.metastore.api_key_by_hash(&hash).await;
+        let api_key_missed = matches!(api_key, Ok(None));
+        if let Ok(Some(key)) = api_key {
             let identity = Identity {
                 name: format!("apikey:{}", key.name),
                 is_admin: key.actions.iter().any(|a| a == "admin"),
@@ -184,6 +222,11 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
             };
             state.auth.cache_put(hash, identity.clone());
             return Some(identity);
+        }
+        // Only a definite miss goes in the negative cache — a metastore
+        // error must not make a valid token unusable for the TTL.
+        if session_missed && api_key_missed {
+            state.auth.negative_put(hash);
         }
     }
 
@@ -199,6 +242,15 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
         && let Ok(text) = String::from_utf8(decoded)
         && let Some((username, password)) = text.split_once(':')
     {
+        // Verified credentials are cached (same TTL and invalidation as
+        // tokens) so shippers using Basic don't pay a full PBKDF2 per
+        // request. Failures are never cached: first contact with any
+        // username always costs one full verify, preserving the
+        // timing defense below.
+        let basic_hash = crypto::token_digest(&format!("basic\0{username}\0{password}"));
+        if let Some(identity) = state.auth.cache_get(&basic_hash) {
+            return Some(identity);
+        }
         let user = state.metastore.get_user(username).await.ok().flatten();
         let hash = user
             .as_ref()
@@ -209,7 +261,9 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Opti
             .await
             .unwrap_or(false);
         if ok && let Some(user) = user {
-            return Some(user_identity(user));
+            let identity = user_identity(user);
+            state.auth.cache_put(basic_hash, identity.clone());
+            return Some(identity);
         }
     }
     None

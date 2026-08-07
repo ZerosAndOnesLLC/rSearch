@@ -29,6 +29,10 @@ pub struct AppState {
     /// Repair/drain/leadership counters for /metrics, shared with the
     /// control loop. Present only on nodes running the control role.
     pub control: Option<Arc<crate::metrics::ControlMetrics>>,
+    /// Short-TTL cache of all stream names for wildcard resolution — an
+    /// `_msearch` refresh resolves `logs-*` once per TTL instead of one
+    /// `list_streams` query per header/body pair per viewer.
+    pub stream_names: Arc<std::sync::Mutex<Option<(Arc<Vec<String>>, std::time::Instant)>>>,
 }
 
 impl AppState {
@@ -52,7 +56,30 @@ impl AppState {
             internal: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control: None,
+            stream_names: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// All stream names, cached briefly (see `stream_names`).
+    pub async fn cached_stream_names(
+        &self,
+    ) -> Result<Arc<Vec<String>>, rsearch_metastore::MetastoreError> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        if let Some((names, at)) = self.stream_names.lock().unwrap().as_ref()
+            && at.elapsed() < TTL
+        {
+            return Ok(names.clone());
+        }
+        let names: Arc<Vec<String>> = Arc::new(
+            self.metastore
+                .list_streams()
+                .await?
+                .into_iter()
+                .map(|s| s.name)
+                .collect(),
+        );
+        *self.stream_names.lock().unwrap() = Some((names.clone(), std::time::Instant::now()));
+        Ok(names)
     }
 
     /// Record a security-relevant event to the `rsearch-audit` stream

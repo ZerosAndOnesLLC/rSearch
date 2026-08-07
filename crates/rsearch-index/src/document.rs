@@ -78,7 +78,7 @@ impl DocumentConverter {
     /// Convert one document, deriving the stored `_source` from the doc.
     pub fn convert(
         &self,
-        doc: &serde_json::Value,
+        doc: serde_json::Value,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
         self.convert_with_source(doc, None, fallback_timestamp)
@@ -90,34 +90,44 @@ impl DocumentConverter {
     /// ingest hot path. `fallback_timestamp` is used when the document
     /// carries no parseable `@timestamp`/`timestamp`. Returns the
     /// converted document and its effective timestamp.
+    ///
+    /// Takes the document by value: unmapped fields (most of a typical log
+    /// line) are moved into `_dynamic` rather than deep-cloned.
     pub fn convert_with_source(
         &self,
-        doc: &serde_json::Value,
+        doc: serde_json::Value,
         source: Option<&str>,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
-        let obj = doc
-            .as_object()
-            .ok_or_else(|| IndexError::InvalidDocument("document must be an object".into()))?;
+        let timestamp = extract_timestamp(&doc).unwrap_or(fallback_timestamp);
+        // `_source` must be serialized before the fields are moved out.
+        let serialized = match source {
+            Some(_) => None,
+            None => Some(doc.to_string()),
+        };
+        let obj = match doc {
+            serde_json::Value::Object(obj) => obj,
+            _ => return Err(IndexError::InvalidDocument("document must be an object".into())),
+        };
 
-        let timestamp = extract_timestamp(doc).unwrap_or(fallback_timestamp);
         let mut out = TantivyDocument::new();
         out.add_date(self.schema.timestamp, timestamp);
-        match source {
-            Some(source) => out.add_text(self.schema.source, source),
-            None => out.add_text(self.schema.source, doc.to_string()),
+        match (source, serialized) {
+            (Some(source), _) => out.add_text(self.schema.source, source),
+            (None, Some(serialized)) => out.add_text(self.schema.source, serialized),
+            (None, None) => unreachable!("serialized computed for source: None"),
         }
 
         let mut dynamic = serde_json::Map::new();
         for (key, value) in obj {
-            match self.schema.fields.get(key) {
+            match self.schema.fields.get(&key) {
                 Some((field, ty)) => {
-                    for item in flatten(value) {
+                    for item in flatten(&value) {
                         add_typed(&mut out, *field, *ty, item);
                     }
                 }
                 None => {
-                    dynamic.insert(key.clone(), value.clone());
+                    dynamic.insert(key, value);
                 }
             }
         }
@@ -231,7 +241,7 @@ mod tests {
         let c = converter();
         let (doc, ts) = c
             .convert(
-                &serde_json::json!({
+                serde_json::json!({
                     "@timestamp": "2026-07-24T01:02:03Z",
                     "service": "api",
                     "message": "user login ok",
@@ -251,7 +261,7 @@ mod tests {
     fn uses_fallback_when_timestamp_missing() {
         let c = converter();
         let (_, ts) = c
-            .convert(&serde_json::json!({"message": "no ts"}), fallback())
+            .convert(serde_json::json!({"message": "no ts"}), fallback())
             .unwrap();
         assert_eq!(ts, fallback());
     }
@@ -267,7 +277,7 @@ mod tests {
     #[test]
     fn rejects_non_object_documents() {
         let c = converter();
-        assert!(c.convert(&serde_json::json!([1, 2]), fallback()).is_err());
+        assert!(c.convert(serde_json::json!([1, 2]), fallback()).is_err());
     }
 
     #[test]
@@ -275,7 +285,7 @@ mod tests {
         let c = converter();
         let (doc, _) = c
             .convert(
-                &serde_json::json!({"service": ["a", "b"], "status": [1, 2, 3]}),
+                serde_json::json!({"service": ["a", "b"], "status": [1, 2, 3]}),
                 fallback(),
             )
             .unwrap();

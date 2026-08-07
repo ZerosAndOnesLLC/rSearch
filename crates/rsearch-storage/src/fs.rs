@@ -197,9 +197,18 @@ impl Storage for FsStorage {
         let path = self.resolve(key)?;
         self.prepare_parent(&path, key).await?;
         let tmp = path.with_extension("tmp-upload");
-        tokio::fs::copy(local, &tmp)
-            .await
-            .map_err(|e| Self::io_err(key, e))?;
+        // Publish via hard link when the staging dir and the storage root
+        // share a filesystem (both usually live under data_dir) — a copy
+        // would rewrite every split byte a second time (2x publish write
+        // amplification). Cross-device or unsupported links fall back to
+        // the copy. The link target must not exist, so clear any leftover
+        // temp from a crashed earlier attempt first.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        if tokio::fs::hard_link(local, &tmp).await.is_err() {
+            tokio::fs::copy(local, &tmp)
+                .await
+                .map_err(|e| Self::io_err(key, e))?;
+        }
         // Durability: fsync the data before it becomes visible, so the
         // ingest WAL is only truncated after the split is truly on disk.
         {

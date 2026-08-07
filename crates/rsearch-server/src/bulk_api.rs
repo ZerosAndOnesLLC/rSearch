@@ -60,13 +60,14 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
         })
         .collect();
     let wal = pipeline.wal().clone();
-    let wal_items: Vec<(String, Vec<u8>)> = expanded
+    let wal_items: Vec<(String, std::sync::Arc<str>)> = expanded
         .iter()
         .flat_map(|(_, item, routes)| {
-            // WAL payload = the client's original line bytes (no re-serialize).
+            // WAL payload = the client's original line bytes (no
+            // re-serialize, no byte copy — the Arc is shared).
             routes
                 .iter()
-                .map(move |stream| (stream.clone(), item.raw.as_bytes().to_vec()))
+                .map(move |stream| (stream.clone(), item.raw.clone()))
         })
         .collect();
     let positions = match tokio::task::spawn_blocking(move || wal.append_batch(&wal_items)).await {

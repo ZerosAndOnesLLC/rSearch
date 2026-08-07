@@ -4,3 +4,4 @@
 /certs
 /data
 /bench-data
+compose-syslog-input.yml

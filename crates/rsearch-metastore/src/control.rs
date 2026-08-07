@@ -101,16 +101,25 @@ impl Metastore {
         .await?)
     }
 
-    /// Published splits past their stream's retention window.
-    pub async fn expired_splits(&self, now_millis: i64) -> MetastoreResult<Vec<String>> {
+    /// Published splits past their stream's retention window. Bounded by
+    /// `limit` so enabling retention on a large old stream marks its
+    /// backlog in batches (the caller loops) instead of loading millions
+    /// of ids in one shot.
+    pub async fn expired_splits(
+        &self,
+        now_millis: i64,
+        limit: i64,
+    ) -> MetastoreResult<Vec<String>> {
         let rows = sqlx::query(
             "SELECT s.split_id FROM splits s
              JOIN streams st ON st.id = s.stream_id
              WHERE s.state = 'published'
                AND st.retention_hours IS NOT NULL
-               AND s.time_end_millis < $1 - (st.retention_hours::bigint * 3600000)",
+               AND s.time_end_millis < $1 - (st.retention_hours::bigint * 3600000)
+             LIMIT $2",
         )
         .bind(now_millis)
+        .bind(limit)
         .fetch_all(self.pool())
         .await?;
         Ok(rows.iter().map(|r| r.get::<String, _>("split_id")).collect())

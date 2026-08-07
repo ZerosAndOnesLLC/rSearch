@@ -102,16 +102,20 @@ impl SplitReader {
         Ok(self.reader.searcher())
     }
 
-    /// Export every document as (source JSON, timestamp millis) — used by
-    /// the merge job to re-index small splits. Call from a blocking
-    /// context; streams the doc store rather than materializing segments.
-    pub fn export_docs(&self) -> IndexResult<Vec<(serde_json::Value, i64)>> {
+    /// Visit every document as (parsed source JSON, timestamp millis) —
+    /// used by the merge job to re-index small splits. Call from a
+    /// blocking context. Streams the doc store one document at a time so
+    /// re-indexing a whole merge group holds O(one doc) in memory, not the
+    /// entire group's parsed corpus.
+    pub fn for_each_doc(
+        &self,
+        mut visit: impl FnMut(serde_json::Value, i64) -> IndexResult<()>,
+    ) -> IndexResult<()> {
         let searcher = self.searcher()?;
         let schema = self.index.schema();
         let source_field = schema
             .get_field(crate::mapping::SOURCE_FIELD)
             .map_err(|_| IndexError::InvalidDocument("split lacks _source".into()))?;
-        let mut docs = Vec::with_capacity(self.meta.split.doc_count as usize);
         for segment_reader in searcher.segment_readers() {
             let store = segment_reader.get_store_reader(10)?;
             let ts_column = segment_reader
@@ -132,10 +136,10 @@ impl SplitReader {
                     .first(doc_id)
                     .map(|dt| dt.into_timestamp_millis())
                     .unwrap_or_default();
-                docs.push((json, ts));
+                visit(json, ts)?;
             }
         }
-        Ok(docs)
+        Ok(())
     }
 }
 
@@ -146,6 +150,12 @@ struct DirectoryInner {
     cache: Arc<SplitCache>,
     runtime: Handle,
 }
+
+/// Ranged-read chunk size for cold split fetches. Large bundled files
+/// (a merged split's doc store can be 100MB+) stream into the cache file
+/// chunk by chunk, so transient memory stays O(chunk) per concurrent
+/// fetch instead of O(file).
+const FETCH_CHUNK_BYTES: u64 = 8 << 20;
 
 impl DirectoryInner {
     /// Fetch an internal file (whole-file granularity) through the cache.
@@ -160,15 +170,22 @@ impl DirectoryInner {
                 format!("{file_name} not in split bundle"),
             )
         })?;
-        let data = self
-            .runtime
-            .block_on(
-                self.storage
-                    .get_range(&self.key, span.offset..span.offset + span.len),
-            )
-            .map_err(std::io::Error::other)?;
         self.cache
-            .insert(&self.meta.split.split_id, file_name, &data)
+            .insert_via(&self.meta.split.split_id, file_name, |file| {
+                use std::io::Write;
+                let mut offset = span.offset;
+                let end = span.offset + span.len;
+                while offset < end {
+                    let chunk_end = (offset + FETCH_CHUNK_BYTES).min(end);
+                    let data = self
+                        .runtime
+                        .block_on(self.storage.get_range(&self.key, offset..chunk_end))
+                        .map_err(std::io::Error::other)?;
+                    file.write_all(&data)?;
+                    offset = chunk_end;
+                }
+                Ok(())
+            })
     }
 }
 
@@ -319,7 +336,7 @@ mod tests {
         for i in 0..500 {
             builder
                 .add_json(
-                    &serde_json::json!({
+                    serde_json::json!({
                         "@timestamp": 1_753_300_000_000_i64 + i,
                         "service": if i % 2 == 0 { "api" } else { "worker" },
                         "message": format!("event number {i}"),

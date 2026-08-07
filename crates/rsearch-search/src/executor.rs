@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tantivy::aggregation::AggregationLimitsGuard;
@@ -26,10 +27,18 @@ use crate::error::{SearchError, SearchResult};
 use crate::query_dsl::{extract_time_bounds, rewrite_agg_fields, translate_query};
 
 const TIMESTAMP_ALIASES: [&str; 3] = ["@timestamp", "timestamp", "_timestamp"];
-/// Cap on cached open split readers (LRU).
+/// Cap on cached open split readers (LRU), across all shards.
 const READER_CACHE_CAP: usize = 256;
+/// Reader-cache shards: every split touch on every query locks the cache
+/// (LRU `get` mutates), so one global lock serializes the whole search
+/// path. Sharding by split id keeps that contention local.
+const READER_CACHE_SHARDS: usize = 8;
 /// Max concurrent split searches per query.
 const SPLIT_SEARCH_CONCURRENCY: usize = 16;
+/// How long a resolved stream record + built schema may be reused before
+/// re-checking the metastore. Bounds mapping-change staleness the same way
+/// the ingest side's per-flush re-check does.
+const STREAM_CACHE_TTL: Duration = Duration::from_secs(10);
 /// ES-compatible default exact-count ceiling; beyond this the reported
 /// total is a lower bound (`"relation": "gte"`).
 const DEFAULT_TRACK_TOTAL_HITS: usize = 10_000;
@@ -141,16 +150,29 @@ struct SplitOutcome {
     aggs: Option<IntermediateAggregationResults>,
 }
 
+/// A resolved stream: its metastore record plus the schema built from its
+/// mapping, cached for [`STREAM_CACHE_TTL`].
+struct CachedStream {
+    record: rsearch_metastore::StreamRecord,
+    schema: Arc<MappedSchema>,
+}
+
 /// Stateless search service: metastore for pruning, storage for split
-/// bytes, an LRU cache of open readers with single-flight opens.
+/// bytes, a sharded LRU cache of open readers with single-flight opens.
 pub struct SearchService {
     metastore: Metastore,
     storage: Arc<dyn Storage>,
     cache: Arc<SplitCache>,
-    readers: Mutex<lru::LruCache<String, Arc<SplitReader>>>,
+    /// Sharded by split id; each shard is a sync mutex (never held across
+    /// an await) so concurrent split touches don't serialize globally.
+    readers: Vec<std::sync::Mutex<lru::LruCache<String, Arc<SplitReader>>>>,
     /// Per-split open locks so concurrent queries opening the same cold
     /// split don't each pay the open cost.
-    opening: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    opening: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Stream name → resolved record + built schema. Saves the per-query
+    /// metastore roundtrip and full Tantivy schema rebuild for data that
+    /// only changes on PUT /{index}.
+    streams: std::sync::Mutex<HashMap<String, (Arc<CachedStream>, Instant)>>,
 }
 
 impl SearchService {
@@ -159,40 +181,82 @@ impl SearchService {
             metastore,
             storage,
             cache,
-            readers: Mutex::new(lru::LruCache::new(
-                NonZeroUsize::new(READER_CACHE_CAP).unwrap(),
-            )),
-            opening: Mutex::new(HashMap::new()),
+            readers: (0..READER_CACHE_SHARDS)
+                .map(|_| {
+                    std::sync::Mutex::new(lru::LruCache::new(
+                        NonZeroUsize::new(READER_CACHE_CAP / READER_CACHE_SHARDS).unwrap(),
+                    ))
+                })
+                .collect(),
+            opening: std::sync::Mutex::new(HashMap::new()),
+            streams: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
+    fn reader_shard(&self, split_id: &str) -> &std::sync::Mutex<lru::LruCache<String, Arc<SplitReader>>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        split_id.hash(&mut hasher);
+        &self.readers[hasher.finish() as usize % READER_CACHE_SHARDS]
+    }
+
+    /// Resolve a stream's record and schema through the TTL cache.
+    async fn stream_schema(&self, name: &str) -> SearchResult<Arc<CachedStream>> {
+        if let Some((cached, at)) = self.streams.lock().unwrap().get(name)
+            && at.elapsed() < STREAM_CACHE_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let record = self.metastore.get_stream(name).await?;
+        let mapping = IndexMapping::from_json(&record.mapping)
+            .map_err(|e| SearchError::BadRequest(e.to_string()))?;
+        let cached = Arc::new(CachedStream {
+            schema: Arc::new(MappedSchema::build(mapping)),
+            record,
+        });
+        let mut streams = self.streams.lock().unwrap();
+        // Bounded so a probe flood of stream names can't grow it forever.
+        if streams.len() > 10_000 {
+            streams.clear();
+        }
+        streams.insert(name.to_string(), (cached.clone(), Instant::now()));
+        Ok(cached)
+    }
+
     async fn reader(&self, split_id: &str, storage_key: &str) -> SearchResult<Arc<SplitReader>> {
-        if let Some(reader) = self.readers.lock().await.get(split_id).cloned() {
-            return Ok(reader);
+        if let Some(reader) = self.reader_shard(split_id).lock().unwrap().get(split_id) {
+            return Ok(reader.clone());
         }
         // Single-flight: coalesce concurrent opens of the same split.
         let gate = {
-            let mut opening = self.opening.lock().await;
+            let mut opening = self.opening.lock().unwrap();
             opening
                 .entry(split_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
         let _guard = gate.lock().await;
         // Someone may have opened it while we waited for the gate.
-        if let Some(reader) = self.readers.lock().await.get(split_id).cloned() {
-            return Ok(reader);
+        if let Some(reader) = self.reader_shard(split_id).lock().unwrap().get(split_id) {
+            return Ok(reader.clone());
         }
-        let reader = Arc::new(
-            SplitReader::open(self.storage.clone(), storage_key, self.cache.clone()).await?,
-        );
+        // The gate entry must not outlive the attempt: a failed open would
+        // otherwise leak it forever (one map entry per failing split id).
+        let opened = SplitReader::open(self.storage.clone(), storage_key, self.cache.clone()).await;
+        let reader = match opened {
+            Ok(reader) => Arc::new(reader),
+            Err(e) => {
+                self.opening.lock().unwrap().remove(split_id);
+                return Err(e.into());
+            }
+        };
         // LRU insert evicts only the least-recently-used entry, not the
         // whole cache.
-        self.readers
+        self.reader_shard(split_id)
             .lock()
-            .await
+            .unwrap()
             .put(split_id.to_string(), reader.clone());
-        self.opening.lock().await.remove(split_id);
+        self.opening.lock().unwrap().remove(split_id);
         Ok(reader)
     }
 
@@ -201,10 +265,9 @@ impl SearchService {
         use futures::stream::{self, StreamExt};
 
         let started = Instant::now();
-        let stream = self.metastore.get_stream(&request.stream).await?;
-        let mapping = IndexMapping::from_json(&stream.mapping)
-            .map_err(|e| SearchError::BadRequest(e.to_string()))?;
-        let schema = Arc::new(MappedSchema::build(mapping));
+        let cached = self.stream_schema(&request.stream).await?;
+        let stream = &cached.record;
+        let schema = cached.schema.clone();
 
         let (t_start, t_end) = extract_time_bounds(&request.query);
         let splits = self
@@ -239,6 +302,11 @@ impl SearchService {
         // split order so split_idx stays meaningful.
         let track = request.track_total_hits;
         let sort_desc = request.sort_desc;
+        // Running total of counted matches across splits. Once it passes
+        // track_total_hits, later splits skip their Count collector and the
+        // response reports `"relation": "gte"` — the default 10k cap stops
+        // exact counting instead of scanning every match in the stream.
+        let counted = Arc::new(AtomicUsize::new(0));
         let futs: Vec<_> = splits
             .iter()
             .enumerate()
@@ -247,6 +315,7 @@ impl SearchService {
                 let schema = schema.clone();
                 let query = query.clone();
                 let aggregations = aggregations.clone();
+                let counted = counted.clone();
                 let split_id = split.split_id.clone();
                 let storage_key = split.storage_key.clone();
                 let doc_count = split.doc_count as usize;
@@ -258,7 +327,11 @@ impl SearchService {
                     && t_end.map(|e| split.time_end_millis <= e).unwrap_or(true);
                 async move {
                     let reader = this.reader(&split_id, &storage_key).await?;
-                    tokio::task::spawn_blocking(move || {
+                    let skip_count = match track {
+                        Some(cap) => counted.load(Ordering::Relaxed) >= cap,
+                        None => false,
+                    };
+                    let outcome = tokio::task::spawn_blocking(move || {
                         search_one_split(
                             &reader,
                             &schema,
@@ -266,14 +339,16 @@ impl SearchService {
                             aggregations,
                             fetch_limit,
                             sort_desc,
-                            track,
+                            skip_count,
                             idx,
                             doc_count,
                             fully_covered,
                         )
                     })
                     .await
-                    .map_err(|e| SearchError::Internal(format!("search task panicked: {e}")))?
+                    .map_err(|e| SearchError::Internal(format!("search task panicked: {e}")))??;
+                    counted.fetch_add(outcome.count, Ordering::Relaxed);
+                    Ok(outcome)
                 }
             })
             .collect();
@@ -386,37 +461,52 @@ impl SearchService {
         page: &[SplitHit],
         stream: &str,
     ) -> SearchResult<Vec<Value>> {
-        // Group page positions by split.
+        use futures::stream::{self, StreamExt};
+
+        // Group page positions by split, then fetch the splits concurrently
+        // (bounded); positions restore the page order afterwards.
         let mut by_split: HashMap<usize, Vec<(usize, DocAddress)>> = HashMap::new();
         for (pos, hit) in page.iter().enumerate() {
             by_split.entry(hit.split_idx).or_default().push((pos, hit.doc));
         }
-        let mut sources: Vec<Value> = vec![Value::Null; page.len()];
-        for (split_idx, wants) in by_split {
-            let split = &splits[split_idx];
-            let reader = self.reader(&split.split_id, &split.storage_key).await?;
-            let schema = schema.clone();
-            let fetched = tokio::task::spawn_blocking(move || {
-                let searcher = reader.searcher()?;
-                let mut out = Vec::with_capacity(wants.len());
-                for (pos, address) in wants {
-                    let doc: TantivyDocument =
-                        searcher.doc(address).map_err(SearchError::Tantivy)?;
-                    let source = doc
-                        .get_first(schema.source)
-                        .and_then(|v| v.as_str().map(str::to_string));
-                    out.push((pos, source));
+        let futs: Vec<_> = by_split
+            .into_iter()
+            .map(|(split_idx, wants)| {
+                let this = &*self;
+                let split = &splits[split_idx];
+                let schema = schema.clone();
+                async move {
+                    let reader = this.reader(&split.split_id, &split.storage_key).await?;
+                    tokio::task::spawn_blocking(move || {
+                        let searcher = reader.searcher()?;
+                        let mut out = Vec::with_capacity(wants.len());
+                        for (pos, address) in wants {
+                            let doc: TantivyDocument =
+                                searcher.doc(address).map_err(SearchError::Tantivy)?;
+                            let source = doc
+                                .get_first(schema.source)
+                                .and_then(|v| v.as_str().map(str::to_string));
+                            out.push((pos, source));
+                        }
+                        Ok::<_, SearchError>(out)
+                    })
+                    .await
+                    .map_err(|e| SearchError::Internal(format!("source fetch panicked: {e}")))?
                 }
-                Ok::<_, SearchError>(out)
             })
+            .collect();
+        let mut sources: Vec<Value> = vec![Value::Null; page.len()];
+        let fetched: Vec<Vec<(usize, Option<String>)>> = stream::iter(futs)
+            .buffer_unordered(SPLIT_SEARCH_CONCURRENCY)
+            .collect::<Vec<SearchResult<_>>>()
             .await
-            .map_err(|e| SearchError::Internal(format!("source fetch panicked: {e}")))??;
-            for (pos, source) in fetched {
-                sources[pos] = source
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or(Value::Null);
-            }
+            .into_iter()
+            .collect::<SearchResult<Vec<_>>>()?;
+        for (pos, source) in fetched.into_iter().flatten() {
+            sources[pos] = source
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(Value::Null);
         }
         Ok(page
             .iter()
@@ -460,7 +550,7 @@ fn search_one_split(
     aggregations: Option<Aggregations>,
     fetch_limit: usize,
     sort_desc: bool,
-    track_total_hits: Option<usize>,
+    skip_count: bool,
     split_idx: usize,
     doc_count: usize,
     fully_covered: bool,
@@ -498,11 +588,10 @@ fn search_one_split(
         });
     }
 
-    // track_total_hits:false → don't run the Count collector at all; the
-    // total becomes a lower bound (the page length). Aggregations still
-    // need their collector.
-    let skip_count = track_total_hits == Some(0);
-
+    // skip_count (track_total_hits:false, or the running total already
+    // passed the cap) → don't run the Count collector at all; the total
+    // becomes a lower bound (the page length). Aggregations still need
+    // their collector, and counting is free alongside their full scan.
     let (count, count_is_lower_bound, top, agg_result) = match (aggregations, skip_count) {
         (Some(aggs), _) => {
             let agg_collector = tantivy::aggregation::DistributedAggregationCollector::from_aggs(

@@ -142,14 +142,13 @@ async fn resolve_stream(state: &AppState, pattern: &str) -> Result<String, Strin
         return Ok(pattern.to_string());
     }
     let streams = state
-        .metastore
-        .list_streams()
+        .cached_stream_names()
         .await
         .map_err(|e| e.to_string())?;
     let matches: Vec<String> = streams
-        .into_iter()
-        .map(|s| s.name)
+        .iter()
         .filter(|name| glob_match(pattern, name))
+        .cloned()
         .collect();
     match matches.len() {
         0 => Err(format!("no stream matches '{pattern}'")),

@@ -169,12 +169,20 @@ async fn read_lines(
             return Ok(());
         }
         pending.extend_from_slice(&chunk[..n]);
-        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = pending.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+        // Frame via a cursor and compact once per chunk — a per-message
+        // drain() shifts the whole remaining buffer every message, which
+        // goes quadratic on floods of small messages.
+        let mut start = 0;
+        while let Some(rel) = pending[start..].iter().position(|&b| b == b'\n') {
+            let end = start + rel;
+            let line = String::from_utf8_lossy(&pending[start..end]);
             if !line.trim().is_empty() {
                 let _ = tx.send(parse_syslog(&line)).await;
             }
+            start = end + 1;
+        }
+        if start > 0 {
+            pending.drain(..start);
         }
         // Guard against unframed floods.
         if pending.len() > 1 << 20 {
@@ -235,14 +243,20 @@ async fn read_gelf(
             return Ok(());
         }
         pending.extend_from_slice(&chunk[..n]);
-        while let Some(pos) = pending.iter().position(|&b| b == 0) {
-            let frame: Vec<u8> = pending.drain(..=pos).collect();
-            match parse_gelf(&frame[..frame.len() - 1]) {
+        // Cursor + single compaction per chunk (see read_lines).
+        let mut start = 0;
+        while let Some(rel) = pending[start..].iter().position(|&b| b == 0) {
+            let end = start + rel;
+            match parse_gelf(&pending[start..end]) {
                 Some(doc) => {
                     let _ = tx.send(doc).await;
                 }
                 None => warn!("dropping invalid GELF frame"),
             }
+            start = end + 1;
+        }
+        if start > 0 {
+            pending.drain(..start);
         }
         if pending.len() > 1 << 20 {
             pending.clear();
