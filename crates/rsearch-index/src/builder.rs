@@ -74,7 +74,7 @@ impl SplitBuilder {
     /// Convert and buffer one document (serializes `_source` from `doc`).
     pub fn add_json(
         &mut self,
-        doc: &serde_json::Value,
+        doc: serde_json::Value,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
         self.add_json_with_source(doc, None, fallback_timestamp)
@@ -82,9 +82,11 @@ impl SplitBuilder {
 
     /// Convert and buffer one document, storing `source` verbatim as
     /// `_source` (the client's original line) instead of re-serializing.
+    /// The document is consumed — its unmapped fields move into `_dynamic`
+    /// without a deep clone.
     pub fn add_json_with_source(
         &mut self,
-        doc: &serde_json::Value,
+        doc: serde_json::Value,
         source: Option<&str>,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
@@ -177,7 +179,7 @@ mod tests {
         for i in 0..100 {
             builder
                 .add_json(
-                    &serde_json::json!({
+                    serde_json::json!({
                         "@timestamp": 1_753_300_000_000_i64 + i,
                         "service": "api",
                         "message": format!("request {i} handled"),
@@ -237,7 +239,7 @@ mod timestamp_units {
         ] {
             builder
                 .add_json(
-                    &serde_json::json!({"@timestamp": ts, "message": "x"}),
+                    serde_json::json!({"@timestamp": ts, "message": "x"}),
                     tantivy::DateTime::from_timestamp_millis(1_784_871_020_163),
                 )
                 .unwrap();

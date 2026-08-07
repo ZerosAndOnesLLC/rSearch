@@ -12,6 +12,13 @@ const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_co
 #[derive(Clone)]
 pub struct Metastore {
     pool: PgPool,
+    /// Per-node held-bytes totals for replication target ranking. The
+    /// backing SUM..GROUP BY over object_locations is O(table), so it is
+    /// refreshed at most once per TTL instead of on every placement call
+    /// (see `replication_targets`). Shared across clones.
+    pub(crate) held_bytes: std::sync::Arc<
+        std::sync::Mutex<Option<(std::collections::HashMap<String, i64>, std::time::Instant)>>,
+    >,
 }
 
 impl Metastore {
@@ -33,7 +40,10 @@ impl Metastore {
             .connect(&url)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            held_bytes: Default::default(),
+        })
     }
 
     pub fn pool(&self) -> &PgPool {

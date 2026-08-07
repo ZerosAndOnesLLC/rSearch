@@ -147,16 +147,28 @@ impl Wal {
     /// buffer), then the fsync runs under a separate gate so concurrent
     /// appends coalesce into one fsync (group commit) instead of each
     /// paying its own.
-    pub fn append_batch(&self, items: &[(String, Vec<u8>)]) -> std::io::Result<Vec<WalPos>> {
+    pub fn append_batch<S, D>(&self, items: &[(S, D)]) -> std::io::Result<Vec<WalPos>>
+    where
+        S: AsRef<str>,
+        D: AsRef<str>,
+    {
         use std::sync::atomic::Ordering;
         let mut positions = Vec::with_capacity(items.len());
+        // Segments sealed by rotation during this batch are fsynced below,
+        // outside the writer lock; fully-confirmed segments GC found are
+        // unlinked outside it too — neither disk op stalls other appenders.
+        let mut sealed: Vec<std::fs::File> = Vec::new();
+        let mut victims: Vec<PathBuf> = Vec::new();
         let (fd, my_gen) = {
             let mut inner = self.inner.lock().unwrap();
             for (stream, doc) in items {
+                let doc = doc.as_ref().as_bytes();
                 if inner.current_len >= self.max_segment_bytes {
-                    self.rotate(&mut inner)?;
+                    let (old_file, mut gc) = self.rotate(&mut inner)?;
+                    sealed.push(old_file);
+                    victims.append(&mut gc);
                 }
-                let stream_bytes = stream.as_bytes();
+                let stream_bytes = stream.as_ref().as_bytes();
                 let payload_len = 2 + stream_bytes.len() + doc.len();
                 let len_field = stream_bytes.len() as u16;
                 // Stream the CRC over the three payload slices; write them
@@ -189,6 +201,16 @@ impl Wal {
             (fd, inner.written)
         };
 
+        // Rotated-out segments may hold records from this batch, so they
+        // must be durable before the positions are acked. The group-commit
+        // fsync below only covers the current segment's fd.
+        for old in &sealed {
+            old.sync_data()?;
+        }
+        for path in victims {
+            let _ = std::fs::remove_file(path);
+        }
+
         // Group commit: if someone already fsynced past our records, skip;
         // otherwise fsync once (covers everyone flushed so far).
         if self.synced.load(Ordering::Acquire) < my_gen {
@@ -204,9 +226,11 @@ impl Wal {
         Ok(positions)
     }
 
-    fn rotate(&self, inner: &mut WalInner) -> std::io::Result<()> {
+    /// Seal the current segment and open a fresh one. Returns the sealed
+    /// file — the caller fsyncs it outside the writer lock — plus any
+    /// fully-confirmed segments for the caller to unlink, also outside.
+    fn rotate(&self, inner: &mut WalInner) -> std::io::Result<(std::fs::File, Vec<PathBuf>)> {
         inner.writer.flush()?;
-        inner.writer.get_ref().sync_data()?;
         let old_seq = inner.current_seq;
         if let Some(state) = inner.segments.get_mut(&old_seq) {
             state.sealed = true;
@@ -216,7 +240,10 @@ impl Wal {
             .create(true)
             .append(true)
             .open(segment_path(&self.dir, new_seq))?;
-        inner.writer = BufWriter::new(file);
+        let old = std::mem::replace(&mut inner.writer, BufWriter::new(file));
+        let old_file = old
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         inner.current_seq = new_seq;
         inner.current_len = 0;
         inner.segments.insert(
@@ -227,32 +254,43 @@ impl Wal {
             },
         );
         // The old segment may already be fully confirmed.
-        Self::gc_locked(&self.dir, inner);
-        Ok(())
+        let victims = self.collect_confirmed(inner);
+        Ok((old_file, victims))
     }
 
     /// Confirm records as durably published; deletes exhausted segments.
     pub fn confirm(&self, positions: &[WalPos]) {
-        let mut inner = self.inner.lock().unwrap();
-        for pos in positions {
-            if let Some(state) = inner.segments.get_mut(&pos.segment) {
-                state.outstanding = state.outstanding.saturating_sub(1);
+        let victims = {
+            let mut inner = self.inner.lock().unwrap();
+            for pos in positions {
+                if let Some(state) = inner.segments.get_mut(&pos.segment) {
+                    state.outstanding = state.outstanding.saturating_sub(1);
+                }
             }
+            self.collect_confirmed(&mut inner)
+        };
+        for path in victims {
+            let _ = std::fs::remove_file(path);
         }
-        Self::gc_locked(&self.dir, &mut inner);
     }
 
-    fn gc_locked(dir: &Path, inner: &mut WalInner) {
-        let victims: Vec<u64> = inner
+    /// Drop fully-confirmed sealed segments from tracking and return their
+    /// paths. The caller unlinks them after releasing the writer lock so
+    /// the syscall never stalls concurrent appends. Each victim is removed
+    /// from the map here, so racing callers never unlink the same path.
+    fn collect_confirmed(&self, inner: &mut WalInner) -> Vec<PathBuf> {
+        let seqs: Vec<u64> = inner
             .segments
             .iter()
             .filter(|(_, s)| s.sealed && s.outstanding == 0)
             .map(|(&seq, _)| seq)
             .collect();
-        for seq in victims {
-            inner.segments.remove(&seq);
-            let _ = std::fs::remove_file(segment_path(dir, seq));
-        }
+        seqs.into_iter()
+            .map(|seq| {
+                inner.segments.remove(&seq);
+                segment_path(&self.dir, seq)
+            })
+            .collect()
     }
 
     /// Number of live (non-deleted) segments — used by tests and metrics.
@@ -367,14 +405,9 @@ impl Iterator for WalReplay {
 mod tests {
     use super::*;
 
-    fn items(n: usize, stream: &str) -> Vec<(String, Vec<u8>)> {
+    fn items(n: usize, stream: &str) -> Vec<(String, String)> {
         (0..n)
-            .map(|i| {
-                (
-                    stream.to_string(),
-                    format!("{{\"n\":{i}}}").into_bytes(),
-                )
-            })
+            .map(|i| (stream.to_string(), format!("{{\"n\":{i}}}")))
             .collect()
     }
 

@@ -54,7 +54,14 @@ struct PipelineInner {
     storage: Arc<dyn Storage>,
     metastore: Metastore,
     wal: Arc<Wal>,
-    workers: tokio::sync::Mutex<HashMap<String, mpsc::Sender<WorkItem>>>,
+    /// Stream → worker sender. Read-locked (sync, never across an await)
+    /// on the per-document hot path; the write lock is only ever taken to
+    /// insert a newly created worker.
+    workers: std::sync::RwLock<HashMap<String, mpsc::Sender<WorkItem>>>,
+    /// Single-flights first-time worker creation so the metastore resolve
+    /// never runs under `workers` — enqueues to existing streams are not
+    /// blocked while a new stream's row is being created.
+    worker_create: tokio::sync::Mutex<()>,
     metrics: IngestMetrics,
     /// Routing rules, refreshed periodically from the metastore.
     rules: std::sync::RwLock<Arc<Vec<rsearch_metastore::RoutingRuleRecord>>>,
@@ -86,7 +93,8 @@ impl IngestPipeline {
                 storage,
                 metastore,
                 wal,
-                workers: tokio::sync::Mutex::new(HashMap::new()),
+                workers: std::sync::RwLock::new(HashMap::new()),
+                worker_create: tokio::sync::Mutex::new(()),
                 metrics: IngestMetrics::default(),
                 rules: std::sync::RwLock::new(Arc::new(Vec::new())),
             }),
@@ -163,28 +171,30 @@ impl IngestPipeline {
     ) -> IngestResult<(usize, usize)> {
         // Programmatic inputs have no original line, so serialize once and
         // share the Arc across every route.
-        let mut pairs: Vec<(String, Value, Arc<str>)> = Vec::new();
+        let mut pairs: Vec<(String, Arc<str>)> = Vec::new();
         for doc in docs {
             let source: Arc<str> = Arc::from(doc.to_string());
             for stream in self.expand_routes(default_stream, &doc) {
-                pairs.push((stream, doc.clone(), source.clone()));
+                pairs.push((stream, source.clone()));
             }
         }
         if pairs.is_empty() {
             return Ok((0, 0));
         }
+        // The pairs move into the blocking task and back so the WAL append
+        // works on the existing strings — no per-document byte copies.
         let wal = self.inner.wal.clone();
-        let wal_items: Vec<(String, Vec<u8>)> = pairs
-            .iter()
-            .map(|(stream, _, source)| (stream.clone(), source.as_bytes().to_vec()))
-            .collect();
-        let positions = tokio::task::spawn_blocking(move || wal.append_batch(&wal_items))
-            .await
-            .map_err(|e| IngestError::Wal(std::io::Error::other(e.to_string())))??;
+        let (pairs, positions) = tokio::task::spawn_blocking(move || {
+            let positions = wal.append_batch(&pairs);
+            (pairs, positions)
+        })
+        .await
+        .map_err(|e| IngestError::Wal(std::io::Error::other(e.to_string())))?;
+        let positions = positions?;
 
         let mut accepted = 0;
         let mut dropped = 0;
-        for ((stream, _doc, source), pos) in pairs.into_iter().zip(positions) {
+        for ((stream, source), pos) in pairs.into_iter().zip(positions) {
             match self.enqueue(&stream, source, pos).await {
                 Ok(()) => accepted += 1,
                 Err(_) => {
@@ -247,7 +257,12 @@ impl IngestPipeline {
                 self.inner.wal.confirm(&[record.pos]);
                 continue;
             }
-            let source: Arc<str> = Arc::from(String::from_utf8_lossy(&record.doc).into_owned());
+            // Valid JSON is valid UTF-8, so the common path builds the Arc
+            // straight from the record bytes (one copy, no String detour).
+            let source: Arc<str> = match std::str::from_utf8(&record.doc) {
+                Ok(text) => Arc::from(text),
+                Err(_) => Arc::from(String::from_utf8_lossy(&record.doc).into_owned()),
+            };
             let tx = self.worker_for(&record.stream).await?;
             self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
             if tx
@@ -268,12 +283,16 @@ impl IngestPipeline {
     }
 
     async fn worker_for(&self, stream: &str) -> IngestResult<mpsc::Sender<WorkItem>> {
-        let mut workers = self.inner.workers.lock().await;
-        if let Some(tx) = workers.get(stream) {
+        if let Some(tx) = self.inner.workers.read().unwrap().get(stream) {
             return Ok(tx.clone());
         }
         // First document for this stream: resolve it in the metastore and
-        // spin up its worker.
+        // spin up its worker. Serialized behind `worker_create` (re-checking
+        // after acquiring it) so concurrent first-docs create one worker.
+        let _create = self.inner.worker_create.lock().await;
+        if let Some(tx) = self.inner.workers.read().unwrap().get(stream) {
+            return Ok(tx.clone());
+        }
         let record = self.inner.metastore.ensure_stream(stream).await?;
         let mapping = IndexMapping::from_json(&record.mapping).unwrap_or_default();
         let schema = MappedSchema::build(mapping);
@@ -285,7 +304,11 @@ impl IngestPipeline {
             schema,
             rx,
         ));
-        workers.insert(stream.to_string(), tx.clone());
+        self.inner
+            .workers
+            .write()
+            .unwrap()
+            .insert(stream.to_string(), tx.clone());
         Ok(tx)
     }
 }
@@ -412,7 +435,7 @@ async fn flush_inner(
                 // only ever held the raw bytes.
                 match serde_json::from_str::<Value>(&item.source) {
                     Ok(doc) => {
-                        builder.add_json_with_source(&doc, Some(&item.source), fallback)?;
+                        builder.add_json_with_source(doc, Some(&item.source), fallback)?;
                     }
                     Err(e) => {
                         // Enqueued docs were validated, so this is unexpected;

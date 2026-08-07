@@ -116,6 +116,29 @@ impl Metastore {
         Ok(rows.into_iter().map(|(key,)| key).collect())
     }
 
+    /// Refresh interval for the per-node held-bytes totals used to rank
+    /// replication targets. A few seconds of staleness only skews
+    /// placement slightly; the aggregation it avoids is a full scan of
+    /// object_locations per call.
+    const HELD_BYTES_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Total recorded bytes per node, cached for [`Self::HELD_BYTES_TTL`].
+    async fn node_held_bytes(&self) -> MetastoreResult<std::collections::HashMap<String, i64>> {
+        if let Some((map, at)) = self.held_bytes.lock().unwrap().as_ref()
+            && at.elapsed() < Self::HELD_BYTES_TTL
+        {
+            return Ok(map.clone());
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT node_id, SUM(size_bytes)::bigint FROM object_locations GROUP BY node_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        let map: std::collections::HashMap<String, i64> = rows.into_iter().collect();
+        *self.held_bytes.lock().unwrap() = Some((map.clone(), std::time::Instant::now()));
+        Ok(map)
+    }
+
     /// Up to `limit` live nodes to receive new object copies, excluding
     /// `exclude` (typically the writer and existing holders), preferring
     /// nodes holding the fewest total bytes so fresh/empty nodes absorb
@@ -123,6 +146,10 @@ impl Metastore {
     /// too, ranked after non-draining ones — repair's last resort when
     /// nothing else can take a copy (#4); the drain job moves such copies
     /// off again later.
+    ///
+    /// The held-bytes ranking comes from a short-TTL cache rather than an
+    /// O(object_locations) aggregation per call — this runs on every
+    /// replicated write and repair/drain key.
     pub async fn replication_targets(
         &self,
         stale_after_secs: f64,
@@ -130,27 +157,31 @@ impl Metastore {
         limit: i64,
         include_draining: bool,
     ) -> MetastoreResult<Vec<NodeRecord>> {
-        Ok(sqlx::query_as::<_, NodeRecord>(
+        let mut candidates = sqlx::query_as::<_, NodeRecord>(
             "SELECT n.id, n.roles, n.address, n.draining,
                     EXTRACT(EPOCH FROM (now() - n.last_heartbeat))::float8 AS heartbeat_age_secs,
                     EXTRACT(EPOCH FROM (now() - n.draining_since))::float8 AS draining_since_secs
              FROM nodes n
-             LEFT JOIN (
-                 SELECT node_id, SUM(size_bytes)::bigint AS bytes
-                 FROM object_locations GROUP BY node_id
-             ) held ON held.node_id = n.id
              WHERE n.last_heartbeat > now() - make_interval(secs => $1)
                AND n.id <> ALL($2)
-               AND (NOT n.draining OR $4)
-             ORDER BY n.draining ASC, COALESCE(held.bytes, 0) ASC, n.id
-             LIMIT $3",
+               AND (NOT n.draining OR $3)",
         )
         .bind(stale_after_secs)
         .bind(exclude)
-        .bind(limit)
         .bind(include_draining)
         .fetch_all(self.pool())
-        .await?)
+        .await?;
+        let held = self.node_held_bytes().await?;
+        candidates.sort_by(|a, b| {
+            let a_bytes = held.get(&a.id).copied().unwrap_or(0);
+            let b_bytes = held.get(&b.id).copied().unwrap_or(0);
+            a.draining
+                .cmp(&b.draining)
+                .then_with(|| a_bytes.cmp(&b_bytes))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        candidates.truncate(limit.max(0) as usize);
+        Ok(candidates)
     }
 
     /// Recorded size of an object, if any copy is registered.
