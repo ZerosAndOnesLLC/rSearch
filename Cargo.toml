@@ -31,7 +31,7 @@ rsearch-ingest = { path = "crates/rsearch-ingest", version = "0.1.0" }
 rsearch-search = { path = "crates/rsearch-search", version = "0.1.0" }
 
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

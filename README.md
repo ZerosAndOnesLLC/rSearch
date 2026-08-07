@@ -203,6 +203,35 @@ percentiles, cardinality, …).
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
 
+### Loki-compatible API (Grafana Logs Drilldown)
+
+rSearch also speaks a subset of Loki's HTTP query API, so Grafana's
+built-in **Loki datasource** — and with it **Logs Drilldown** — works
+with no plugins: point a Loki datasource at the rSearch URL (Basic auth
+or an API key as a bearer credential) and browse.
+
+| Endpoint | Notes |
+|----------|-------|
+| `GET/POST /loki/api/v1/query_range` | log selectors → `streams`, metric queries → `matrix` |
+| `GET/POST /loki/api/v1/query` | instant queries |
+| `GET /loki/api/v1/labels`, `/label/{name}/values` | label discovery |
+| `GET/POST /loki/api/v1/series` | series matching |
+| `GET/POST /loki/api/v1/index/volume`, `/index/volume_range` | Drilldown's volume breakdowns |
+| `GET /loki/api/v1/tail` | WebSocket live tail (poll-backed) |
+| `GET /ready` | Loki readiness probe (open, like `/health`) |
+
+Model mapping: the `service_name` label is the stream name (every stream
+appears as a browsable service); other labels are the stream's
+keyword-mapped fields, with values served from terms aggregations
+(capped at 1000). A log line is the doc's `message` field, or the raw
+`_source` JSON when there is none.
+
+LogQL coverage is the subset Grafana sends: selectors with
+`=`, `!=`, `=~`, `!~`; line filters `|=` and `!=` (regex line filters
+return a clear error); `count_over_time` and `rate`, optionally wrapped
+in `sum` / `sum by (label)`. Like `/_msearch`, the Loki surface requires
+search-level auth with global stream access.
+
 `GET /metrics` serves Prometheus text format: ingest throughput and
 queue depth, WAL backlog (`rsearch_wal_outstanding_records` — watch this
 for restart-replay memory pressure), cluster node liveness/draining

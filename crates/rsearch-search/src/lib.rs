@@ -3,6 +3,7 @@
 
 mod error;
 mod executor;
+pub mod logql;
 mod query_dsl;
 
 pub use error::{SearchError, SearchResult};

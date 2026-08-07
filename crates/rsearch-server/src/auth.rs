@@ -168,9 +168,14 @@ enum Action {
 fn classify(method: &str, path: &str) -> Action {
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, segments.as_slice()) {
-        // Open surface: handshake, health, login.
+        // Open surface: handshake, health, login. `/ready` is the Loki
+        // readiness probe — health-equivalent, no data exposure.
         (_, [""]) | (_, ["health"]) | (_, ["_cluster", "health"]) => Action::Open,
+        (_, ["ready"]) => Action::Open,
         ("POST", ["_rsearch", "login"]) => Action::Open,
+        // Loki-compatible read API (#11): selectors may span any stream,
+        // so like /_msearch it needs global search access.
+        (_, ["loki", "api", "v1", ..]) => Action::Search(None),
         // Ingest
         ("POST", ["_bulk"]) => Action::Ingest(None),
         ("POST", [index, "_bulk"]) => Action::Ingest(Some(index.to_string())),
