@@ -22,13 +22,17 @@ const MAX_SAFE_MILLIS: i64 = i64::MAX / 1_000_000;
 /// Normalize an epoch number of unknown unit (secs, millis, micros, or
 /// nanos — shippers send all four) to clamped epoch milliseconds.
 pub fn epoch_to_millis(value: i64) -> i64 {
+    // Every branch flows through the clamp: tantivy multiplies millis by
+    // 1e6 to reach nanos, so anything past MAX_SAFE_MILLIS overflows i64
+    // there — a debug-build panic, silent garbage timestamps in release.
+    // The micros branch used to skip it (#22).
     let millis = match value.unsigned_abs() {
-        0..=99_999_999_999 => value,                       // seconds (to ~5138 AD)
-        100_000_000_000..=99_999_999_999_999 => return value.clamp(-MAX_SAFE_MILLIS, MAX_SAFE_MILLIS), // millis
-        100_000_000_000_000..=99_999_999_999_999_999 => return value / 1_000, // micros
-        _ => return value / 1_000_000,                     // nanos
+        0..=99_999_999_999 => value.saturating_mul(1000),  // seconds (to ~5138 AD)
+        100_000_000_000..=99_999_999_999_999 => value,     // millis
+        100_000_000_000_000..=99_999_999_999_999_999 => value / 1_000, // micros
+        _ => value / 1_000_000,                            // nanos
     };
-    millis.saturating_mul(1000).clamp(-MAX_SAFE_MILLIS, MAX_SAFE_MILLIS)
+    millis.clamp(-MAX_SAFE_MILLIS, MAX_SAFE_MILLIS)
 }
 
 fn parse_timestamp(value: &serde_json::Value) -> Option<tantivy::DateTime> {
@@ -274,6 +278,28 @@ mod tests {
             .unwrap();
         let secs = extract_timestamp(&serde_json::json!({"timestamp": 1_753_300_000})).unwrap();
         assert_eq!(millis, secs);
+    }
+
+    /// Every unit branch clamps to the tantivy-safe range; the micros
+    /// branch used to leak values whose nanos representation overflows
+    /// i64 (#22) — in debug builds `from_timestamp_millis` then panicked.
+    #[test]
+    fn out_of_range_epochs_clamp_in_every_unit() {
+        for value in [
+            99_999_999_999_i64,      // max seconds branch
+            99_999_999_999_999,      // max millis branch
+            99_999_999_999_999_999,  // max micros branch — the #22 overflow
+            17_865_684_004_574_505,  // truncated-nanos garbage seen in the wild
+            i64::MAX,                // max nanos branch
+        ] {
+            let millis = epoch_to_millis(value);
+            assert!(millis <= MAX_SAFE_MILLIS, "{value} -> {millis} exceeds safe range");
+            // The real failure mode: this multiply overflowed.
+            let _ = tantivy::DateTime::from_timestamp_millis(millis);
+            let neg = epoch_to_millis(-value);
+            assert!(neg >= -MAX_SAFE_MILLIS, "-{value} -> {neg} exceeds safe range");
+            let _ = tantivy::DateTime::from_timestamp_millis(neg);
+        }
     }
 
     #[test]
