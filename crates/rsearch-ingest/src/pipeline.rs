@@ -456,11 +456,26 @@ async fn flush(
     loop {
         attempt += 1;
         match flush_inner(inner, stream, stream_id, schema, batch).await {
-            Ok(split_id) => {
+            Ok(Some((split_id, indexed))) => {
                 inner.wal.confirm(&positions);
-                inner.metrics.docs_indexed.fetch_add(count, Ordering::Relaxed);
+                inner.metrics.docs_indexed.fetch_add(indexed, Ordering::Relaxed);
                 inner.metrics.splits_published.fetch_add(1, Ordering::Relaxed);
-                info!(stream, split_id = %split_id, docs = count, "split published");
+                if indexed < count {
+                    warn!(
+                        stream,
+                        skipped = count - indexed,
+                        "batch published without its invalid docs"
+                    );
+                }
+                info!(stream, split_id = %split_id, docs = indexed, "split published");
+                return;
+            }
+            Ok(None) => {
+                // Nothing in the batch was indexable. The docs are still
+                // processed: confirm their WAL entries so replay doesn't
+                // resurrect (and re-skip) them forever.
+                inner.wal.confirm(&positions);
+                warn!(stream, docs = count, "batch contained no indexable docs; dropped");
                 return;
             }
             Err((e, returned)) => {
@@ -483,57 +498,108 @@ async fn flush(
     }
 }
 
+/// Render a caught panic payload as a log-friendly message.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 /// Build → upload → stage → publish a batch. On error, returns the batch
 /// back alongside the error so the caller can retry (the split-building
-/// step is deterministic, so re-running it is safe).
+/// step is deterministic, so re-running it is safe). `Ok(None)` means the
+/// whole batch was skipped as invalid — nothing to publish, but the docs
+/// are processed and their WAL positions may confirm.
 async fn flush_inner(
     inner: &Arc<PipelineInner>,
     stream: &str,
     stream_id: i64,
     schema: &MappedSchema,
     batch: Vec<WorkItem>,
-) -> Result<String, (IngestError, Vec<WorkItem>)> {
+) -> Result<Option<(String, u64)>, (IngestError, Vec<WorkItem>)> {
     let schema = schema.clone();
     let stream_name = stream.to_string();
     let work_dir = inner.config.work_dir.clone();
     let budget = inner.config.memory_budget;
 
     // The blocking task always hands the batch back so a failed flush can
-    // be retried without having lost the documents.
+    // be retried without having lost the documents — including when the
+    // build panics (#23: the old JoinError path returned an empty batch,
+    // so the retry loop spun on "refusing to build an empty split"
+    // forever while the docs sat unconfirmed in the WAL).
     let (result, batch) = tokio::task::spawn_blocking(move || {
-        let build = (|| {
+        let build = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut builder = SplitBuilder::new(stream_name, schema, &work_dir, budget)?;
             let fallback = now_datetime();
             for item in &batch {
                 // Parse the source here, on the indexer thread — the queue
                 // only ever held the raw bytes.
-                match serde_json::from_str::<Value>(&item.source) {
-                    Ok(doc) => {
-                        builder.add_json_with_source(doc, Some(&item.source), fallback)?;
-                    }
+                let doc = match serde_json::from_str::<Value>(&item.source) {
+                    Ok(doc) => doc,
                     Err(e) => {
                         // Enqueued docs were validated, so this is unexpected;
                         // skip the bad doc rather than fail the whole batch.
                         tracing::warn!(error = %e, "skipping unparseable buffered doc");
+                        continue;
+                    }
+                };
+                // A poison doc must cost itself, not its stream (#23):
+                // doc-shaped failures — invalid-document errors and
+                // conversion panics — skip the doc; backend errors still
+                // fail the batch for retry. AssertUnwindSafe: on the
+                // batch-failure paths the builder is discarded and every
+                // retry starts from a fresh one, so a builder corrupted
+                // by an unwound panic can at worst fail this attempt.
+                let added = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    builder.add_json_with_source(doc, Some(&item.source), fallback)
+                }));
+                match added {
+                    Ok(Ok(())) => {}
+                    Ok(Err(rsearch_index::IndexError::InvalidDocument(reason))) => {
+                        tracing::warn!(reason, "skipping invalid buffered doc");
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(panic) => {
+                        tracing::warn!(
+                            panic = panic_message(panic.as_ref()),
+                            "skipping doc that panicked the indexer"
+                        );
                     }
                 }
             }
-            builder.finish()
-        })();
-        (build, batch)
+            if builder.doc_count() == 0 {
+                // Every doc was skipped: nothing to publish, but the batch
+                // is done — it must not retry (finish() on an empty
+                // builder is an error) and its WAL entries must confirm.
+                return Ok(None);
+            }
+            let indexed = builder.doc_count();
+            builder.finish().map(|packaged| Some((packaged, indexed)))
+        }));
+        let result = match build {
+            Ok(result) => result,
+            Err(panic) => Err(rsearch_index::IndexError::InvalidDocument(format!(
+                "indexing task panicked: {}",
+                panic_message(panic.as_ref())
+            ))),
+        };
+        (result, batch)
     })
     .await
     .map_err(|e| {
         (
             IngestError::Index(rsearch_index::IndexError::InvalidDocument(format!(
-                "indexing task panicked: {e}"
+                "indexing task aborted: {e}"
             ))),
             Vec::new(),
         )
     })?;
 
-    let packaged = match result {
-        Ok(packaged) => packaged,
+    let (packaged, indexed) = match result {
+        Ok(Some((packaged, indexed))) => (packaged, indexed),
+        Ok(None) => return Ok(None),
         Err(e) => return Err((IngestError::Index(e), batch)),
     };
 
@@ -561,5 +627,5 @@ async fn flush_inner(
     if let Err(e) = inner.metastore.publish_split(&packaged.meta.split_id).await {
         return Err((IngestError::Metastore(e), batch));
     }
-    Ok(packaged.meta.split_id)
+    Ok(Some((packaged.meta.split_id, indexed)))
 }
