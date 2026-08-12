@@ -12,6 +12,7 @@ mod internal_api;
 mod loki_api;
 mod metrics;
 mod placement;
+mod reconcile;
 mod routes;
 mod search_api;
 mod state;
@@ -117,42 +118,17 @@ async fn main() -> anyhow::Result<()> {
             }
             let ca = (!config.cluster.peer_ca_file.is_empty())
                 .then_some(config.cluster.peer_ca_file.as_str());
-            // Re-announce local files whose keys the placement table still
-            // knows: a node rejoining after registry expiry has real
-            // copies on disk but may have lost its rows. The if-known
-            // guard means cluster-deleted objects are never resurrected.
-            {
-                let fs = rsearch_storage::FsStorage::new(config.storage.root.clone());
-                let metastore = metastore.clone();
-                let node_id = config.node_id();
-                tokio::spawn(async move {
-                    use rsearch_storage::Storage;
-                    let keys = match fs.list("").await {
-                        Ok(keys) => keys,
-                        Err(e) => {
-                            warn!(error = %e, "rejoin scan: listing local objects failed");
-                            return;
-                        }
-                    };
-                    let mut announced = 0u64;
-                    for key in keys {
-                        let Ok(size) = fs.size(&key).await else { continue };
-                        match metastore
-                            .record_object_location_if_known(&key, &node_id, size as i64)
-                            .await
-                        {
-                            Ok(true) => announced += 1,
-                            Ok(false) => {}
-                            Err(e) => {
-                                warn!(key, error = %e, "rejoin scan: record failed");
-                            }
-                        }
-                    }
-                    if announced > 0 {
-                        info!(announced, "rejoin scan: re-announced local object copies");
-                    }
-                });
-            }
+            // Reconcile local files with the metastore, at startup and
+            // periodically: re-announce copies the placement table still
+            // knows (a node rejoining after registry expiry has real
+            // copies on disk but may have lost its rows) and delete
+            // orphaned files whose splits were GC'd while this node was
+            // unreachable (#16).
+            reconcile::spawn(
+                rsearch_storage::FsStorage::new(config.storage.root.clone()),
+                metastore.clone(),
+                config.node_id(),
+            );
             std::sync::Arc::new(rsearch_storage::ReplicatedStorage::new(
                 rsearch_storage::FsStorage::new(config.storage.root.clone()),
                 std::sync::Arc::new(placement::MetastorePlacement::new(metastore.clone())),

@@ -147,6 +147,17 @@ fn sweep_temp_files(dir: &Path) {
 }
 
 impl FsStorage {
+    /// Last-modification time of an object file. Used by the local
+    /// reconcile sweep as a deletion grace: a freshly received object may
+    /// not have its placement row yet and must not be treated as an
+    /// orphan.
+    pub async fn modified(&self, key: &str) -> StorageResult<std::time::SystemTime> {
+        let path = self.resolve(key)?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| Self::io_err(key, e))?;
+        meta.modified().map_err(|e| Self::io_err(key, e))
+    }
 
     /// Atomic streamed write for peer transfers: chunks land in a temp
     /// sibling, fsync, rename, parent fsync — same durability discipline

@@ -52,6 +52,23 @@ impl Metastore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Whether the cluster still tracks `storage_key` at all — any
+    /// placement row *or* split row referencing it counts. Deliberately
+    /// broader than the `if_known` insert guard above: this gates local
+    /// file deletion in the orphan reconcile sweep (#16), where a split
+    /// row without location rows (however it arose) must protect the last
+    /// physical copy rather than let it be swept.
+    pub async fn object_known(&self, storage_key: &str) -> MetastoreResult<bool> {
+        let known: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM object_locations WHERE storage_key = $1)
+                 OR EXISTS (SELECT 1 FROM splits WHERE storage_key = $1)",
+        )
+        .bind(storage_key)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(known)
+    }
+
     /// Remove one node's copy record for an object.
     pub async fn remove_object_location(
         &self,
