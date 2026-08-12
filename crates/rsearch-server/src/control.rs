@@ -548,10 +548,12 @@ impl ControlPlane {
         }
         let Some((stream_id, group)) = by_stream
             .into_iter()
-            .find(|(_, group)| group.len() >= 2)
-            .map(|(id, group)| {
-                let take = group.len().min(self.config.merge_max_group);
-                (id, group[..take].to_vec())
+            .find_map(|(id, group)| {
+                let group = merge_candidates(group);
+                (group.len() >= 2).then(|| {
+                    let take = group.len().min(self.config.merge_max_group);
+                    (id, group[..take].to_vec())
+                })
             })
         else {
             return Ok(());
@@ -681,5 +683,125 @@ impl ControlPlane {
             }
         }
         Ok(())
+    }
+}
+
+/// A split whose size exceeds this many times the combined size of every
+/// smaller merge candidate in its stream is left out of the merge group.
+const MERGE_SKEW_FACTOR: i64 = 10;
+
+/// Drop dominant splits from a stream's merge group (#15). Merging is a
+/// full rewrite of every source, so folding a trickle of tiny splits into
+/// one dominant under-threshold split re-wrote its bytes every tick —
+/// quadratic write amplification (plus re-replication, GC churn, and
+/// cache pressure) until it finally crossed `merge_min_mb`. Excluding a
+/// split that is more than [`MERGE_SKEW_FACTOR`]× the sum of its smaller
+/// peers lets the small splits merge among themselves; the dominant one
+/// rejoins once they have accumulated to comparable size, so each byte is
+/// rewritten O(log) times instead of every tick. Relative (time) order of
+/// the survivors is preserved to keep merged time ranges tight.
+fn merge_candidates(group: Vec<&SplitRecord>) -> Vec<&SplitRecord> {
+    let mut by_size: Vec<i64> = group.iter().map(|s| s.size_bytes).collect();
+    by_size.sort_unstable_by_key(|size| std::cmp::Reverse(*size));
+    // Find the largest suffix of the size-ranked list where no split
+    // dominates the rest; everything ranked above it is excluded. The
+    // last-ranked split is never tested — any size "dominates" an empty
+    // rest, and a lone survivor is already too small a group to merge.
+    let mut cut = 0;
+    for i in 0..by_size.len().saturating_sub(1) {
+        let rest: i64 = by_size[i + 1..].iter().sum();
+        if by_size[i] > MERGE_SKEW_FACTOR.saturating_mul(rest) {
+            cut = i + 1;
+        } else {
+            break;
+        }
+    }
+    if cut == 0 {
+        return group;
+    }
+    let threshold = by_size[cut - 1];
+    // Exclude by size threshold: `cut` splits are >= threshold in rank
+    // order, and ties at the threshold can only make the group more
+    // balanced, so a strict comparison keeps exactly the survivors.
+    group
+        .into_iter()
+        .filter(|s| s.size_bytes < threshold)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(id: i64, size_bytes: i64) -> SplitRecord {
+        SplitRecord {
+            id,
+            split_id: format!("split-{id}"),
+            stream_id: 1,
+            state: "published".to_string(),
+            storage_key: format!("streams/test/{id}.split"),
+            doc_count: size_bytes / 100,
+            size_bytes,
+            time_start_millis: id * 1_000,
+            time_end_millis: id * 1_000 + 999,
+            footer_len: 0,
+            created_by: None,
+        }
+    }
+
+    fn candidate_ids(splits: &[SplitRecord]) -> Vec<i64> {
+        merge_candidates(splits.iter().collect())
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
+    #[test]
+    fn dominant_split_is_left_out() {
+        // The #15 pathology: a 52 MB split plus one trickle split must
+        // not merge — the survivor group is too small to act on.
+        let splits = [split(1, 52 << 20), split(2, 4 << 10)];
+        assert_eq!(candidate_ids(&splits), vec![2]);
+    }
+
+    #[test]
+    fn tiny_splits_merge_among_themselves() {
+        let splits = [
+            split(1, 52 << 20),
+            split(2, 4 << 10),
+            split(3, 6 << 10),
+            split(4, 5 << 10),
+        ];
+        // The giant stays out; the trickle splits keep their time order.
+        assert_eq!(candidate_ids(&splits), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn comparable_splits_all_merge() {
+        let splits = [split(1, 10 << 20), split(2, 8 << 20), split(3, 52 << 20)];
+        assert_eq!(candidate_ids(&splits), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn dominant_rejoins_once_peers_accumulate() {
+        // 5 MB of accumulated smalls x 10 >= 50 MB giant: full merge.
+        let splits = [split(1, 50 << 20), split(2, 3 << 20), split(3, 2 << 20)];
+        assert_eq!(candidate_ids(&splits), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cascading_dominance_is_cut_at_the_right_rank() {
+        // 100 MB dominates (1 MB + 1 KB); 1 MB dominates 1 KB alone —
+        // both are excluded, leaving too few to merge.
+        let splits = [split(1, 100 << 20), split(2, 1 << 20), split(3, 1 << 10)];
+        assert_eq!(candidate_ids(&splits), vec![3]);
+    }
+
+    #[test]
+    fn single_split_passes_through() {
+        // A lone split survives the filter; the caller's >= 2 group-size
+        // check is what keeps it from merging with itself.
+        let splits = [split(1, 1 << 20)];
+        assert_eq!(candidate_ids(&splits), vec![1]);
     }
 }
