@@ -24,6 +24,14 @@ const DRAIN_BATCHES_PER_TICK: usize = 10;
 /// How often the full under-replication scan must run even with no
 /// membership change — catches writes that never reached the factor.
 const REPAIR_FULL_SCAN_SECS: u64 = 300;
+/// Liveness-sensitive jobs (merge, repair, drain) wait this long after
+/// leadership is acquired. On a cluster-wide cold start the winner's first
+/// tick otherwise races the peers' registration: their heartbeat rows are
+/// still stale, so objects they hold look unavailable — merges fail with
+/// "object not found" and repair logs false "no live holder" alarms that
+/// read exactly like data loss (#17). Peers heartbeat every 5s, so a few
+/// multiples of that settles the membership view.
+const LEADERSHIP_GRACE_SECS: u64 = 15;
 
 pub struct ControlPlane {
     metastore: Metastore,
@@ -123,8 +131,9 @@ impl ControlPlane {
             };
             info!(node = %self.node_id, "acquired control leadership");
             self.metrics.leader.store(true, std::sync::atomic::Ordering::Relaxed);
+            let leader_since = std::time::Instant::now();
             loop {
-                self.tick().await;
+                self.tick(leader_since).await;
                 tokio::time::sleep(Duration::from_secs(self.config.interval_secs)).await;
                 if !Metastore::leadership_alive(&mut leader_conn).await {
                     warn!("leadership connection lost; abdicating");
@@ -140,8 +149,19 @@ impl ControlPlane {
         }
     }
 
-    async fn tick(&self) {
-        if let Err(e) = self.merge_job().await {
+    async fn tick(&self, leader_since: std::time::Instant) {
+        // Jobs that read peer liveness wait out the registration race on
+        // a fresh leadership (#17); time-based jobs (retention, GC,
+        // orphan sweeps, alerts) don't depend on the membership view and
+        // run from the first tick.
+        let settled = leader_since.elapsed().as_secs() >= LEADERSHIP_GRACE_SECS;
+        if !settled {
+            info!(
+                grace_secs = LEADERSHIP_GRACE_SECS,
+                "fresh leadership: deferring merge/repair/drain until peers heartbeat"
+            );
+        }
+        if settled && let Err(e) = self.merge_job().await {
             error!(error = %e, "merge job failed");
         }
         if let Err(e) = self.retention_job().await {
@@ -156,10 +176,10 @@ impl ControlPlane {
         if let Err(e) = self.metastore.expire_dead_nodes(3600.0).await {
             error!(error = %e, "node expiry failed");
         }
-        if let Err(e) = self.repair_job().await {
+        if settled && let Err(e) = self.repair_job().await {
             error!(error = %e, "repair job failed");
         }
-        if let Err(e) = self.drain_job().await {
+        if settled && let Err(e) = self.drain_job().await {
             error!(error = %e, "drain job failed");
         }
         if let Err(e) = self.alert_job().await {
