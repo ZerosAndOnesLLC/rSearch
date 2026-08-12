@@ -192,17 +192,37 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Search role: split cache + stateless search service.
+    // One split cache per node, shared by the search and control roles:
+    // cache_max_mb is the node's whole budget, so two roles must not each
+    // claim it in full (issue #18). Sharing also lets control-side merge
+    // reads warm the cache search serves from.
+    let split_cache = if roles.contains(&Role::Search) || roles.contains(&Role::Control) {
+        let cache_dir = PathBuf::from(&config.node.data_dir).join("cache");
+        // Earlier releases gave control its own budget-sized cache here;
+        // reclaim the dead directory rather than let it sit at up to a
+        // full cache_max_mb of disk.
+        match std::fs::remove_dir_all(cache_dir.join("control")) {
+            Ok(()) => info!("removed legacy control split cache"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(error = %e, "removing legacy control split cache failed"),
+        }
+        Some(std::sync::Arc::new(
+            rsearch_index::SplitCache::new(
+                cache_dir.join("splits"),
+                config.search.cache_max_mb << 20,
+            )
+            .context("initializing split cache")?,
+        ))
+    } else {
+        None
+    };
+
+    // Search role: stateless search service over the shared cache.
     let search = if roles.contains(&Role::Search) {
-        let cache = rsearch_index::SplitCache::new(
-            PathBuf::from(&config.node.data_dir).join("cache/splits"),
-            config.search.cache_max_mb << 20,
-        )
-        .context("initializing split cache")?;
         Some(std::sync::Arc::new(rsearch_search::SearchService::new(
             metastore.clone(),
             storage.clone(),
-            std::sync::Arc::new(cache),
+            split_cache.clone().expect("split cache exists for search role"),
         )))
     } else {
         None
@@ -216,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
             &config,
             metastore.clone(),
             storage.clone(),
+            split_cache.clone().expect("split cache exists for control role"),
             metrics.clone(),
         )
         .context("initializing control plane")?;
