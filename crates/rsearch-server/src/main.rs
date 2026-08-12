@@ -62,9 +62,29 @@ async fn main() -> anyhow::Result<()> {
         "starting rsearch"
     );
 
-    let metastore = Metastore::connect(&config.metastore)
-        .await
-        .context("connecting to metastore")?;
+    // An unreachable metastore at startup is retried in-process instead
+    // of exiting: a fatal exit turns any Postgres blip or slow dependency
+    // start into a docker-level crash loop, and after a host reboot the
+    // whole cluster stays down until an operator intervenes (#14). A
+    // genuinely wrong DATABASE_URL surfaces as this same warning
+    // repeating — the error text carries the cause either way.
+    let metastore = {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            match Metastore::connect(&config.metastore).await {
+                Ok(metastore) => break metastore,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        retry_in_secs = delay.as_secs(),
+                        "connecting to metastore failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    };
     let storage: std::sync::Arc<dyn rsearch_storage::Storage> =
         if config.storage.backend == "replicated" {
             if config.cluster.internal_token.is_empty() {
