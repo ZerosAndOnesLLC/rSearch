@@ -6,6 +6,7 @@ mod alerts_api;
 mod auth;
 mod auth_api;
 mod bulk_api;
+mod bulk_forward;
 mod control;
 mod internal_api;
 mod loki_api;
@@ -302,6 +303,24 @@ async fn main() -> anyhow::Result<()> {
     let mut state = AppState::new(&config, &roles, metastore, pipeline, search);
     state.draining = draining_flag;
     state.control = control_metrics;
+    // Bulk handoff between ingest peers needs the cluster token both to
+    // authenticate outbound handoffs and to verify inbound ones; without
+    // a token the node simply indexes everything it receives itself.
+    if roles.contains(&Role::Ingest) && !config.cluster.internal_token.is_empty() {
+        state.bulk_forward = Some(std::sync::Arc::new(bulk_forward::BulkForwarder::new(
+            state.metastore.clone(),
+            rsearch_storage::PeerClient::new(
+                &config.cluster.internal_token,
+                (!config.cluster.peer_ca_file.is_empty())
+                    .then_some(config.cluster.peer_ca_file.as_str()),
+            )
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("building bulk handoff peer client")?,
+            config.node_id(),
+            rsearch_common::crypto::token_digest(&config.cluster.internal_token),
+            config.ingest.balance_bulk,
+        )));
+    }
     if config.storage.backend == "replicated" {
         state.internal = Some(std::sync::Arc::new(internal_api::InternalState {
             fs: rsearch_storage::FsStorage::new(config.storage.root.clone()),

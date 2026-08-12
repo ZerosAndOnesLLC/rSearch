@@ -1,12 +1,16 @@
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{Value, json};
 
+use rsearch_common::crypto;
 use rsearch_ingest::{BulkParseOutcome, IngestError, parse_bulk_body};
+use rsearch_storage::INTERNAL_TOKEN_HEADER;
+use tracing::warn;
 
 use crate::state::AppState;
 
@@ -22,9 +26,44 @@ pub async fn bulk_index(
     handle_bulk(state, Some(index), body).await
 }
 
+#[derive(serde::Deserialize)]
+pub struct InternalBulkQuery {
+    index: Option<String>,
+}
+
+/// Receive a batch handed off by a peer (#19). Authenticated by the
+/// cluster token like the internal object API; always indexes locally —
+/// a handed-off batch is never re-forwarded, so no hop loops.
+pub async fn bulk_internal(
+    State(state): State<AppState>,
+    Query(query): Query<InternalBulkQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let Some(forwarder) = state.bulk_forward.clone() else {
+        return error_response(StatusCode::NOT_FOUND, "bulk handoff not enabled");
+    };
+    let presented = headers
+        .get(INTERNAL_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if presented.is_empty() || crypto::token_digest(presented) != forwarder.token_digest {
+        return (StatusCode::UNAUTHORIZED, "invalid cluster token").into_response();
+    }
+    if state.draining.load(Ordering::Relaxed) {
+        // A peer picked this node before the drain reached the registry;
+        // the 503 makes the sender fall back to indexing locally.
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node is draining; index this batch elsewhere",
+        );
+    }
+    forwarder.received.fetch_add(1, Ordering::Relaxed);
+    handle_bulk_local(state, query.index, body).await
+}
+
 async fn handle_bulk(state: AppState, default_index: Option<String>, body: String) -> Response {
-    let started = Instant::now();
-    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+    if state.draining.load(Ordering::Relaxed) {
         // Draining: refuse new writes so the WAL empties out before
         // shutdown; shippers retry against another ingest node.
         return error_response(
@@ -32,6 +71,57 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
             "node is draining; send bulk traffic to another ingest node",
         );
     }
+    if state.pipeline.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "this node does not run the ingest role",
+        );
+    }
+    // Server-side balancing (#19): shippers pin keep-alive connections to
+    // one node, so spread whole batches round-robin across live ingest
+    // peers. The ack then comes from the target's WAL. Any handoff
+    // failure falls back to local indexing — like shipper retries after a
+    // timeout, that is at-least-once, never lost.
+    if let Some(forwarder) = state.bulk_forward.clone()
+        && let Some((peer_id, peer_addr)) = forwarder.pick_target().await
+    {
+        match forwarder
+            .forward(&peer_addr, default_index.as_deref(), body.clone().into())
+            .await
+        {
+            // Relay only a peer 2xx (its per-item results). Anything else
+            // — refused (draining, saturated), failed, or a peer version
+            // without the endpoint — falls through to local indexing,
+            // which reproduces the right client-facing outcome itself.
+            Ok((status, response)) if (200..300).contains(&status) => {
+                forwarder.forwarded.fetch_add(1, Ordering::Relaxed);
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                return (
+                    status,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    response,
+                )
+                    .into_response();
+            }
+            Ok((status, _)) => {
+                forwarder.forward_fallbacks.fetch_add(1, Ordering::Relaxed);
+                warn!(peer = %peer_id, status, "bulk handoff refused; indexing locally");
+            }
+            Err(e) => {
+                forwarder.forward_fallbacks.fetch_add(1, Ordering::Relaxed);
+                warn!(peer = %peer_id, error = %e, "bulk handoff failed; indexing locally");
+            }
+        }
+    }
+    handle_bulk_local(state, default_index, body).await
+}
+
+async fn handle_bulk_local(
+    state: AppState,
+    default_index: Option<String>,
+    body: String,
+) -> Response {
+    let started = Instant::now();
     let Some(pipeline) = state.pipeline.clone() else {
         return error_response(
             StatusCode::BAD_REQUEST,
