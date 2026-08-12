@@ -319,4 +319,38 @@ impl PeerClient {
         })
         .await
     }
+
+    /// POST a raw body to an already-built internal URL on a peer and
+    /// return `(status, response bytes)` verbatim — unlike [`send`], no
+    /// status is treated as an error, so a proxying caller (bulk handoff)
+    /// can relay the peer's real response to its own client.
+    pub async fn post_raw(&self, url: &str, body: Bytes) -> StorageResult<(u16, Bytes)> {
+        let uri: hyper::Uri = url.parse().map_err(|e| StorageError::Backend {
+            key: String::new(),
+            message: format!("building peer uri '{url}': {e}"),
+        })?;
+        let request = self.request("POST", uri, full_body(body))?;
+        Self::bounded("", TRANSFER_TIMEOUT, async {
+            let response =
+                self.client
+                    .request(request)
+                    .await
+                    .map_err(|e| StorageError::Backend {
+                        key: String::new(),
+                        message: format!("peer request failed: {e}"),
+                    })?;
+            let status = response.status().as_u16();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| StorageError::Backend {
+                    key: String::new(),
+                    message: format!("reading peer response: {e}"),
+                })?
+                .to_bytes();
+            Ok((status, bytes))
+        })
+        .await
+    }
 }

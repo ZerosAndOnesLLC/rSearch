@@ -137,6 +137,15 @@ pub fn router(state: AppState) -> Router {
     } else {
         router
     };
+    // Same for the bulk handoff receiver (#19).
+    let router = if state.bulk_forward.is_some() {
+        router.route(
+            "/_rsearch/internal/bulk",
+            post(bulk_api::bulk_internal).layer(DefaultBodyLimit::max(BULK_BODY_LIMIT)),
+        )
+    } else {
+        router
+    };
     router.with_state(state)
 }
 
@@ -216,9 +225,17 @@ async fn node_stats(State(state): State<AppState>) -> Json<Value> {
             "wal_segments": p.wal().segment_count(),
         })
     });
+    let bulk_balance = state.bulk_forward.as_ref().map(|f| {
+        json!({
+            "forwarded": f.forwarded.load(Ordering::Relaxed),
+            "forward_fallbacks": f.forward_fallbacks.load(Ordering::Relaxed),
+            "received": f.received.load(Ordering::Relaxed),
+        })
+    });
     Json(json!({
         "node": state.node_id,
         "ingest": ingest,
+        "bulk_balance": bulk_balance,
     }))
 }
 

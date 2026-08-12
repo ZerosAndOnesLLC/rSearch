@@ -367,6 +367,12 @@ pub struct IngestConfig {
     pub memory_budget_mb: usize,
     /// WAL segment rotation size, in megabytes.
     pub wal_segment_mb: u64,
+    /// Spread `/_bulk` batches round-robin across live ingest peers
+    /// instead of indexing every batch on the node the client happens to
+    /// hold a connection to. Takes effect only when
+    /// `cluster.internal_token` is set (the handoff authenticates with
+    /// it); with no token or no live peers, batches stay local.
+    pub balance_bulk: bool,
 }
 
 impl Default for IngestConfig {
@@ -377,6 +383,7 @@ impl Default for IngestConfig {
             queue_capacity: 100_000,
             memory_budget_mb: 256,
             wal_segment_mb: 64,
+            balance_bulk: true,
         }
     }
 }
