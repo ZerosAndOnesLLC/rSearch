@@ -27,6 +27,9 @@ x-rsearch-node: &rsearch-node
 services:
   postgres:
     image: postgres:17-alpine
+    # Same policy as the nodes: without it a docker-daemon restart (host
+    # reboot) leaves the metastore down while every node crash-loops (#14).
+    restart: unless-stopped
     environment:
       POSTGRES_USER: rsearch
       POSTGRES_PASSWORD: rsearch
@@ -39,6 +42,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data
     environment:
       MINIO_ROOT_USER: minioadmin
