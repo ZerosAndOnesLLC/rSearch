@@ -23,9 +23,15 @@ sqlx migrate run --source crates/rsearch-metastore/migrations   # against dev PG
 ./tests/cluster/run-ha-compose-test.sh       # replicated backend, containers
 ```
 
-Release builds of the FIPS module require CMake, Go, and **clang**
-(`CC=clang CXX=clang++ cargo build --release`) — newer GCC is rejected by
-the aws-lc delocator.
+Release builds of the FIPS module require CMake, Go, and a C toolchain.
+Since aws-lc-fips-sys 0.14 (aws-lc-rs 1.18), GCC 15 works; on older
+lockfiles the 0.13.x delocator rejects newer GCC — build with
+`CC=clang CXX=clang++` there.
+
+`tests/cluster/run-ha-compose-test.sh` runs `docker compose down -v` on
+the `rsearch-ha` project — never run it on a machine whose live cluster
+uses that project name (it wipes the data volumes); use a throwaway host
+or rename the project first.
 
 ## Publish (dependency order)
 

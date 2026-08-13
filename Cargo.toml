@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -23,12 +23,12 @@ keywords = ["search", "logging", "opensearch", "loki", "fips"]
 categories = ["database-implementations", "text-processing"]
 
 [workspace.dependencies]
-rsearch-common = { path = "crates/rsearch-common", version = "0.1.0" }
-rsearch-storage = { path = "crates/rsearch-storage", version = "0.1.0" }
-rsearch-index = { path = "crates/rsearch-index", version = "0.1.0" }
-rsearch-metastore = { path = "crates/rsearch-metastore", version = "0.1.0" }
-rsearch-ingest = { path = "crates/rsearch-ingest", version = "0.1.0" }
-rsearch-search = { path = "crates/rsearch-search", version = "0.1.0" }
+rsearch-common = { path = "crates/rsearch-common", version = "0.2.0" }
+rsearch-storage = { path = "crates/rsearch-storage", version = "0.2.0" }
+rsearch-index = { path = "crates/rsearch-index", version = "0.2.0" }
+rsearch-metastore = { path = "crates/rsearch-metastore", version = "0.2.0" }
+rsearch-ingest = { path = "crates/rsearch-ingest", version = "0.2.0" }
+rsearch-search = { path = "crates/rsearch-search", version = "0.2.0" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -51,7 +51,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 url = "2"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
-lru = "0.12"
+lru = "0.18"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 async-trait = "0.1"
 bytes = "1"
