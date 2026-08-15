@@ -24,7 +24,9 @@ use rsearch_metastore::Metastore;
 use rsearch_storage::Storage;
 
 use crate::error::{SearchError, SearchResult};
-use crate::query_dsl::{extract_time_bounds, rewrite_agg_fields, translate_query};
+use crate::query_dsl::{
+    extract_time_bounds, fix_date_histogram_keys, rewrite_agg_fields, translate_query,
+};
 
 const TIMESTAMP_ALIASES: [&str; 3] = ["@timestamp", "timestamp", "_timestamp"];
 /// Cap on cached open split readers (LRU), across all shards.
@@ -443,8 +445,13 @@ impl SearchService {
                     ),
                     None => None,
                 };
-                final_result
-                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+                final_result.map(|r| {
+                    let mut value = serde_json::to_value(r).unwrap_or(Value::Null);
+                    if let Some(request) = &aggs_json {
+                        fix_date_histogram_keys(request, &mut value);
+                    }
+                    value
+                })
             }
             _ => None,
         };

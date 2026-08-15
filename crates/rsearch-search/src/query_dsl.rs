@@ -83,6 +83,65 @@ pub fn rewrite_agg_fields(schema: &MappedSchema, aggs: &Value) -> Value {
     }
 }
 
+/// Tantivy serializes every histogram bucket key as a JSON float, but
+/// Elasticsearch returns integer epoch millis for `date_histogram` — and
+/// clients that read the key with `as_i64()` see every bucket as missing
+/// otherwise (issue #32). Walk the final aggregation response alongside
+/// the aggs request and convert whole-number `date_histogram` keys to
+/// integers. Plain `histogram` keys stay doubles, matching ES.
+pub fn fix_date_histogram_keys(aggs_request: &Value, response: &mut Value) {
+    let Some(requests) = aggs_request.as_object() else {
+        return;
+    };
+    for (name, spec) in requests {
+        let (Some(spec), Some(result)) = (spec.as_object(), response.get_mut(name)) else {
+            continue;
+        };
+        let is_date_histogram = spec.contains_key("date_histogram");
+        let sub_aggs = spec.get("aggs").or_else(|| spec.get("aggregations"));
+        let buckets: Option<Vec<&mut Value>> = match result.get_mut("buckets") {
+            Some(Value::Array(items)) => Some(items.iter_mut().collect()),
+            // Keyed buckets (e.g. `filters`, keyed ranges) come back as an
+            // object of name -> bucket.
+            Some(Value::Object(map)) => Some(map.values_mut().collect()),
+            _ => None,
+        };
+        match buckets {
+            Some(buckets) => {
+                for bucket in buckets {
+                    if is_date_histogram
+                        && let Some(key) = bucket.get_mut("key")
+                        && let Some(millis) = float_as_exact_i64(key)
+                    {
+                        *key = Value::from(millis);
+                    }
+                    if let Some(sub) = sub_aggs {
+                        fix_date_histogram_keys(sub, bucket);
+                    }
+                }
+            }
+            // Single-bucket aggs (e.g. `filter`) nest sub-agg results
+            // directly on the result object.
+            None => {
+                if let Some(sub) = sub_aggs {
+                    fix_date_histogram_keys(sub, result);
+                }
+            }
+        }
+    }
+}
+
+/// A JSON float's value as i64, when it is whole and exactly
+/// representable (within 2^53). Values already serialized as integers
+/// return `None` — nothing to rewrite.
+fn float_as_exact_i64(value: &Value) -> Option<i64> {
+    if value.is_i64() || value.is_u64() {
+        return None;
+    }
+    let f = value.as_f64()?;
+    (f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0).then_some(f as i64)
+}
+
 /// Parse a timestamp literal (RFC 3339, epoch secs/millis, or "now").
 fn parse_time_millis(value: &Value) -> Option<i64> {
     match value {
@@ -707,5 +766,73 @@ mod tests {
             "_dynamic.level"
         );
         assert_eq!(rewritten["by_service"]["terms"]["field"], "service");
+    }
+
+    #[test]
+    fn date_histogram_keys_become_integers() {
+        // Tantivy emits float keys; ES clients read them as i64 (#32).
+        let aggs = serde_json::json!({
+            "hist": {
+                "date_histogram": {"field": "_timestamp", "fixed_interval": "1h"},
+                "aggs": {"levels": {"terms": {"field": "level", "size": 20}}}
+            }
+        });
+        let mut response = serde_json::json!({
+            "hist": {"buckets": [
+                {"key": 1_786_669_200_000.0_f64, "key_as_string": "2026-08-14T01:00:00Z",
+                 "doc_count": 2_190_507,
+                 "levels": {"buckets": [{"key": "info", "doc_count": 5}]}},
+                {"key": 1_786_672_800_000.0_f64, "doc_count": 3},
+            ]}
+        });
+        fix_date_histogram_keys(&aggs, &mut response);
+        let buckets = response["hist"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets[0]["key"].as_i64(), Some(1_786_669_200_000));
+        assert_eq!(buckets[1]["key"].as_i64(), Some(1_786_672_800_000));
+        // Sub-agg terms keys untouched.
+        assert_eq!(buckets[0]["levels"]["buckets"][0]["key"], "info");
+        assert_eq!(
+            serde_json::to_string(&buckets[0]["key"]).unwrap(),
+            "1786669200000"
+        );
+    }
+
+    #[test]
+    fn plain_histogram_keys_stay_floats() {
+        // ES returns doubles for numeric `histogram`; only date_histogram
+        // keys are converted.
+        let aggs = serde_json::json!({
+            "sizes": {"histogram": {"field": "bytes", "interval": 100}}
+        });
+        let mut response = serde_json::json!({
+            "sizes": {"buckets": [{"key": 200.0_f64, "doc_count": 1}]}
+        });
+        fix_date_histogram_keys(&aggs, &mut response);
+        assert!(response["sizes"]["buckets"][0]["key"].is_f64());
+    }
+
+    #[test]
+    fn date_histogram_under_single_bucket_agg_is_fixed() {
+        // A `filter` agg nests sub-agg results directly on its object —
+        // the walk must still reach the date_histogram inside it.
+        let aggs = serde_json::json!({
+            "errors": {
+                "filter": {"term": {"level": "error"}},
+                "aggs": {"hist": {
+                    "date_histogram": {"field": "_timestamp", "fixed_interval": "1h"}
+                }}
+            }
+        });
+        let mut response = serde_json::json!({
+            "errors": {
+                "doc_count": 7,
+                "hist": {"buckets": [{"key": 1_786_669_200_000.0_f64, "doc_count": 7}]}
+            }
+        });
+        fix_date_histogram_keys(&aggs, &mut response);
+        assert_eq!(
+            response["errors"]["hist"]["buckets"][0]["key"].as_i64(),
+            Some(1_786_669_200_000)
+        );
     }
 }
