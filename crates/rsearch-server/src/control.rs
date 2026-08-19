@@ -159,6 +159,12 @@ impl ControlPlane {
         if settled && let Err(e) = self.merge_job().await {
             error!(error = %e, "merge job failed");
         }
+        if settled && let Err(e) = self.compaction_job().await {
+            error!(error = %e, "compaction job failed");
+        }
+        if let Err(e) = self.tombstone_purge_job().await {
+            error!(error = %e, "tombstone purge failed");
+        }
         if let Err(e) = self.retention_job().await {
             error!(error = %e, "retention job failed");
         }
@@ -575,14 +581,71 @@ impl ControlPlane {
         };
 
         let stream = self.metastore.get_stream_by_id(stream_id).await?;
-        let mapping = IndexMapping::from_json(&stream.mapping).unwrap_or_default();
-        let schema = MappedSchema::build(mapping);
         info!(
             stream = %stream.name,
             splits = group.len(),
             docs = group.iter().map(|s| s.doc_count).sum::<i64>(),
             "merging small splits"
         );
+        // A merge is also a compaction: document-mode streams drop their
+        // tombstoned versions on the way through.
+        let tombstones = self.stream_tombstones(&stream).await?;
+        let group_refs: Vec<&SplitRecord> = group.to_vec();
+        let rebuilt = self.rebuild_splits(&stream, &group_refs, &tombstones).await?;
+        match rebuilt {
+            Some(new_split_id) => info!(
+                merged_into = %new_split_id,
+                sources = group.len(),
+                "merge complete"
+            ),
+            None => info!(sources = group.len(), "merge: every document was tombstoned; sources dropped"),
+        }
+        Ok(())
+    }
+
+    /// The full tombstone list of a stream (ascending by seq), empty for
+    /// log streams. Paged out of the metastore; compaction keeps it small.
+    async fn stream_tombstones(
+        &self,
+        stream: &rsearch_metastore::StreamRecord,
+    ) -> anyhow::Result<Vec<rsearch_index::Tombstone>> {
+        if !stream.is_document_mode() {
+            return Ok(Vec::new());
+        }
+        const PAGE: i64 = 10_000;
+        let mut out = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self.metastore.tombstones_since(stream.id, after, PAGE).await?;
+            let done = (page.len() as i64) < PAGE;
+            if let Some(last) = page.last() {
+                after = last.seq;
+            }
+            out.extend(page.into_iter().map(|t| rsearch_index::Tombstone {
+                seq: t.seq,
+                doc_id: t.doc_id,
+                before_seq: t.before_seq,
+            }));
+            if done {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Re-index `sources` into one new split with `tombstones` applied
+    /// (hidden versions skipped), publish it and mark the sources for
+    /// delete atomically. Returns the new split id, or None when nothing
+    /// survived (the sources are then simply marked for delete).
+    async fn rebuild_splits(
+        &self,
+        stream: &rsearch_metastore::StreamRecord,
+        sources: &[&SplitRecord],
+        tombstones: &[rsearch_index::Tombstone],
+    ) -> anyhow::Result<Option<String>> {
+        let stream_id = stream.id;
+        let mapping = IndexMapping::from_json(&stream.mapping).unwrap_or_default();
+        let schema = MappedSchema::build(mapping);
+        let applied_through = tombstones.last().map(|t| t.seq).unwrap_or(0);
 
         // Stream every source split's docs straight into the new builder,
         // one split at a time on blocking threads. Peak memory is one doc
@@ -595,14 +658,18 @@ impl ControlPlane {
             SplitBuilder::new(stream_name, schema, &work_dir, budget)
         })
         .await??;
-        for split in &group {
+        let mut skipped_total = 0u64;
+        for split in sources {
             let reader = Arc::new(
                 SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
                     .await?,
             );
-            builder = tokio::task::spawn_blocking(move || {
+            let tombstones = tombstones.to_vec();
+            let (next_builder, skipped) = tokio::task::spawn_blocking(move || {
+                let exclusions = reader.apply_tombstones(&tombstones)?;
+                let skipped = exclusions.len() as u64;
                 reader.for_each_doc(
-                    |_, _| false,
+                    |segment_ord, doc_id| exclusions.contains(segment_ord, doc_id),
                     |doc| {
                         // Docs lacking their own timestamp keep the
                         // original one via the fallback. Identity is
@@ -620,9 +687,20 @@ impl ControlPlane {
                         )
                     },
                 )?;
-                Ok::<_, rsearch_index::IndexError>(builder)
+                Ok::<_, rsearch_index::IndexError>((builder, skipped))
             })
             .await??;
+            builder = next_builder;
+            skipped_total += skipped;
+        }
+        let old_ids: Vec<String> = sources.iter().map(|s| s.split_id.clone()).collect();
+        if builder.doc_count() == 0 {
+            // Everything was tombstoned: no replacement split to publish.
+            self.metastore.mark_splits_for_delete(&old_ids).await?;
+            self.metrics
+                .compacted_docs
+                .fetch_add(skipped_total, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
         }
         let packaged = tokio::task::spawn_blocking(move || builder.finish()).await??;
 
@@ -641,19 +719,112 @@ impl ControlPlane {
                 created_by: Some(&self.node_id),
                 seq_min: packaged.meta.seq_min,
                 seq_max: packaged.meta.seq_max,
-                tombstone_seq_applied: 0,
+                tombstone_seq_applied: applied_through,
             })
             .await?;
-        let old_ids: Vec<String> = group.iter().map(|s| s.split_id.clone()).collect();
         self.metastore
             .swap_splits(&old_ids, &packaged.meta.split_id)
             .await?;
-        info!(
-            merged_into = %packaged.meta.split_id,
-            sources = old_ids.len(),
-            docs = packaged.meta.doc_count,
-            "merge complete"
-        );
+        if skipped_total > 0 {
+            self.metrics
+                .compacted_docs
+                .fetch_add(skipped_total, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Some(packaged.meta.split_id))
+    }
+
+    /// Document-mode compaction: once a stream has accumulated
+    /// `compact_min_tombstones` (or its oldest tombstone is past
+    /// `compact_max_age_secs`), visit its published splits that haven't
+    /// applied the current tombstones. A split with nothing to hide is
+    /// just marked up to date (no rewrite); one with hidden versions is
+    /// rewritten without them. Bounded per tick so a big backlog drains
+    /// over several ticks without starving the other jobs.
+    async fn compaction_job(&self) -> anyhow::Result<()> {
+        let stats = self.metastore.tombstone_stats().await?;
+        let mut budget = self.config.compact_splits_per_tick.max(1);
+        for stat in stats {
+            if budget <= 0 {
+                break;
+            }
+            let due = stat.count >= self.config.compact_min_tombstones
+                || stat.oldest_age_secs >= self.config.compact_max_age_secs;
+            if !due {
+                continue;
+            }
+            let stream = match self.metastore.get_stream_by_id(stat.stream_id).await {
+                Ok(stream) => stream,
+                Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if !stream.is_document_mode() {
+                continue;
+            }
+            let candidates = self
+                .metastore
+                .splits_needing_compaction(stream.id, stat.max_seq, budget)
+                .await?;
+            if candidates.is_empty() {
+                continue;
+            }
+            let tombstones = self.stream_tombstones(&stream).await?;
+            let applied_through = tombstones.last().map(|t| t.seq).unwrap_or(0);
+            for split in &candidates {
+                budget -= 1;
+                // Cheap check first: does this split hold anything hidden?
+                let reader = Arc::new(
+                    SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
+                        .await?,
+                );
+                let list = tombstones.clone();
+                let hidden = tokio::task::spawn_blocking(move || {
+                    reader.apply_tombstones(&list).map(|set| set.len())
+                })
+                .await??;
+                if hidden == 0 {
+                    self.metastore
+                        .mark_tombstones_applied(&split.split_id, applied_through)
+                        .await?;
+                    continue;
+                }
+                info!(
+                    stream = %stream.name,
+                    split_id = %split.split_id,
+                    hidden,
+                    docs = split.doc_count,
+                    "compacting split"
+                );
+                match self.rebuild_splits(&stream, &[split], &tombstones).await {
+                    Ok(_) => {
+                        self.metrics
+                            .compactions
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Most likely the split was merged/deleted under us
+                        // (swap conflict); the next tick re-evaluates.
+                        warn!(split_id = %split.split_id, error = %e, "compaction of split failed");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Purge tombstones no split can still need (see
+    /// `Metastore::purge_tombstones`); bounded per tick.
+    async fn tombstone_purge_job(&self) -> anyhow::Result<()> {
+        const BATCH: i64 = 10_000;
+        let purged = self
+            .metastore
+            .purge_tombstones(self.config.tombstone_purge_grace_secs, BATCH)
+            .await?;
+        if purged > 0 {
+            self.metrics
+                .tombstones_purged
+                .fetch_add(purged, std::sync::atomic::Ordering::Relaxed);
+            info!(purged, "tombstones purged");
+        }
         Ok(())
     }
 

@@ -384,7 +384,7 @@ tombstones in the metastore since splits are immutable shared objects):
       stream's current batch and resolves once it is published; bulk
       handoff forwards the flag. Document the default window
       (`ingest.max_batch_secs` / `document_max_batch_secs`).
-- [ ] 14.6 Compaction + purge: merge applies tombstones and stamps
+- [x] 14.6 Compaction + purge: merge applies tombstones and stamps
       `tombstone_seq_applied`; new control job rewrites document-mode
       splits with pending tombstones (`compact_min_tombstones`,
       `compact_max_age_secs`); tombstone purge once no published split

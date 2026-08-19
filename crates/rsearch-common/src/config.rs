@@ -159,6 +159,20 @@ pub struct ControlConfig {
     /// DELETE /_rsearch/nodes/{id}/drain, and the node silently takes no
     /// writes or repair copies while it lasts.
     pub drain_warn_secs: f64,
+    /// Document-mode compaction trigger: a stream whose tombstone count
+    /// reaches this has its splits rewritten without the hidden versions.
+    pub compact_min_tombstones: i64,
+    /// Document-mode compaction trigger: a stream whose oldest tombstone
+    /// is older than this is compacted regardless of count — the bound on
+    /// how long a deleted document physically survives in storage.
+    pub compact_max_age_secs: f64,
+    /// Max splits rewritten (or marked up to date) per compaction tick.
+    pub compact_splits_per_tick: i64,
+    /// Tombstones are purged from the metastore only once no split can
+    /// still hold a version they hide *and* they are at least this old —
+    /// the age covers documents still buffered on an ingest node whose
+    /// split has not been cut yet.
+    pub tombstone_purge_grace_secs: f64,
 }
 
 impl Default for ControlConfig {
@@ -172,6 +186,10 @@ impl Default for ControlConfig {
             staged_orphan_secs: 3600.0,
             repair_stale_secs: 300.0,
             drain_warn_secs: 3600.0,
+            compact_min_tombstones: 1_000,
+            compact_max_age_secs: 3_600.0,
+            compact_splits_per_tick: 8,
+            tombstone_purge_grace_secs: 3_600.0,
         }
     }
 }

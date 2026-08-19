@@ -89,6 +89,15 @@ gc_grace_secs = 600         # delay before deleting marked-for-delete splits
 staged_orphan_secs = 3600   # sweep splits stuck in 'staged' after a crash
 repair_stale_secs = 300     # replicated backend: holder silence before re-replication
 allow_insecure_webhooks = false  # require https + block private IPs for alerts
+# Document-mode streams: tombstoned versions are hidden at query time and
+# removed physically by compaction, which runs when a stream accumulates
+# compact_min_tombstones or its oldest tombstone passes compact_max_age_secs
+# (the bound on how long a deleted document survives in storage).
+compact_min_tombstones = 1000
+compact_max_age_secs = 3600
+compact_splits_per_tick = 8
+tombstone_purge_grace_secs = 3600  # keep tombstones at least this long after
+                                   # every split has applied them
 
 # Network log inputs (disabled by default). Each routes to a stream and is
 # subject to routing rules.

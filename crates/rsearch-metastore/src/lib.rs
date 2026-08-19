@@ -18,7 +18,7 @@ pub use alerts::AlertRecord;
 pub use auth::{ApiKeyRecord, UserRecord};
 pub use control::CONTROL_LEADER_LOCK;
 pub use routing::RoutingRuleRecord;
-pub use tombstones::{NewTombstone, TombstoneRecord};
+pub use tombstones::{NewTombstone, StreamTombstoneStats, TombstoneRecord};
 
 pub use error::{MetastoreError, MetastoreResult};
 pub use metastore::Metastore;
