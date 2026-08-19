@@ -62,6 +62,15 @@ const MAX_RESULT_WINDOW: usize = 10_000;
 /// scheduling a search on each.
 const MAX_QUERY_SPLITS: usize = 10_000;
 
+/// A document found by `_id` (see `SearchService::get_document`).
+#[derive(Debug, Clone)]
+pub struct FoundDocument {
+    /// The document's `_seq` (reported as `_version`).
+    pub version: i64,
+    /// Its `_source`.
+    pub source: Value,
+}
+
 /// A parsed `_search` request body.
 pub struct SearchRequest {
     /// Stream (index) the search runs against.
@@ -358,6 +367,36 @@ impl SearchService {
             .put(split_id.to_string(), reader.clone());
         self.opening.lock().unwrap().remove(split_id);
         Ok(reader)
+    }
+
+    /// Look a document up by `_id`: the newest live version (tombstones
+    /// applied), or None. Reads published splits only — a write still in
+    /// an ingest buffer is not visible yet (use `?refresh=wait_for` on the
+    /// write when a read-after-write must see it).
+    pub async fn get_document(&self, stream: &str, id: &str) -> SearchResult<Option<FoundDocument>> {
+        // Several live versions of one id can only coexist transiently
+        // (same-instant writes on different nodes); take the newest.
+        let request = SearchRequest {
+            stream: stream.to_string(),
+            query: json!({"ids": {"values": [id]}}),
+            from: 0,
+            size: 16,
+            sort_desc: true,
+            aggs: None,
+            include_source: true,
+            track_total_hits: Some(0),
+        };
+        let response = self.search(request).await?;
+        let best = response["hits"]["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|hit| hit["_id"].as_str() == Some(id))
+            .max_by_key(|hit| hit["_version"].as_i64().unwrap_or(0));
+        Ok(best.map(|hit| FoundDocument {
+            version: hit["_version"].as_i64().unwrap_or(0),
+            source: hit["_source"].clone(),
+        }))
     }
 
     /// Execute a search and return the full ES-shaped response body.

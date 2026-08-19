@@ -17,6 +17,10 @@ pub struct AppState {
     pub pipeline: Option<IngestPipeline>,
     /// Present only on nodes running the search role.
     pub search: Option<Arc<SearchService>>,
+    /// Document lookups for the write path (update/create/GET /_doc):
+    /// present on ingest and search nodes (the same instance as `search`
+    /// when both roles run).
+    pub doc_lookup: Option<Arc<SearchService>>,
     pub auth: crate::auth::AuthState,
     /// Mirror of control.allow_insecure_webhooks for the alerts API.
     pub allow_insecure_webhooks: bool,
@@ -63,6 +67,7 @@ impl AppState {
             metastore,
             pipeline,
             search,
+            doc_lookup: None,
             auth: crate::auth::AuthState::default(),
             allow_insecure_webhooks: config.control.allow_insecure_webhooks,
             cors_allow_origin: config.http.cors_allow_origin.clone(),

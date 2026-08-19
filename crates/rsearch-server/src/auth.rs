@@ -179,6 +179,15 @@ fn classify(method: &str, path: &str) -> Action {
         // Ingest
         ("POST", ["_bulk"]) => Action::Ingest(None),
         ("POST", [index, "_bulk"]) => Action::Ingest(Some(index.to_string())),
+        // Document APIs (#34): writes are stream-scoped ingest, reads are
+        // stream-scoped search — so an application key never needs admin.
+        ("PUT" | "POST" | "DELETE", [index, "_doc", ..])
+        | ("PUT" | "POST", [index, "_create", _])
+        | ("POST", [index, "_update", _])
+        | ("POST", [index, "_delete_by_query"]) => Action::Ingest(Some(index.to_string())),
+        ("GET" | "HEAD", [index, "_doc", _]) | ("GET", [index, "_source", _]) => {
+            Action::Search(Some(index.to_string()))
+        }
         // Search / read
         (_, [index, "_search"]) => Action::Search(Some(index.to_string())),
         ("POST", ["_msearch"]) => Action::Search(None),
@@ -444,6 +453,19 @@ mod tests {
             classify("GET", "/app-logs/_settings"),
             Action::Search(Some("app-logs".into()))
         );
+        // Document APIs.
+        assert_eq!(classify("PUT", "/recs/_doc/1"), Action::Ingest(Some("recs".into())));
+        assert_eq!(classify("POST", "/recs/_doc"), Action::Ingest(Some("recs".into())));
+        assert_eq!(classify("DELETE", "/recs/_doc/1"), Action::Ingest(Some("recs".into())));
+        assert_eq!(classify("POST", "/recs/_update/1"), Action::Ingest(Some("recs".into())));
+        assert_eq!(classify("PUT", "/recs/_create/1"), Action::Ingest(Some("recs".into())));
+        assert_eq!(
+            classify("POST", "/recs/_delete_by_query"),
+            Action::Ingest(Some("recs".into()))
+        );
+        assert_eq!(classify("GET", "/recs/_doc/1"), Action::Search(Some("recs".into())));
+        assert_eq!(classify("HEAD", "/recs/_doc/1"), Action::Search(Some("recs".into())));
+        assert_eq!(classify("GET", "/recs/_source/1"), Action::Search(Some("recs".into())));
         // Reserved top-level paths never fall into the index arms.
         assert_eq!(classify("PUT", "/_rsearch"), Action::Admin);
         assert_eq!(classify("GET", "/_rsearch"), Action::Admin);

@@ -368,7 +368,7 @@ pub async fn head_index(State(state): State<AppState>, Path(index): Path<String>
     }
 }
 
-fn index_not_found(index: &str) -> Response {
+pub(crate) fn index_not_found(index: &str) -> Response {
     es_error(
         StatusCode::NOT_FOUND,
         "index_not_found_exception",

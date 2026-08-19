@@ -71,6 +71,27 @@ pub fn router(state: AppState) -> Router {
             get(crate::loki_api::volume_range).post(crate::loki_api::volume_range),
         )
         .route("/loki/api/v1/tail", get(crate::loki_api::tail))
+        // Document APIs (document-mode streams, #34): ES clients reach for
+        // these before _bulk.
+        .route(
+            "/{index}/_doc",
+            post(crate::doc_api::post_doc),
+        )
+        .route(
+            "/{index}/_doc/{id}",
+            axum::routing::put(crate::doc_api::put_doc)
+                .post(crate::doc_api::put_doc)
+                .get(crate::doc_api::get_doc)
+                .head(crate::doc_api::head_doc)
+                .delete(crate::doc_api::delete_doc),
+        )
+        .route(
+            "/{index}/_create/{id}",
+            axum::routing::put(crate::doc_api::create_doc).post(crate::doc_api::create_doc),
+        )
+        .route("/{index}/_update/{id}", post(crate::doc_api::update_doc))
+        .route("/{index}/_source/{id}", get(crate::doc_api::get_source))
+        .route("/{index}/_delete_by_query", post(crate::doc_api::delete_by_query))
         .route("/{index}/_mapping", get(search_api::get_mapping))
         .route("/{index}/_settings", get(search_api::get_settings))
         .route(

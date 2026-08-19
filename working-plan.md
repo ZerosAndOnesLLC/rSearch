@@ -369,7 +369,7 @@ tombstones in the metastore since splits are immutable shared objects):
       tombstone cache with TTL + local invalidation on write, fast paths
       disabled when exclusions apply). GET-by-id helper (term on `_id`,
       exclusions applied, newest `_seq` wins) used by 14.4.
-- [ ] 14.4 ES document routes: `PUT/POST /{index}/_doc/{id}`, `POST
+- [x] 14.4 ES document routes: `PUT/POST /{index}/_doc/{id}`, `POST
       /{index}/_doc` (generated id), `GET/HEAD /{index}/_doc/{id}`,
       `DELETE /{index}/_doc/{id}`, `PUT/POST /{index}/_create/{id}`
       (409 if a live doc exists — checked against published splits, see

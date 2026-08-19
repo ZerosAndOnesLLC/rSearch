@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{Value, json};
@@ -64,23 +64,41 @@ pub async fn bulk_internal(
         );
     }
     forwarder.received.fetch_add(1, Ordering::Relaxed);
-    handle_bulk_local(state, query.index, body).await
+    match handle_bulk_local(state, query.index, body).await {
+        Ok(result) => Json(result).into_response(),
+        Err(response) => response,
+    }
 }
 
 async fn handle_bulk(state: AppState, default_index: Option<String>, body: String) -> Response {
+    match execute_bulk(state, default_index, body).await {
+        Ok(result) => Json(result).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Run a bulk body end to end — peer handoff when enabled, otherwise
+/// locally — and return the ES bulk response JSON, or a whole-request
+/// error response. The `_doc` routes synthesize one-item bodies and go
+/// through here so every write path shares the same semantics.
+pub async fn execute_bulk(
+    state: AppState,
+    default_index: Option<String>,
+    body: String,
+) -> Result<Value, Response> {
     if state.draining.load(Ordering::Relaxed) {
         // Draining: refuse new writes so the WAL empties out before
         // shutdown; shippers retry against another ingest node.
-        return error_response(
+        return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "node is draining; send bulk traffic to another ingest node",
-        );
+        ));
     }
     if state.pipeline.is_none() {
-        return error_response(
+        return Err(error_response(
             StatusCode::BAD_REQUEST,
             "this node does not run the ingest role",
-        );
+        ));
     }
     // Server-side balancing (#19): shippers pin keep-alive connections to
     // one node, so spread whole batches round-robin across live ingest
@@ -99,14 +117,16 @@ async fn handle_bulk(state: AppState, default_index: Option<String>, body: Strin
             // without the endpoint — falls through to local indexing,
             // which reproduces the right client-facing outcome itself.
             Ok((status, response)) if (200..300).contains(&status) => {
-                forwarder.forwarded.fetch_add(1, Ordering::Relaxed);
-                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-                return (
-                    status,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    response,
-                )
-                    .into_response();
+                match serde_json::from_slice::<Value>(&response) {
+                    Ok(value) => {
+                        forwarder.forwarded.fetch_add(1, Ordering::Relaxed);
+                        return Ok(value);
+                    }
+                    Err(e) => {
+                        forwarder.forward_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        warn!(peer = %peer_id, error = %e, "bulk handoff returned malformed JSON; indexing locally");
+                    }
+                }
             }
             Ok((status, _)) => {
                 forwarder.forward_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -128,6 +148,97 @@ fn log_mode_reason(action: &str, stream: &str) -> String {
          {{\"settings\":{{\"index\":{{\"mode\":\"document\"}}}}}} to enable \
          document-level writes"
     )
+}
+
+/// Look up the current live version of a document for a read-modify-write
+/// action. `Err` carries a closure producing the per-item error body.
+async fn lookup_current(
+    state: &AppState,
+    stream: &str,
+    id: &str,
+) -> Result<Option<rsearch_search::FoundDocument>, Box<dyn Fn(&str, &str, &str) -> Value + Send>> {
+    let Some(lookup) = &state.doc_lookup else {
+        return Err(Box::new(|action, index, id| {
+            item_err(
+                action,
+                index,
+                Some(id),
+                400,
+                "illegal_argument_exception",
+                "document lookups need a node running the ingest or search role",
+            )
+        }));
+    };
+    match lookup.get_document(stream, id).await {
+        Ok(found) => Ok(found),
+        // A stream that exists but has no splits yet has nothing to find.
+        Err(rsearch_search::SearchError::Metastore(
+            rsearch_metastore::MetastoreError::StreamNotFound(_),
+        )) => Ok(None),
+        Err(e) => {
+            let reason = e.to_string();
+            Err(Box::new(move |action, index, id| {
+                item_err(action, index, Some(id), 503, "unavailable_shards_exception", &reason)
+            }))
+        }
+    }
+}
+
+/// Apply an ES `_update` body to the current document. Returns the new
+/// document and whether it was an upsert (no current version), `Ok(None)`
+/// when the document is missing and no upsert applies, or an error for a
+/// malformed body. Supports `doc`, `doc_as_upsert`, and `upsert`; scripts
+/// are not supported.
+fn apply_update(body: &Value, current: Option<Value>) -> Result<Option<(Value, bool)>, String> {
+    if body.get("script").is_some() {
+        return Err("scripted updates are not supported".to_string());
+    }
+    let partial = body
+        .get("doc")
+        .ok_or_else(|| "update body requires 'doc'".to_string())?;
+    if !partial.is_object() {
+        return Err("'doc' must be an object".to_string());
+    }
+    match current {
+        Some(mut current) => {
+            merge_json(&mut current, partial);
+            Ok(Some((current, false)))
+        }
+        None => {
+            let doc_as_upsert = body
+                .get("doc_as_upsert")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if doc_as_upsert {
+                return Ok(Some((partial.clone(), true)));
+            }
+            match body.get("upsert") {
+                Some(upsert) if upsert.is_object() => Ok(Some((upsert.clone(), true))),
+                Some(_) => Err("'upsert' must be an object".to_string()),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+/// ES partial-update merge: objects merge recursively, everything else
+/// (including arrays) is replaced.
+fn merge_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                match target.get_mut(key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_json(existing, value);
+                    }
+                    _ => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
 }
 
 /// One per-item outcome, positioned for the response.
@@ -165,21 +276,21 @@ async fn handle_bulk_local(
     state: AppState,
     default_index: Option<String>,
     body: String,
-) -> Response {
+) -> Result<Value, Response> {
     let started = Instant::now();
     let Some(pipeline) = state.pipeline.clone() else {
-        return error_response(
+        return Err(error_response(
             StatusCode::BAD_REQUEST,
             "this node does not run the ingest role",
-        );
+        ));
     };
 
     let outcome = match parse_bulk_body(&body, default_index.as_deref()) {
         Ok(outcome) => outcome,
-        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+        Err(reason) => return Err(error_response(StatusCode::BAD_REQUEST, &reason)),
     };
     if outcome.total == 0 {
-        return error_response(StatusCode::BAD_REQUEST, "empty bulk body");
+        return Err(error_response(StatusCode::BAD_REQUEST, "empty bulk body"));
     }
     let BulkParseOutcome {
         items, rejections, ..
@@ -192,17 +303,168 @@ async fn handle_bulk_local(
         })
         .collect();
 
-    // Routing expansion + one write-sequence stamp per item (shared by all
-    // its routed copies, so the WAL, the split, and the response agree).
-    // Deletes route nowhere: they target exactly the named stream.
+    // Resolve every named stream's id + mode up front (creating missing
+    // streams, as _bulk always has): the mode decides what each action
+    // means.
+    let mut infos: HashMap<String, StreamInfo> = HashMap::new();
+    async fn resolve_info(
+        pipeline: &rsearch_ingest::IngestPipeline,
+        infos: &mut HashMap<String, StreamInfo>,
+        stream: &str,
+    ) -> Result<StreamInfo, Response> {
+        if let Some(info) = infos.get(stream) {
+            return Ok(*info);
+        }
+        match pipeline.stream_info(stream).await {
+            Ok(info) => {
+                infos.insert(stream.to_string(), info);
+                Ok(info)
+            }
+            Err(e) => Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("metastore unavailable: {e}"),
+            )),
+        }
+    }
+    for (_, item) in &items {
+        resolve_info(&pipeline, &mut infos, &item.stream).await?;
+    }
+
+    // Read-modify-write actions on document-mode streams (update, create)
+    // look the current version up first and become plain index writes —
+    // or per-item errors. Lookups see published splits only (a write still
+    // in an ingest buffer is invisible until its split is cut; use
+    // ?refresh=wait_for on the prior write when that matters).
     struct Planned {
         position: usize,
         item: rsearch_ingest::BulkItem,
         routes: Vec<String>,
         seq: i64,
+        /// (result, status) the response reports on success.
+        outcome: (&'static str, u16),
+        /// Action name as the client sent it (an `update` becomes an
+        /// `index` write internally but answers as `update`).
+        wire_action: &'static str,
     }
     let mut planned: Vec<Planned> = Vec::with_capacity(items.len());
-    for (position, item) in items {
+    for (position, mut item) in items {
+        let action = item.action.as_str();
+        let document_mode = infos
+            .get(&item.stream)
+            .is_some_and(|i| i.mode == StreamMode::Document);
+        let mut outcome = ("created", 201);
+        match item.action {
+            BulkAction::Index if document_mode && item.explicit_id => {
+                // Without a lookup we can't tell a fresh id from a
+                // replacement; ES reports "updated" for the latter, and
+                // "updated" is the honest answer for an explicit id on a
+                // document index (the tombstone covers both cases).
+                outcome = ("updated", 200);
+            }
+            BulkAction::Index => {}
+            BulkAction::Create if document_mode && item.explicit_id => {
+                match lookup_current(&state, &item.stream, &item.doc_id).await {
+                    Ok(Some(current)) => {
+                        results.push(ItemResult {
+                            position,
+                            body: item_err(
+                                action,
+                                &item.stream,
+                                Some(&item.doc_id),
+                                409,
+                                "version_conflict_engine_exception",
+                                &format!(
+                                    "[{}]: version conflict, document already exists (current version [{}])",
+                                    item.doc_id, current.version
+                                ),
+                            ),
+                        });
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(body) => {
+                        results.push(ItemResult {
+                            position,
+                            body: body(action, &item.stream, &item.doc_id),
+                        });
+                        continue;
+                    }
+                }
+            }
+            BulkAction::Create => {}
+            BulkAction::Update => {
+                if !document_mode {
+                    results.push(ItemResult {
+                        position,
+                        body: item_err(
+                            action,
+                            &item.stream,
+                            Some(&item.doc_id),
+                            400,
+                            "illegal_argument_exception",
+                            &log_mode_reason(action, &item.stream),
+                        ),
+                    });
+                    continue;
+                }
+                let current = match lookup_current(&state, &item.stream, &item.doc_id).await {
+                    Ok(current) => current,
+                    Err(body) => {
+                        results.push(ItemResult {
+                            position,
+                            body: body(action, &item.stream, &item.doc_id),
+                        });
+                        continue;
+                    }
+                };
+                let merged = match apply_update(&item.doc, current.map(|c| c.source)) {
+                    Ok(Some((doc, was_upsert))) => {
+                        outcome = if was_upsert { ("created", 201) } else { ("updated", 200) };
+                        doc
+                    }
+                    Ok(None) => {
+                        results.push(ItemResult {
+                            position,
+                            body: item_err(
+                                action,
+                                &item.stream,
+                                Some(&item.doc_id),
+                                404,
+                                "document_missing_exception",
+                                &format!("[{}]: document missing", item.doc_id),
+                            ),
+                        });
+                        continue;
+                    }
+                    Err(reason) => {
+                        results.push(ItemResult {
+                            position,
+                            body: item_err(
+                                action,
+                                &item.stream,
+                                Some(&item.doc_id),
+                                400,
+                                "illegal_argument_exception",
+                                &reason,
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                // Becomes an ordinary explicit-id index write; the response
+                // still says "update".
+                item.raw = std::sync::Arc::from(merged.to_string());
+                item.doc = merged;
+                item.action = BulkAction::Index;
+            }
+            BulkAction::Delete => {
+                outcome = ("deleted", 200);
+            }
+        }
+        // Routing expansion + one write-sequence stamp per item (shared by
+        // all its routed copies, so the WAL, the split, and the response
+        // agree). Deletes route nowhere: they target exactly the named
+        // stream.
         let routes = match item.action {
             BulkAction::Index | BulkAction::Create => {
                 pipeline.expand_routes(&item.stream, &item.doc)
@@ -214,28 +476,15 @@ async fn handle_bulk_local(
             item,
             routes,
             seq: pipeline.next_seq(),
+            outcome,
+            wire_action: action,
         });
     }
-
-    // Resolve every target stream's id + mode (creating missing streams,
-    // as _bulk always has). Document-mode targets get tombstones.
-    let mut infos: HashMap<String, StreamInfo> = HashMap::new();
+    // Routing rules may fan a document out to streams not named in the
+    // request; resolve those too.
     for plan in &planned {
         for stream in &plan.routes {
-            if infos.contains_key(stream) {
-                continue;
-            }
-            match pipeline.stream_info(stream).await {
-                Ok(info) => {
-                    infos.insert(stream.clone(), info);
-                }
-                Err(e) => {
-                    return error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("metastore unavailable: {e}"),
-                    );
-                }
-            }
+            resolve_info(&pipeline, &mut infos, stream).await?;
         }
     }
 
@@ -246,7 +495,7 @@ async fn handle_bulk_local(
     let mut tombstones: Vec<NewTombstone> = Vec::new();
     let mut writes: Vec<&Planned> = Vec::new();
     for plan in &planned {
-        let action = plan.item.action.as_str();
+        let action = plan.wire_action;
         match plan.item.action {
             BulkAction::Index | BulkAction::Create => {
                 if plan.item.explicit_id {
@@ -273,7 +522,14 @@ async fn handle_bulk_local(
                     });
                     results.push(ItemResult {
                         position: plan.position,
-                        body: item_ok(action, &plan.item.stream, &plan.item.doc_id, plan.seq, "deleted", 200),
+                        body: item_ok(
+                            action,
+                            &plan.item.stream,
+                            &plan.item.doc_id,
+                            plan.seq,
+                            plan.outcome.0,
+                            plan.outcome.1,
+                        ),
                     });
                 }
                 _ => results.push(ItemResult {
@@ -288,30 +544,26 @@ async fn handle_bulk_local(
                     ),
                 }),
             },
+            // Updates were rewritten into index writes (or rejected) above.
             BulkAction::Update => results.push(ItemResult {
                 position: plan.position,
                 body: item_err(
                     action,
                     &plan.item.stream,
                     Some(&plan.item.doc_id),
-                    400,
-                    "illegal_argument_exception",
-                    &match infos.get(&plan.item.stream) {
-                        Some(info) if info.mode == StreamMode::Document => {
-                            "update is not supported in _bulk yet".to_string()
-                        }
-                        _ => log_mode_reason(action, &plan.item.stream),
-                    },
+                    500,
+                    "internal_error",
+                    "update was not resolved",
                 ),
             }),
         }
     }
     if !tombstones.is_empty() {
         if let Err(e) = state.metastore.upsert_tombstones(&tombstones).await {
-            return error_response(
+            return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!("metastore unavailable (tombstones): {e}"),
-            );
+            ));
         }
         // A search immediately after this write on this node must see it.
         if let Some(search) = &state.search {
@@ -346,16 +598,16 @@ async fn handle_bulk_local(
         match tokio::task::spawn_blocking(move || wal.append_batch(&wal_items)).await {
             Ok(Ok(positions)) => positions,
             Ok(Err(e)) => {
-                return error_response(
+                return Err(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("wal append failed: {e}"),
-                );
+                ));
             }
             Err(e) => {
-                return error_response(
+                return Err(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("wal task failed: {e}"),
-                );
+                ));
             }
         }
     };
@@ -364,7 +616,7 @@ async fn handle_bulk_local(
     // was accepted. Saturated routes get confirmed so the WAL drains.
     let mut position_iter = positions.into_iter();
     for plan in writes {
-        let action = plan.item.action.as_str();
+        let action = plan.wire_action;
         let stream_name = &plan.item.stream;
         let doc_id = &plan.item.doc_id;
         let mut accepted = 0usize;
@@ -394,18 +646,7 @@ async fn handle_bulk_local(
             }
         }
         let body = if accepted > 0 {
-            // ES reports "updated" for an index that replaced a document;
-            // an explicit id on a document-mode stream may have, and the
-            // cheap honest answer without a lookup is "created" for fresh
-            // ids and "updated" for explicit ones (the tombstone covers
-            // both cases).
-            let replaced = plan.item.explicit_id
-                && plan.item.action == BulkAction::Index
-                && infos
-                    .get(stream_name)
-                    .is_some_and(|i| i.mode == StreamMode::Document);
-            let (result, status) = if replaced { ("updated", 200) } else { ("created", 201) };
-            item_ok(action, stream_name, doc_id, plan.seq, result, status)
+            item_ok(action, stream_name, doc_id, plan.seq, plan.outcome.0, plan.outcome.1)
         } else if saturated {
             item_err(
                 action,
@@ -442,15 +683,14 @@ async fn handle_bulk_local(
             .unwrap_or(true)
     });
     let items: Vec<Value> = results.into_iter().map(|r| r.body).collect();
-    Json(json!({
+    Ok(json!({
         "took": started.elapsed().as_millis() as u64,
         "errors": errors,
         "items": items,
     }))
-    .into_response()
 }
 
-fn error_response(status: StatusCode, reason: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, reason: &str) -> Response {
     (
         status,
         Json(json!({
