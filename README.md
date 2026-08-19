@@ -206,9 +206,10 @@ and IMDS are never touched.
 Query DSL subset: `match_all`, `bool`, `term`, `terms`, `ids`, `range`,
 `exists`, `match`, `match_phrase`, `query_string`, `simple_query_string`
 (the same lenient parser — a typo never 400s; `fields` with `^boost`,
-`default_field`, and `default_operator` are honored, `flags` is accepted
-and ignored; bare terms search the mapped text fields, unmapped fields by
-`name:term` or via `fields`). Aggregations pass
+`default_field`, and `default_operator` are honored — OR by default as in
+Elasticsearch/OpenSearch, `"and"` to require every term; `flags` is
+accepted and ignored; bare terms search the mapped text fields, unmapped
+fields by `name:term` or via `fields`). Aggregations pass
 through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 

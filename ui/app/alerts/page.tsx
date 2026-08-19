@@ -50,7 +50,9 @@ export default function AlertsPage() {
     try {
       let query: unknown = {};
       if (form.query.trim())
-        query = { query_string: { query: form.query.trim() } };
+        query = {
+          query_string: { query: form.query.trim(), default_operator: "and" },
+        };
       await rq(`/_rsearch/alerts/${encodeURIComponent(form.name)}`, {
         method: "PUT",
         body: JSON.stringify({ ...form, query }),
