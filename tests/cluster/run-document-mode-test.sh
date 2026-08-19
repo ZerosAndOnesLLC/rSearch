@@ -129,10 +129,17 @@ done
 [ "$(curl -s "$U/recs/_doc/a" | jq -r '._source.v')" = 2 ] || fail "newest version survives compaction"
 grep -q "compacting split" "$LOGDIR/node.log" || fail "no compaction logged"
 
+say "query_string fields / simple_query_string"
+curl -s -XPOST "$U/recs/_bulk?refresh=wait_for" -H "$ND" --data-binary $'{"index":{"_id":"q1"}}\n{"title":"lovelace","note":"ada wrote notes"}\n{"index":{"_id":"q2"}}\n{"title":"babbage","note":"lovelace annotated"}\n' >/dev/null
+[ "$(curl -s -XPOST "$U/recs/_search" -H "$J" -d '{"query":{"query_string":{"query":"lovelace","fields":["title"]}}}' | jq -r '.hits.total.value')" = 1 ] || fail "query_string fields narrows"
+[ "$(curl -s -XPOST "$U/recs/_search" -H "$J" -d '{"query":{"simple_query_string":{"query":"lovelace","fields":["title","note"]}}}' | jq -r '.hits.total.value')" = 2 ] || fail "simple_query_string across fields"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -XPOST "$U/recs/_search" -H "$J" -d '{"query":{"simple_query_string":{"query":"lovelace \"oops AND","fields":["note"],"default_operator":"or"}}}')" = 200 ] || fail "simple_query_string never 400s on typos"
+curl -s -XPOST "$U/recs/_delete_by_query" -H "$J" -d '{"query":{"ids":{"values":["q1","q2"]}}}' >/dev/null
+
 say "least-privilege key: stream-scoped ingest creates its index and writes"
 curl -s -XPUT "$U/_rsearch/users/admin" -H "$J" -d '{"password":"adminpassword123","role":"admin"}' | jq -e '.acknowledged' >/dev/null || fail "create admin"
 TOKEN=$(curl -s -XPOST "$U/_rsearch/login" -H "$J" -d '{"username":"admin","password":"adminpassword123"}' | jq -r '.token')
-KEY=$(curl -s -XPOST "$U/_rsearch/api_keys" -H "Authorization: Bearer $TOKEN" -H "$J" -d '{"name":"app","actions":["ingest","search"],"streams":["app-items"]}' | jq -r '.key')
+KEY=$(curl -s -XPOST "$U/_rsearch/api_keys" -H "Authorization: Bearer $TOKEN" -H "$J" -d '{"name":"app","actions":["ingest","search"],"streams":["app-*"]}' | jq -r '.key')
 [ -n "$KEY" ] && [ "$KEY" != null ] || fail "create api key"
 code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app-items" -H "Authorization: Bearer $KEY" -H "$J" -d '{"settings":{"index":{"mode":"document"}}}')
 [ "$code" = 200 ] || fail "scoped ingest key creates its index (got $code)"
@@ -140,8 +147,12 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app-items/_doc/1?refresh
 [ "$code" = 200 ] || fail "scoped key writes a document (got $code)"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$U/app-items/_doc/1" -H "Authorization: Bearer $KEY")
 [ "$code" = 200 ] || fail "scoped key reads a document (got $code)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app-orders/_doc/1?refresh=wait_for" -H "Authorization: Bearer $KEY" -H "$J" -d '{"n":1}')
+[ "$code" = 201 ] || fail "glob scope covers a new tenant index (got $code)"
 code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/other/_doc/1" -H "Authorization: Bearer $KEY" -H "$J" -d '{}')
 [ "$code" = 403 ] || fail "scoped key is denied outside its streams (got $code)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app/_doc/1" -H "Authorization: Bearer $KEY" -H "$J" -d '{}')
+[ "$code" = 403 ] || fail "glob needs the full prefix (got $code)"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$U/_rsearch/users" -H "Authorization: Bearer $KEY")
 [ "$code" = 403 ] || fail "scoped key is not admin (got $code)"
 
