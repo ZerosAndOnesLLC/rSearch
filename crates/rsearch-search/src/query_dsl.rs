@@ -279,9 +279,13 @@ pub fn translate_query(
         "match" => translate_match(index, schema, body, false),
         "match_phrase" => translate_match(index, schema, body, true),
         "query_string" => translate_query_string(index, schema, body),
+        // Same engine: our query_string parse is already lenient (never a
+        // 400 on a typo), which is the property simple_query_string exists
+        // for; `flags` is accepted and ignored.
+        "simple_query_string" => translate_query_string(index, schema, body),
         other => Err(SearchError::BadRequest(format!(
             "unsupported query type '{other}' (supported: match_all, bool, term, terms, \
-             ids, range, exists, match, match_phrase, query_string)"
+             ids, range, exists, match, match_phrase, query_string, simple_query_string)"
         ))),
     }
 }
@@ -632,6 +636,11 @@ fn translate_match(
     }
 }
 
+/// `query_string` / `simple_query_string`. Honors `fields` (with ES `^boost`
+/// suffixes and a bare `*`) or `default_field`; without either, every
+/// mapped text field plus the dynamic catch-all is searched, so bare
+/// terms search everything tokenized. `default_operator` defaults to
+/// AND (log-search convention); pass `"or"` for ES's default.
 fn translate_query_string(
     index: &tantivy::Index,
     schema: &MappedSchema,
@@ -641,22 +650,95 @@ fn translate_query_string(
         .get("query")
         .and_then(Value::as_str)
         .ok_or_else(|| SearchError::BadRequest("query_string needs 'query'".into()))?;
+    let conjunction = !matches!(
+        body.get("default_operator").and_then(Value::as_str),
+        Some(op) if op.eq_ignore_ascii_case("or")
+    );
 
-    // Default search fields: every mapped text field plus the dynamic
-    // catch-all, so bare terms search everything tokenized.
-    let mut default_fields: Vec<Field> = schema
-        .fields
-        .values()
-        .filter(|(_, ty)| *ty == FieldType::Text)
-        .map(|(field, _)| *field)
-        .collect();
-    default_fields.push(schema.dynamic);
+    // Requested fields: `fields: [..]` wins, else `default_field`, else
+    // everything. `*` (alone) means everything too.
+    let requested: Vec<String> = match (body.get("fields"), body.get("default_field")) {
+        (Some(Value::Array(items)), _) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        (_, Some(Value::String(name))) => vec![name.clone()],
+        (Some(other), _) => {
+            return Err(SearchError::BadRequest(format!(
+                "query_string 'fields' must be an array of names, got {other}"
+            )));
+        }
+        _ => Vec::new(),
+    };
+    let all = requested.is_empty() || requested.iter().any(|f| f.trim_end_matches('^') == "*");
 
-    let mut parser = QueryParser::for_index(index, default_fields);
-    parser.set_conjunction_by_default();
-    // Lenient parse: log queries from UIs often contain minor syntax slips.
-    let (query, _errors) = parser.parse_query_lenient(query_text);
-    Ok(query)
+    // Mapped fields go to the parser as default fields (with boosts);
+    // unmapped names live under paths of the dynamic JSON field, which the
+    // parser can only target through `_dynamic.path:(…)` syntax, so each
+    // of those gets its own parse of the wrapped text.
+    let mut default_fields: Vec<Field> = Vec::new();
+    let mut boosts: Vec<(Field, f32)> = Vec::new();
+    let mut dynamic_paths: Vec<(String, f32)> = Vec::new();
+    if all {
+        default_fields.extend(
+            schema
+                .fields
+                .values()
+                .filter(|(_, ty)| *ty == FieldType::Text)
+                .map(|(field, _)| *field),
+        );
+        default_fields.push(schema.dynamic);
+    } else {
+        for spec in &requested {
+            let (name, boost) = match spec.rsplit_once('^') {
+                Some((name, b)) => (name, b.parse::<f32>().unwrap_or(1.0)),
+                None => (spec.as_str(), 1.0),
+            };
+            match resolve(schema, name) {
+                Resolved::Typed(field, FieldType::Text | FieldType::Keyword) => {
+                    default_fields.push(field);
+                    if boost != 1.0 {
+                        boosts.push((field, boost));
+                    }
+                }
+                // Numeric/date/ip/timestamp fields can't take free text.
+                Resolved::Typed(..) | Resolved::Timestamp(_) => {}
+                Resolved::Dynamic(_, path) => dynamic_paths.push((path, boost)),
+            }
+        }
+        if default_fields.is_empty() && dynamic_paths.is_empty() {
+            return Err(SearchError::BadRequest(
+                "query_string 'fields' names no searchable field".into(),
+            ));
+        }
+    }
+
+    let parse = |fields: Vec<Field>, boosts: &[(Field, f32)], text: &str| {
+        let mut parser = QueryParser::for_index(index, fields);
+        if conjunction {
+            parser.set_conjunction_by_default();
+        }
+        for (field, boost) in boosts {
+            parser.set_field_boost(*field, *boost);
+        }
+        // Lenient parse: queries from UIs often contain minor syntax slips.
+        let (query, _errors) = parser.parse_query_lenient(text);
+        query
+    };
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    if !default_fields.is_empty() {
+        clauses.push((Occur::Should, parse(default_fields, &boosts, query_text)));
+    }
+    for (path, boost) in dynamic_paths {
+        let wrapped = format!("{}.{path}:({query_text})", rsearch_index::DYNAMIC_FIELD);
+        let boosts = if boost != 1.0 { vec![(schema.dynamic, boost)] } else { Vec::new() };
+        clauses.push((Occur::Should, parse(vec![schema.dynamic], &boosts, &wrapped)));
+    }
+    Ok(match clauses.len() {
+        1 => clauses.pop().map(|(_, q)| q).expect("one clause"),
+        _ => Box::new(BooleanQuery::new(clauses)),
+    })
 }
 
 #[cfg(test)]
@@ -707,6 +789,88 @@ mod tests {
             translate_query(&idx, &s, &query)
                 .unwrap_or_else(|e| panic!("query {query} failed: {e}"));
         }
+    }
+
+    /// Index three docs and count hits for a query: exercises field
+    /// targeting end to end (mapped text, keyword, and unmapped/dynamic).
+    fn hits(query: &serde_json::Value) -> usize {
+        use rsearch_index::DocumentConverter;
+        use tantivy::collector::Count;
+        let s = schema();
+        let idx = index(&s);
+        let converter = DocumentConverter::new(s.clone());
+        let mut writer = idx.writer_with_num_threads(1, 20 << 20).unwrap();
+        for doc in [
+            serde_json::json!({"message": "ada lovelace wrote notes", "service": "api", "name": "Ada"}),
+            serde_json::json!({"message": "charles babbage engine", "service": "worker", "name": "Lovelace"}),
+            serde_json::json!({"message": "unrelated text", "service": "api", "name": "Nobody"}),
+        ] {
+            let (doc, _) = converter
+                .convert(doc, tantivy::DateTime::from_timestamp_millis(0))
+                .unwrap();
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = idx.reader().unwrap().searcher();
+        let q = translate_query(&idx, &s, query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        searcher.search(&q, &Count).unwrap()
+    }
+
+    #[test]
+    fn query_string_honors_fields_and_default_field() {
+        // Bare terms search the mapped text fields; unmapped values are
+        // reachable by path (`name:lovelace`) or via `fields` — Tantivy's
+        // parser can't fan a bare term across every JSON path.
+        assert_eq!(hits(&serde_json::json!({"query_string": {"query": "lovelace"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"query_string": {"query": "name:lovelace"}})), 1);
+        // Only the mapped text field.
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {"query": "lovelace", "fields": ["message"]}})),
+            1
+        );
+        // Only the unmapped (dynamic) field, with a boost suffix.
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {"query": "lovelace", "fields": ["name^2"]}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {"query": "Lovelace", "default_field": "name"}})),
+            1
+        );
+        // Keyword field is exact.
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {"query": "api", "fields": ["service"]}})),
+            2
+        );
+        // `*` means everything; AND is the default operator, OR opt-in.
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {"query": "ada engine", "fields": ["*"]}})),
+            0
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {"query": "ada", "fields": ["message", "name"]}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {
+                "query": "ada engine", "fields": ["message"], "default_operator": "or"}})),
+            2
+        );
+        // simple_query_string is the same engine, and never a 400 on typos
+        // (the broken clause is parsed leniently, not rejected).
+        assert_eq!(
+            hits(&serde_json::json!({"simple_query_string": {
+                "query": "lovelace \"unbalanced AND", "fields": ["message", "name"],
+                "default_operator": "or", "flags": "ALL"}})),
+            2
+        );
+        // A field list naming nothing searchable is an error, not silence.
+        let s = schema();
+        let idx = index(&s);
+        assert!(
+            translate_query(&idx, &s, &serde_json::json!({"query_string": {"query": "x", "fields": ["status"]}}))
+                .is_err()
+        );
     }
 
     #[test]
