@@ -48,6 +48,12 @@ pub struct SplitMeta {
     /// absent in footers written before `_id`/`_seq` existed.
     #[serde(default)]
     pub schema_version: u32,
+    /// Lowest `_seq` in the split; None when documents carry no ids.
+    #[serde(default)]
+    pub seq_min: Option<i64>,
+    /// Highest `_seq` in the split; None when documents carry no ids.
+    #[serde(default)]
+    pub seq_max: Option<i64>,
 }
 
 /// Full footer contents: bundled file map + split metadata.

@@ -14,12 +14,15 @@ use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::collector::{Count, TopDocs};
+use tantivy::query::{BooleanQuery, Occur, Query};
 use tantivy::schema::Value as _;
 use tantivy::{DocAddress, Order, TantivyDocument};
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use rsearch_index::{IndexMapping, MappedSchema, SplitCache, SplitReader};
+use rsearch_index::{
+    ExcludeDocsQuery, ExclusionSet, IndexMapping, MappedSchema, SplitCache, SplitReader, Tombstone,
+};
 use rsearch_metastore::Metastore;
 use rsearch_storage::Storage;
 
@@ -44,6 +47,13 @@ const STREAM_CACHE_TTL: Duration = Duration::from_secs(10);
 /// ES-compatible default exact-count ceiling; beyond this the reported
 /// total is a lower bound (`"relation": "gte"`).
 const DEFAULT_TRACK_TOTAL_HITS: usize = 10_000;
+/// How long a document-mode stream's tombstone list may be reused before
+/// the metastore is asked for newer rows. A node that wrote a tombstone
+/// invalidates its own cache immediately; other search nodes see it
+/// within this window.
+const TOMBSTONE_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Tombstone rows fetched per metastore round trip.
+const TOMBSTONE_PAGE: i64 = 10_000;
 /// Hard ceiling on from+size (ES max_result_window).
 const MAX_RESULT_WINDOW: usize = 10_000;
 /// Max splits one query may touch. A query over more than this (an
@@ -147,8 +157,9 @@ impl SearchRequest {
     }
 }
 
-/// A fetched page document: (page position, stored `_id`, `_source` text).
-type FetchedDoc = (usize, Option<String>, Option<String>);
+/// A fetched page document: (page position, stored `_id`, `_seq`,
+/// `_source` text).
+type FetchedDoc = (usize, Option<String>, Option<i64>, Option<String>);
 
 /// A hit reference — no `_source` yet; it's fetched only for the final
 /// page after the global merge, and includes a stable tiebreaker.
@@ -157,6 +168,15 @@ struct SplitHit {
     timestamp_millis: i64,
     split_idx: usize,
     doc: DocAddress,
+}
+
+/// A document-mode stream's tombstones as last fetched: ascending by
+/// `seq`, append-only between refreshes (the list is what every split's
+/// incremental `apply_tombstones` consumes).
+struct StreamTombstones {
+    entries: Arc<Vec<Tombstone>>,
+    /// None = explicitly invalidated (a local write); refresh on next use.
+    fetched_at: Option<Instant>,
 }
 
 struct SplitOutcome {
@@ -190,6 +210,8 @@ pub struct SearchService {
     /// metastore roundtrip and full Tantivy schema rebuild for data that
     /// only changes on PUT /{index}.
     streams: std::sync::Mutex<HashMap<String, (Arc<CachedStream>, Instant)>>,
+    /// Stream id → tombstone list (document-mode streams only).
+    tombstones: std::sync::Mutex<HashMap<i64, StreamTombstones>>,
 }
 
 impl SearchService {
@@ -209,7 +231,66 @@ impl SearchService {
                 .collect(),
             opening: std::sync::Mutex::new(HashMap::new()),
             streams: std::sync::Mutex::new(HashMap::new()),
+            tombstones: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drop the freshness of a stream's cached tombstones so the next
+    /// query re-reads the metastore — called by the node's own write path
+    /// so a delete is visible to an immediately following local search.
+    pub fn invalidate_tombstones(&self, stream_id: i64) {
+        if let Some(entry) = self.tombstones.lock().unwrap().get_mut(&stream_id) {
+            entry.fetched_at = None;
+        }
+    }
+
+    /// The stream's tombstones, ascending by seq, extended from the
+    /// metastore when the cache is stale.
+    async fn tombstones_for(&self, stream_id: i64) -> SearchResult<Arc<Vec<Tombstone>>> {
+        let cached = {
+            let map = self.tombstones.lock().unwrap();
+            map.get(&stream_id).map(|t| (t.entries.clone(), t.fetched_at))
+        };
+        if let Some((entries, Some(at))) = &cached
+            && at.elapsed() < TOMBSTONE_CACHE_TTL
+        {
+            return Ok(entries.clone());
+        }
+        let mut entries: Vec<Tombstone> = cached
+            .map(|(e, _)| e.as_ref().clone())
+            .unwrap_or_default();
+        let mut after = entries.last().map(|t| t.seq).unwrap_or(0);
+        loop {
+            let page = self
+                .metastore
+                .tombstones_since(stream_id, after, TOMBSTONE_PAGE)
+                .await?;
+            let done = (page.len() as i64) < TOMBSTONE_PAGE;
+            if let Some(last) = page.last() {
+                after = last.seq;
+            }
+            entries.extend(page.into_iter().map(|t| Tombstone {
+                seq: t.seq,
+                doc_id: t.doc_id,
+                before_seq: t.before_seq,
+            }));
+            if done {
+                break;
+            }
+        }
+        let entries = Arc::new(entries);
+        let mut map = self.tombstones.lock().unwrap();
+        if map.len() > 10_000 {
+            map.clear();
+        }
+        map.insert(
+            stream_id,
+            StreamTombstones {
+                entries: entries.clone(),
+                fetched_at: Some(Instant::now()),
+            },
+        );
+        Ok(entries)
     }
 
     fn reader_shard(&self, split_id: &str) -> &std::sync::Mutex<lru::LruCache<String, Arc<SplitReader>>> {
@@ -312,6 +393,15 @@ impl SearchService {
             None => None,
         };
 
+        // Document-mode streams hide tombstoned versions; the list is
+        // shared by every split's incremental application below.
+        let tombstones: Option<Arc<Vec<Tombstone>>> = if stream.is_document_mode() {
+            let list = self.tombstones_for(stream.id).await?;
+            (!list.is_empty()).then_some(list)
+        } else {
+            None
+        };
+
         let fetch_limit = request.from + request.size;
         let query = Arc::new(request.query.clone());
         // Whether the query is exactly match_all — lets fully-covered
@@ -342,6 +432,11 @@ impl SearchService {
                 let split_id = split.split_id.clone();
                 let storage_key = split.storage_key.clone();
                 let doc_count = split.doc_count as usize;
+                // Only splits that carry ids (seq_min known) can hold a
+                // tombstoned version.
+                let tombstones = tombstones
+                    .clone()
+                    .filter(|_| split.seq_min.is_some());
                 // A split fully inside [t_start, t_end] needs no filtering
                 // for a match_all query — its whole doc_count matches, so it
                 // reports its count without scanning (H3).
@@ -355,6 +450,11 @@ impl SearchService {
                         None => false,
                     };
                     let outcome = tokio::task::spawn_blocking(move || {
+                        let exclusions = match tombstones {
+                            Some(list) => Some(reader.apply_tombstones(&list)?),
+                            None => None,
+                        }
+                        .filter(|set| !set.is_empty());
                         search_one_split(
                             &reader,
                             &query,
@@ -365,6 +465,7 @@ impl SearchService {
                             idx,
                             doc_count,
                             fully_covered,
+                            exclusions,
                         )
                     })
                     .await
@@ -512,13 +613,22 @@ impl SearchService {
                             let id = schema.id.and_then(|f| {
                                 doc.get_first(f).and_then(|v| v.as_str().map(str::to_string))
                             });
+                            let seq = match schema.seq {
+                                Some(_) => searcher
+                                    .segment_reader(address.segment_ord)
+                                    .fast_fields()
+                                    .i64(rsearch_index::SEQ_FIELD)
+                                    .ok()
+                                    .and_then(|col| col.first(address.doc_id)),
+                                None => None,
+                            };
                             let source = include_source
                                 .then(|| {
                                     doc.get_first(schema.source)
                                         .and_then(|v| v.as_str().map(str::to_string))
                                 })
                                 .flatten();
-                            out.push((pos, id, source));
+                            out.push((pos, id, seq, source));
                         }
                         Ok::<_, SearchError>(out)
                     })
@@ -527,28 +637,28 @@ impl SearchService {
                 }
             })
             .collect();
-        let mut fetched_docs: Vec<(Option<String>, Option<String>)> =
-            vec![(None, None); page.len()];
+        let mut fetched_docs: Vec<(Option<String>, Option<i64>, Option<String>)> =
+            vec![(None, None, None); page.len()];
         let fetched: Vec<Vec<FetchedDoc>> = stream::iter(futs)
             .buffer_unordered(SPLIT_SEARCH_CONCURRENCY)
             .collect::<Vec<SearchResult<_>>>()
             .await
             .into_iter()
             .collect::<SearchResult<Vec<_>>>()?;
-        for (pos, id, source) in fetched.into_iter().flatten() {
-            fetched_docs[pos] = (id, source);
+        for (pos, id, seq, source) in fetched.into_iter().flatten() {
+            fetched_docs[pos] = (id, seq, source);
         }
         Ok(page
             .iter()
             .zip(fetched_docs)
-            .map(|(hit, (id, source))| {
+            .map(|(hit, (id, seq, source))| {
                 let source = include_source.then(|| {
                     source
                         .as_deref()
                         .and_then(|s| serde_json::from_str(s).ok())
                         .unwrap_or(Value::Null)
                 });
-                hit_envelope(hit, splits, stream, id, source)
+                hit_envelope(hit, splits, stream, id, seq, source)
             })
             .collect())
     }
@@ -563,6 +673,7 @@ fn hit_envelope(
     splits: &[rsearch_metastore::SplitRecord],
     stream: &str,
     id: Option<String>,
+    seq: Option<i64>,
     source: Option<Value>,
 ) -> Value {
     let split_id = &splits[hit.split_idx].split_id;
@@ -575,6 +686,11 @@ fn hit_envelope(
         "_score": Value::Null,
         "sort": [hit.timestamp_millis],
     });
+    // `_version` is the write sequence: what the bulk/_doc responses
+    // reported for this version of the document.
+    if let Some(seq) = seq {
+        entry["_version"] = json!(seq);
+    }
     if let Some(source) = source {
         entry["_source"] = source;
     }
@@ -597,12 +713,24 @@ fn search_one_split(
     split_idx: usize,
     doc_count: usize,
     fully_covered: bool,
+    exclusions: Option<Arc<ExclusionSet>>,
 ) -> SearchResult<SplitOutcome> {
     let index = reader.index();
     // Translate against the split's own schema: field ordinals follow the
     // mapping the split was built with, which can differ from the stream's
     // current mapping (PUT /{index} after the split was written).
-    let query = translate_query(index, reader.mapped_schema(), query_json)?;
+    let mut query = translate_query(index, reader.mapped_schema(), query_json)?;
+    // Tombstoned versions are excluded inside the query so every collector
+    // (top-k, Count, aggregations) agrees; the doc_count shortcut below
+    // subtracts them instead of scanning.
+    let mut doc_count = doc_count;
+    if let Some(set) = exclusions {
+        doc_count = doc_count.saturating_sub(set.len());
+        query = Box::new(BooleanQuery::new(vec![
+            (Occur::Must, query),
+            (Occur::MustNot, Box::new(ExcludeDocsQuery::new(set)) as Box<dyn Query>),
+        ]));
+    }
     let searcher = reader.searcher()?;
 
     let order = if sort_desc { Order::Desc } else { Order::Asc };

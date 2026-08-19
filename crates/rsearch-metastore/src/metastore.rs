@@ -4,10 +4,11 @@ use sqlx::postgres::PgPoolOptions;
 use rsearch_common::config::MetastoreConfig;
 
 use crate::error::{MetastoreError, MetastoreResult};
-use crate::types::{SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats};
+use crate::types::{NewSplit, SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats};
 
-const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
-     size_bytes, time_start_millis, time_end_millis, footer_len, created_by";
+pub(crate) const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
+     size_bytes, time_start_millis, time_end_millis, footer_len, created_by, \
+     seq_min, seq_max, tombstone_seq_applied";
 
 /// Postgres-backed metadata store shared by every node role: streams,
 /// splits, nodes, placement, auth, routing rules, and alerts. Cloning
@@ -208,33 +209,25 @@ impl Metastore {
     // ---- split lifecycle ----
 
     /// Register a freshly-uploaded split in `staged` state.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn stage_split(
-        &self,
-        split_id: &str,
-        stream_id: i64,
-        storage_key: &str,
-        doc_count: i64,
-        size_bytes: i64,
-        time_start_millis: i64,
-        time_end_millis: i64,
-        footer_len: i64,
-        created_by: Option<&str>,
-    ) -> MetastoreResult<()> {
+    pub async fn stage_split(&self, split: &NewSplit<'_>) -> MetastoreResult<()> {
         sqlx::query(
             "INSERT INTO splits (split_id, stream_id, storage_key, doc_count, size_bytes,
-                                 time_start_millis, time_end_millis, footer_len, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                 time_start_millis, time_end_millis, footer_len, created_by,
+                                 seq_min, seq_max, tombstone_seq_applied)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
-        .bind(split_id)
-        .bind(stream_id)
-        .bind(storage_key)
-        .bind(doc_count)
-        .bind(size_bytes)
-        .bind(time_start_millis)
-        .bind(time_end_millis)
-        .bind(footer_len)
-        .bind(created_by)
+        .bind(split.split_id)
+        .bind(split.stream_id)
+        .bind(split.storage_key)
+        .bind(split.doc_count)
+        .bind(split.size_bytes)
+        .bind(split.time_start_millis)
+        .bind(split.time_end_millis)
+        .bind(split.footer_len)
+        .bind(split.created_by)
+        .bind(split.seq_min)
+        .bind(split.seq_max)
+        .bind(split.tombstone_seq_applied)
         .execute(&self.pool)
         .await?;
         Ok(())

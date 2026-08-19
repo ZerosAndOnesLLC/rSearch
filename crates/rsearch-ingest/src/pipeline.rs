@@ -13,11 +13,27 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use rsearch_index::{DocIdentity, IndexMapping, MappedSchema, SplitBuilder};
-use rsearch_metastore::Metastore;
+use rsearch_metastore::{Metastore, StreamMode};
 use rsearch_storage::Storage;
 
 use crate::error::{IngestError, IngestResult};
 use crate::wal::{Wal, WalItem, WalPos, WalReplay};
+
+/// What the write path needs to know about a stream per request: its id
+/// (tombstones are keyed by it) and its mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// The stream's metastore id.
+    pub id: i64,
+    /// Log or document mode.
+    pub mode: StreamMode,
+}
+
+/// How long a resolved [`StreamInfo`] is reused before the metastore is
+/// asked again. A mode can only change while a stream is empty, so
+/// staleness is bounded and harmless; the node that changes it forgets
+/// its own entry immediately.
+const STREAM_INFO_TTL: Duration = Duration::from_secs(10);
 
 /// Node-local monotonic write-sequence source: micros since epoch, forced
 /// strictly increasing across calls so two writes to the same `_id` on
@@ -113,6 +129,8 @@ struct PipelineInner {
     rules: std::sync::RwLock<Arc<Vec<rsearch_metastore::RoutingRuleRecord>>>,
     /// Write-sequence source shared by every ingest entry point.
     seq: SeqClock,
+    /// Stream name → (info, resolved at). Read-locked per request.
+    stream_info: std::sync::RwLock<HashMap<String, (StreamInfo, std::time::Instant)>>,
 }
 
 /// Cloneable handle to the shared ingest pipeline: routes documents,
@@ -150,6 +168,7 @@ impl IngestPipeline {
                 metrics: IngestMetrics::default(),
                 rules: std::sync::RwLock::new(Arc::new(Vec::new())),
                 seq: SeqClock::default(),
+                stream_info: std::sync::RwLock::new(HashMap::new()),
             }),
         };
         // Keep the routing-rule cache warm.
@@ -278,6 +297,35 @@ impl IngestPipeline {
     /// The shared WAL handle.
     pub fn wal(&self) -> &Arc<Wal> {
         &self.inner.wal
+    }
+
+    /// Resolve a stream's id and mode (creating the stream, log mode, if it
+    /// does not exist — the same implicit creation `_bulk` has always
+    /// done), through a short TTL cache.
+    pub async fn stream_info(&self, name: &str) -> IngestResult<StreamInfo> {
+        if let Some((info, at)) = self.inner.stream_info.read().unwrap().get(name)
+            && at.elapsed() < STREAM_INFO_TTL
+        {
+            return Ok(*info);
+        }
+        let record = self.inner.metastore.ensure_stream(name).await?;
+        let info = StreamInfo {
+            id: record.id,
+            mode: record.mode(),
+        };
+        let mut cache = self.inner.stream_info.write().unwrap();
+        // Bounded: stream names are client-controlled.
+        if cache.len() > 10_000 {
+            cache.clear();
+        }
+        cache.insert(name.to_string(), (info, std::time::Instant::now()));
+        Ok(info)
+    }
+
+    /// Drop a cached [`StreamInfo`] (after this node changed the stream's
+    /// mode) so the next write re-reads it.
+    pub fn forget_stream(&self, name: &str) {
+        self.inner.stream_info.write().unwrap().remove(name);
     }
 
     /// Next write-sequence stamp (`_seq`) for a document accepted by this
@@ -676,17 +724,20 @@ async fn flush_inner(
     }
     if let Err(e) = inner
         .metastore
-        .stage_split(
-            &packaged.meta.split_id,
+        .stage_split(&rsearch_metastore::NewSplit {
+            split_id: &packaged.meta.split_id,
             stream_id,
-            &key,
-            packaged.meta.doc_count as i64,
-            packaged.size_bytes as i64,
-            packaged.meta.time_start_millis,
-            packaged.meta.time_end_millis,
-            packaged.footer_len as i64,
-            Some(&inner.config.node_id),
-        )
+            storage_key: &key,
+            doc_count: packaged.meta.doc_count as i64,
+            size_bytes: packaged.size_bytes as i64,
+            time_start_millis: packaged.meta.time_start_millis,
+            time_end_millis: packaged.meta.time_end_millis,
+            footer_len: packaged.footer_len as i64,
+            created_by: Some(&inner.config.node_id),
+            seq_min: packaged.meta.seq_min,
+            seq_max: packaged.meta.seq_max,
+            tombstone_seq_applied: 0,
+        })
         .await
     {
         return Err((IngestError::Metastore(e), batch));

@@ -41,6 +41,8 @@ pub struct SplitReader {
     /// The mapped schema this split was written with (its own mapping and
     /// layout version), so queries resolve fields by the split's ordinals.
     schema: Arc<MappedSchema>,
+    /// Tombstone exclusions applied so far (see `apply_tombstones`).
+    pub(crate) exclusions: std::sync::Mutex<Arc<crate::exclusions::ExclusionSet>>,
 }
 
 impl SplitReader {
@@ -104,11 +106,20 @@ impl SplitReader {
         .map_err(|e| IndexError::InvalidDocument(format!("open task failed: {e}")))??;
         let mapping = IndexMapping::from_json(&meta.split.mapping).unwrap_or_default();
         let schema = Arc::new(MappedSchema::build_versioned(mapping, meta.split.schema_version));
+        let segment_ids: Vec<tantivy::index::SegmentId> = reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|s| s.segment_id())
+            .collect();
         Ok(Self {
             meta,
             index,
             reader,
             schema,
+            exclusions: std::sync::Mutex::new(Arc::new(
+                crate::exclusions::ExclusionSet::empty(segment_ids),
+            )),
         })
     }
 

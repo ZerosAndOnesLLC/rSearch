@@ -359,7 +359,7 @@ tombstones in the metastore since splits are immutable shared objects):
       document_max_batch_secs` (default 5) bounds time-to-searchable for
       document-mode streams; `PUT /{index}` classifies as
       `Ingest(index)` (ingest keys already create streams via `_bulk`).
-- [ ] 14.3 Tombstones + deletion semantics: migration `doc_tombstones`
+- [x] 14.3 Tombstones + deletion semantics: migration `doc_tombstones`
       (+ `splits.seq_min/seq_max/tombstone_seq_applied`); metastore
       upsert-batch / list-since-seq / stats; bulk `delete` accepted on
       document-mode streams (rejected with the existing message on log

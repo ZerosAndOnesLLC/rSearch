@@ -11,16 +11,18 @@ mod locations;
 mod metastore;
 mod nodes;
 mod routing;
+mod tombstones;
 mod types;
 
 pub use alerts::AlertRecord;
 pub use auth::{ApiKeyRecord, UserRecord};
 pub use control::CONTROL_LEADER_LOCK;
 pub use routing::RoutingRuleRecord;
+pub use tombstones::{NewTombstone, TombstoneRecord};
 
 pub use error::{MetastoreError, MetastoreResult};
 pub use metastore::Metastore;
 pub use types::{
-    NodeRecord, SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats,
+    NewSplit, NodeRecord, SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats,
     UnderReplicatedKey,
 };

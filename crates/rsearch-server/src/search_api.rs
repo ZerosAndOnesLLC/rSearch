@@ -279,6 +279,9 @@ pub async fn put_index(
             // Existing stream with a different mode: allowed only while it
             // is still empty (e.g. auto-created by a first _bulk).
             state.metastore.set_stream_mode(&index, mode).await?;
+            if let Some(pipeline) = &state.pipeline {
+                pipeline.forget_stream(&index);
+            }
         }
         if let Some(mapping) = &mapping {
             state.metastore.update_stream_mapping(&index, mapping).await?;

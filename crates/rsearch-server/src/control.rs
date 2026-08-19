@@ -629,17 +629,20 @@ impl ControlPlane {
         let key = format!("streams/{}/{}.split", stream.name, packaged.meta.split_id);
         self.storage.put_file(&key, &packaged.file_path).await?;
         self.metastore
-            .stage_split(
-                &packaged.meta.split_id,
+            .stage_split(&rsearch_metastore::NewSplit {
+                split_id: &packaged.meta.split_id,
                 stream_id,
-                &key,
-                packaged.meta.doc_count as i64,
-                packaged.size_bytes as i64,
-                packaged.meta.time_start_millis,
-                packaged.meta.time_end_millis,
-                packaged.footer_len as i64,
-                Some(&self.node_id),
-            )
+                storage_key: &key,
+                doc_count: packaged.meta.doc_count as i64,
+                size_bytes: packaged.size_bytes as i64,
+                time_start_millis: packaged.meta.time_start_millis,
+                time_end_millis: packaged.meta.time_end_millis,
+                footer_len: packaged.footer_len as i64,
+                created_by: Some(&self.node_id),
+                seq_min: packaged.meta.seq_min,
+                seq_max: packaged.meta.seq_max,
+                tombstone_seq_applied: 0,
+            })
             .await?;
         let old_ids: Vec<String> = group.iter().map(|s| s.split_id.clone()).collect();
         self.metastore
@@ -772,6 +775,9 @@ mod tests {
             time_end_millis: id * 1_000 + 999,
             footer_len: 0,
             created_by: None,
+            seq_min: None,
+            seq_max: None,
+            tombstone_seq_applied: 0,
         }
     }
 

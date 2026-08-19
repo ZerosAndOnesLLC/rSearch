@@ -19,6 +19,8 @@ pub struct SplitBuilder {
     doc_count: u64,
     min_ts_millis: i64,
     max_ts_millis: i64,
+    min_seq: i64,
+    max_seq: i64,
 }
 
 /// A finished split: a single bundled file on local disk plus its
@@ -63,6 +65,8 @@ impl SplitBuilder {
             doc_count: 0,
             min_ts_millis: i64::MAX,
             max_ts_millis: i64::MIN,
+            min_seq: i64::MAX,
+            max_seq: i64::MIN,
         })
     }
 
@@ -107,6 +111,8 @@ impl SplitBuilder {
         self.writer.add_document(converted)?;
         self.min_ts_millis = self.min_ts_millis.min(millis);
         self.max_ts_millis = self.max_ts_millis.max(millis);
+        self.min_seq = self.min_seq.min(identity.seq);
+        self.max_seq = self.max_seq.max(identity.seq);
         self.doc_count += 1;
         Ok(())
     }
@@ -133,6 +139,8 @@ impl SplitBuilder {
             time_end_millis: self.max_ts_millis,
             mapping: self.converter.schema().mapping.to_json(),
             schema_version: self.converter.schema().schema_version,
+            seq_min: self.converter.schema().seq.map(|_| self.min_seq),
+            seq_max: self.converter.schema().seq.map(|_| self.max_seq),
         };
 
         let file_path = self.work_dir.path().join(format!("{}.split", self.split_id));

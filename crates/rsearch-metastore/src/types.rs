@@ -119,6 +119,42 @@ pub struct SplitRecord {
     pub footer_len: i64,
     /// Id of the node that built the split, when known.
     pub created_by: Option<String>,
+    /// Lowest `_seq` in the split; None for legacy splits without ids.
+    pub seq_min: Option<i64>,
+    /// Highest `_seq` in the split; None for legacy splits without ids.
+    pub seq_max: Option<i64>,
+    /// Highest tombstone `seq` applied when the split was built (0 for
+    /// ingest-built splits: nothing applied yet).
+    pub tombstone_seq_applied: i64,
+}
+
+/// A split to register (see `Metastore::stage_split`).
+#[derive(Debug, Clone)]
+pub struct NewSplit<'a> {
+    /// Globally unique split identifier.
+    pub split_id: &'a str,
+    /// Owning stream id.
+    pub stream_id: i64,
+    /// Object key in storage.
+    pub storage_key: &'a str,
+    /// Documents in the split.
+    pub doc_count: i64,
+    /// Split file size.
+    pub size_bytes: i64,
+    /// Earliest document timestamp, epoch millis.
+    pub time_start_millis: i64,
+    /// Latest document timestamp, epoch millis.
+    pub time_end_millis: i64,
+    /// Footer metadata length.
+    pub footer_len: i64,
+    /// Building node id.
+    pub created_by: Option<&'a str>,
+    /// Lowest `_seq` (None when the split has no ids).
+    pub seq_min: Option<i64>,
+    /// Highest `_seq` (None when the split has no ids).
+    pub seq_max: Option<i64>,
+    /// Highest tombstone seq applied while building.
+    pub tombstone_seq_applied: i64,
 }
 
 impl SplitRecord {

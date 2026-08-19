@@ -1,17 +1,26 @@
 //! `_bulk` NDJSON parsing: alternating action and document lines, per the
-//! ES/OpenSearch wire format. Log ingestion supports `index` and `create`
-//! actions; `delete`/`update` are rejected per item (immutable log store).
+//! ES/OpenSearch wire format. All four actions parse; whether `delete`
+//! and `update` are *accepted* depends on the target stream's mode (log
+//! streams reject them per item, document streams honor them) — that is
+//! the handler's call, so the parser stays mode-agnostic.
 
 use serde_json::Value;
 
-/// Accepted bulk action kinds (both index the document; the immutable
-/// log store makes no update-vs-create distinction).
+/// Bulk action kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkAction {
-    /// An `{"index": …}` action line.
+    /// An `{"index": …}` action line: write the document (document-mode
+    /// streams replace an existing `_id`).
     Index,
-    /// A `{"create": …}` action line.
+    /// A `{"create": …}` action line: write only if the `_id` is absent
+    /// (document mode); indistinguishable from `index` on log streams.
     Create,
+    /// An `{"update": …}` action line followed by `{"doc": …}`: partial
+    /// update of an existing document (document mode only).
+    Update,
+    /// A `{"delete": …}` action line (no document line): hide every
+    /// version of the `_id` (document mode only).
+    Delete,
 }
 
 impl BulkAction {
@@ -20,23 +29,46 @@ impl BulkAction {
         match self {
             BulkAction::Index => "index",
             BulkAction::Create => "create",
+            BulkAction::Update => "update",
+            BulkAction::Delete => "delete",
+        }
+    }
+
+    /// Whether the action needs a following document line.
+    fn has_doc_line(&self) -> bool {
+        !matches!(self, BulkAction::Delete)
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "index" => Some(BulkAction::Index),
+            "create" => Some(BulkAction::Create),
+            "update" => Some(BulkAction::Update),
+            "delete" => Some(BulkAction::Delete),
+            _ => None,
         }
     }
 }
 
-/// One accepted document.
+/// One parsed action.
 #[derive(Debug)]
 pub struct BulkItem {
-    /// The action kind that carried the document.
+    /// The action kind.
     pub action: BulkAction,
     /// Target stream: the action line's `_index`, or the URL default.
     pub stream: String,
-    /// Document id: the action line's `_id`, or a generated UUID.
+    /// Document id: the action line's `_id`, or a generated UUID for
+    /// `index`/`create` without one (`update`/`delete` require it).
     pub doc_id: String,
-    /// The parsed document body.
+    /// Whether the client supplied the `_id` (vs. generated here).
+    pub explicit_id: bool,
+    /// The parsed body: the document for `index`/`create`, the update
+    /// body (`{"doc": …, "doc_as_upsert": …}`) for `update`, `Null` for
+    /// `delete`.
     pub doc: Value,
-    /// The client's original document line, stored verbatim as `_source`
-    /// and written to the WAL — avoids re-serializing the parsed value.
+    /// The client's original body line (empty for `delete`), stored
+    /// verbatim as `_source` and written to the WAL for `index`/`create` —
+    /// avoids re-serializing the parsed value.
     pub raw: std::sync::Arc<str>,
 }
 
@@ -84,93 +116,72 @@ pub fn parse_bulk_body(
             .or(default_index)
             .unwrap_or("")
             .to_string();
+        let explicit_id = meta.get("_id").and_then(|v| v.as_str()).is_some();
         let doc_id = meta
             .get("_id")
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
-        match action_name {
-            "index" | "create" => {
-                let action = if action_name == "index" {
-                    BulkAction::Index
+        let Some(action) = BulkAction::parse(action_name) else {
+            return Err(format!(
+                "unknown bulk action '{action_name}' at action {}",
+                position + 1
+            ));
+        };
+        let reject = |outcome: &mut BulkParseOutcome, reason: String| {
+            outcome
+                .rejections
+                .push((position, action_name.to_string(), index.clone(), reason));
+        };
+        if !action.has_doc_line() {
+            if index.is_empty() {
+                reject(&mut outcome, "no index specified in action or URL".to_string());
+            } else if !explicit_id {
+                reject(&mut outcome, format!("{action_name} requires an _id"));
+            } else {
+                outcome.items.push((
+                    position,
+                    BulkItem {
+                        action,
+                        stream: index,
+                        doc_id,
+                        explicit_id,
+                        doc: Value::Null,
+                        raw: std::sync::Arc::from(""),
+                    },
+                ));
+            }
+            position += 1;
+            continue;
+        }
+        let Some(doc_line) = lines.next() else {
+            reject(&mut outcome, "missing document line".to_string());
+            position += 1; // count this partial action...
+            break; // ...then the post-loop `total = position` is correct
+        };
+        match serde_json::from_str::<Value>(doc_line) {
+            Ok(doc) if doc.is_object() => {
+                if index.is_empty() {
+                    reject(&mut outcome, "no index specified in action or URL".to_string());
+                } else if action == BulkAction::Update && !explicit_id {
+                    reject(&mut outcome, "update requires an _id".to_string());
                 } else {
-                    BulkAction::Create
-                };
-                let Some(doc_line) = lines.next() else {
-                    outcome.rejections.push((
+                    outcome.items.push((
                         position,
-                        action_name.to_string(),
-                        index,
-                        "missing document line".to_string(),
+                        BulkItem {
+                            action,
+                            stream: index,
+                            doc_id,
+                            explicit_id,
+                            doc,
+                            raw: std::sync::Arc::from(doc_line),
+                        },
                     ));
-                    position += 1; // count this partial action...
-                    break; // ...then the post-loop `total = position` is correct
-                };
-                match serde_json::from_str::<Value>(doc_line) {
-                    Ok(doc) if doc.is_object() => {
-                        if index.is_empty() {
-                            outcome.rejections.push((
-                                position,
-                                action_name.to_string(),
-                                index,
-                                "no index specified in action or URL".to_string(),
-                            ));
-                        } else {
-                            outcome.items.push((
-                                position,
-                                BulkItem {
-                                    action,
-                                    stream: index,
-                                    doc_id,
-                                    doc,
-                                    raw: std::sync::Arc::from(doc_line),
-                                },
-                            ));
-                        }
-                    }
-                    Ok(_) => {
-                        outcome.rejections.push((
-                            position,
-                            action_name.to_string(),
-                            index,
-                            "document must be a JSON object".to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        outcome.rejections.push((
-                            position,
-                            action_name.to_string(),
-                            index,
-                            format!("document is not valid JSON: {e}"),
-                        ));
-                    }
                 }
             }
-            "delete" => {
-                outcome.rejections.push((
-                    position,
-                    "delete".to_string(),
-                    index,
-                    "delete is not supported on an immutable log store".to_string(),
-                ));
-            }
-            "update" => {
-                // Update actions carry a following doc line — consume it.
-                let _ = lines.next();
-                outcome.rejections.push((
-                    position,
-                    "update".to_string(),
-                    index,
-                    "update is not supported on an immutable log store".to_string(),
-                ));
-            }
-            other => {
-                return Err(format!(
-                    "unknown bulk action '{other}' at action {}",
-                    position + 1
-                ));
-            }
+            Ok(_) => reject(&mut outcome, "document must be a JSON object".to_string()),
+            Err(e) => reject(&mut outcome, format!("document is not valid JSON: {e}")),
         }
         position += 1;
     }
@@ -213,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_update_and_bad_docs_per_item() {
+    fn parses_delete_and_update_and_rejects_bad_docs_per_item() {
         let body = concat!(
             "{\"delete\":{\"_index\":\"logs\",\"_id\":\"1\"}}\n",
             "{\"index\":{\"_index\":\"logs\"}}\n",
@@ -225,10 +236,34 @@ mod tests {
         );
         let out = parse_bulk_body(body, None).unwrap();
         assert_eq!(out.total, 4);
+        assert_eq!(out.items.len(), 3);
+        assert_eq!(out.rejections.len(), 1);
+        assert_eq!(out.rejections[0].0, 1);
+        let (pos, delete) = &out.items[0];
+        assert_eq!((*pos, delete.action), (0, BulkAction::Delete));
+        assert!(delete.explicit_id && delete.doc.is_null() && delete.raw.is_empty());
+        let (pos, update) = &out.items[1];
+        assert_eq!((*pos, update.action), (2, BulkAction::Update));
+        assert_eq!(update.doc["doc"]["x"], 1);
+        assert_eq!(out.items[2].1.action, BulkAction::Index);
+        assert!(!out.items[2].1.explicit_id);
+    }
+
+    #[test]
+    fn delete_and_update_require_an_id() {
+        let body = concat!(
+            "{\"delete\":{\"_index\":\"logs\"}}\n",
+            "{\"update\":{\"_index\":\"logs\"}}\n",
+            "{\"doc\":{}}\n",
+            "{\"index\":{\"_index\":\"logs\"}}\n",
+            "{\"ok\":true}\n",
+        );
+        let out = parse_bulk_body(body, None).unwrap();
+        assert_eq!(out.total, 3);
         assert_eq!(out.items.len(), 1);
-        assert_eq!(out.rejections.len(), 3);
-        assert_eq!(out.rejections[0].1, "delete");
-        assert_eq!(out.rejections[2].1, "update");
+        assert_eq!(out.rejections.len(), 2);
+        assert!(out.rejections[0].3.contains("requires an _id"));
+        assert!(out.rejections[1].3.contains("requires an _id"));
     }
 
     #[test]
