@@ -12,12 +12,62 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use rsearch_index::{IndexMapping, MappedSchema, SplitBuilder};
-use rsearch_metastore::Metastore;
+use rsearch_index::{DocIdentity, IndexMapping, MappedSchema, SplitBuilder};
+use rsearch_metastore::{Metastore, StreamMode};
 use rsearch_storage::Storage;
 
 use crate::error::{IngestError, IngestResult};
-use crate::wal::{Wal, WalPos, WalReplay};
+use crate::wal::{Wal, WalItem, WalPos, WalReplay};
+
+/// What the write path needs to know about a stream per request: its id
+/// (tombstones are keyed by it) and its mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// The stream's metastore id.
+    pub id: i64,
+    /// Log or document mode.
+    pub mode: StreamMode,
+}
+
+/// How long a resolved [`StreamInfo`] is reused before the metastore is
+/// asked again. A mode can only change while a stream is empty, so
+/// staleness is bounded and harmless; the node that changes it forgets
+/// its own entry immediately.
+const STREAM_INFO_TTL: Duration = Duration::from_secs(10);
+
+/// Write-sequence source: a hybrid logical clock. Stamps are micros
+/// since epoch, forced strictly increasing across calls on one node, and
+/// pushed past every sequence this node has *observed* from the cluster
+/// (tombstone bounds of the ids being written, the stream's highest
+/// published `_seq`) — so a replacement written on a node whose wall
+/// clock lags the previous writer's still orders after it. Wall clocks
+/// only set the pace; causality comes from the observations.
+#[derive(Default)]
+pub struct SeqClock {
+    last: std::sync::atomic::AtomicI64,
+}
+
+impl SeqClock {
+    /// Fold a sequence seen elsewhere into the clock: later stamps exceed it.
+    pub fn observe(&self, seen: i64) {
+        self.last.fetch_max(seen, Ordering::AcqRel);
+    }
+
+    /// Next sequence stamp.
+    pub fn next(&self) -> i64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        // fetch_update: `last = max(last + 1, now)` atomically.
+        self.last
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+                Some(now.max(last.saturating_add(1)))
+            })
+            .map(|prev| now.max(prev.saturating_add(1)))
+            .unwrap_or(now)
+    }
+}
 
 /// Tuning knobs for the ingest pipeline.
 #[derive(Clone)]
@@ -27,6 +77,8 @@ pub struct PipelineConfig {
     /// Flush a non-empty batch after this many seconds regardless of
     /// size (bounds time-to-searchable).
     pub max_batch_secs: u64,
+    /// The same bound for document-mode streams.
+    pub document_max_batch_secs: u64,
     /// Per-stream bounded queue depth in documents; a full queue
     /// rejects with [`IngestError::Saturated`].
     pub queue_capacity: usize,
@@ -38,12 +90,21 @@ pub struct PipelineConfig {
     pub node_id: String,
 }
 
+/// What a stream worker receives: documents to index, or a request to cut
+/// the current batch now (`?refresh=wait_for`) and say when it's published.
+enum WorkerMsg {
+    Doc(WorkItem),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 struct WorkItem {
     /// Original document bytes. The queue holds only these (not a parsed
     /// Value, which is several times larger in memory) — the indexer
     /// re-parses on the blocking thread. Keeps ingest RSS low, which is
     /// the whole point of the engine.
     source: Arc<str>,
+    /// Document identity (`_id`, `_seq`).
+    identity: DocIdentity,
     pos: WalPos,
 }
 
@@ -72,7 +133,7 @@ struct PipelineInner {
     /// Stream → worker sender. Read-locked (sync, never across an await)
     /// on the per-document hot path; the write lock is only ever taken to
     /// insert a newly created worker.
-    workers: std::sync::RwLock<HashMap<String, mpsc::Sender<WorkItem>>>,
+    workers: std::sync::RwLock<HashMap<String, mpsc::Sender<WorkerMsg>>>,
     /// Single-flights first-time worker creation so the metastore resolve
     /// never runs under `workers` — enqueues to existing streams are not
     /// blocked while a new stream's row is being created.
@@ -80,6 +141,10 @@ struct PipelineInner {
     metrics: IngestMetrics,
     /// Routing rules, refreshed periodically from the metastore.
     rules: std::sync::RwLock<Arc<Vec<rsearch_metastore::RoutingRuleRecord>>>,
+    /// Write-sequence source shared by every ingest entry point.
+    seq: SeqClock,
+    /// Stream name → (info, resolved at). Read-locked per request.
+    stream_info: std::sync::RwLock<HashMap<String, (StreamInfo, std::time::Instant)>>,
 }
 
 /// Cloneable handle to the shared ingest pipeline: routes documents,
@@ -116,6 +181,8 @@ impl IngestPipeline {
                 worker_create: tokio::sync::Mutex::new(()),
                 metrics: IngestMetrics::default(),
                 rules: std::sync::RwLock::new(Arc::new(Vec::new())),
+                seq: SeqClock::default(),
+                stream_info: std::sync::RwLock::new(HashMap::new()),
             }),
         };
         // Keep the routing-rule cache warm.
@@ -190,22 +257,30 @@ impl IngestPipeline {
     ) -> IngestResult<(usize, usize)> {
         // Programmatic inputs have no original line, so serialize once and
         // share the Arc across every route.
-        let mut pairs: Vec<(String, Arc<str>)> = Vec::new();
+        let mut items: Vec<WalItem> = Vec::new();
         for doc in docs {
             let source: Arc<str> = Arc::from(doc.to_string());
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let seq = self.next_seq();
             for stream in self.expand_routes(default_stream, &doc) {
-                pairs.push((stream, source.clone()));
+                items.push(WalItem {
+                    stream,
+                    id: id.clone(),
+                    seq,
+                    tombstone: false,
+                    doc: source.clone(),
+                });
             }
         }
-        if pairs.is_empty() {
+        if items.is_empty() {
             return Ok((0, 0));
         }
-        // The pairs move into the blocking task and back so the WAL append
+        // The items move into the blocking task and back so the WAL append
         // works on the existing strings — no per-document byte copies.
         let wal = self.inner.wal.clone();
-        let (pairs, positions) = tokio::task::spawn_blocking(move || {
-            let positions = wal.append_batch(&pairs);
-            (pairs, positions)
+        let (items, positions) = tokio::task::spawn_blocking(move || {
+            let positions = wal.append_batch(&items);
+            (items, positions)
         })
         .await
         .map_err(|e| IngestError::Wal(std::io::Error::other(e.to_string())))?;
@@ -213,8 +288,9 @@ impl IngestPipeline {
 
         let mut accepted = 0;
         let mut dropped = 0;
-        for ((stream, source), pos) in pairs.into_iter().zip(positions) {
-            match self.enqueue(&stream, source, pos).await {
+        for (item, pos) in items.into_iter().zip(positions) {
+            let identity = DocIdentity::new(item.id, item.seq);
+            match self.enqueue(&item.stream, item.doc, identity, pos).await {
                 Ok(()) => accepted += 1,
                 Err(_) => {
                     self.inner.wal.confirm(&[pos]);
@@ -238,15 +314,90 @@ impl IngestPipeline {
         &self.inner.wal
     }
 
+    /// Resolve a stream's id and mode (creating the stream, log mode, if it
+    /// does not exist — the same implicit creation `_bulk` has always
+    /// done), through a short TTL cache.
+    pub async fn stream_info(&self, name: &str) -> IngestResult<StreamInfo> {
+        if let Some((info, at)) = self.inner.stream_info.read().unwrap().get(name)
+            && at.elapsed() < STREAM_INFO_TTL
+        {
+            return Ok(*info);
+        }
+        let record = self.inner.metastore.ensure_stream(name).await?;
+        let info = StreamInfo {
+            id: record.id,
+            mode: record.mode(),
+        };
+        if info.mode == StreamMode::Document {
+            // Order this node's next writes after everything already
+            // published for the stream (cheap lower bound; the per-id
+            // tombstone bounds the bulk handler observes are exact).
+            if let Some(max) = self.inner.metastore.stream_max_seq(info.id).await? {
+                self.inner.seq.observe(max);
+            }
+        }
+        let mut cache = self.inner.stream_info.write().unwrap();
+        // Bounded: stream names are client-controlled.
+        if cache.len() > 10_000 {
+            cache.clear();
+        }
+        cache.insert(name.to_string(), (info, std::time::Instant::now()));
+        Ok(info)
+    }
+
+    /// Like [`IngestPipeline::stream_info`] but never creates the stream:
+    /// `Ok(None)` when it does not exist.
+    pub async fn stream_info_if_exists(&self, name: &str) -> IngestResult<Option<StreamInfo>> {
+        if let Some((info, at)) = self.inner.stream_info.read().unwrap().get(name)
+            && at.elapsed() < STREAM_INFO_TTL
+        {
+            return Ok(Some(*info));
+        }
+        match self.inner.metastore.get_stream(name).await {
+            Ok(_) => self.stream_info(name).await.map(Some),
+            Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop a cached [`StreamInfo`] (after this node changed the stream's
+    /// mode) so the next write re-reads it.
+    pub fn forget_stream(&self, name: &str) {
+        self.inner.stream_info.write().unwrap().remove(name);
+    }
+
+    /// Next write-sequence stamp (`_seq`) for a document accepted by this
+    /// node. Take it before the WAL append so the stamp is what gets
+    /// persisted and replayed.
+    pub fn next_seq(&self) -> i64 {
+        self.inner.seq.next()
+    }
+
+    /// Push the sequence clock past a sequence observed elsewhere (see
+    /// [`SeqClock::observe`]).
+    pub fn observe_seq(&self, seen: i64) {
+        self.inner.seq.observe(seen);
+    }
+
     /// Enqueue a WAL-durable document for indexing. `source` is the exact
     /// document bytes — stored as `_source` and re-parsed by the indexer.
     /// Fails with [`IngestError::Saturated`] when the stream's queue is
     /// full — the caller reports a per-item 429 and confirms the WAL
     /// position.
-    pub async fn enqueue(&self, stream: &str, source: Arc<str>, pos: WalPos) -> IngestResult<()> {
+    pub async fn enqueue(
+        &self,
+        stream: &str,
+        source: Arc<str>,
+        identity: DocIdentity,
+        pos: WalPos,
+    ) -> IngestResult<()> {
         let tx = self.worker_for(stream).await?;
         let size = source.len() as u64;
-        match tx.try_send(WorkItem { source, pos }) {
+        match tx.try_send(WorkerMsg::Doc(WorkItem {
+            source,
+            identity,
+            pos,
+        })) {
             Ok(()) => {
                 self.note_enqueued(size);
                 Ok(())
@@ -284,9 +435,29 @@ impl IngestPipeline {
     /// not be dropped for backpressure.
     pub async fn replay(&self, records: WalReplay) -> IngestResult<usize> {
         let mut count = 0usize;
+        // Records flagged as replacements re-issue their tombstone before
+        // the document is re-indexed (upserts only raise, so doing it
+        // twice is harmless; skipping it would resurrect the old version).
+        let mut pending_tombstones: Vec<rsearch_metastore::NewTombstone> = Vec::new();
         for record in records {
             let record = record.map_err(IngestError::Wal)?;
             count += 1;
+            if record.tombstone {
+                let info = self.stream_info(&record.stream).await?;
+                pending_tombstones.push(rsearch_metastore::NewTombstone {
+                    stream_id: info.id,
+                    doc_id: record.id.clone(),
+                    before_seq: record.seq,
+                });
+                self.inner.seq.observe(record.seq);
+                if pending_tombstones.len() >= 1_000 {
+                    self.inner
+                        .metastore
+                        .upsert_tombstones(&pending_tombstones)
+                        .await?;
+                    pending_tombstones.clear();
+                }
+            }
             // Validate the payload is parseable JSON; the WAL payload IS
             // the source bytes, so we don't keep the parsed value.
             if serde_json::from_slice::<serde::de::IgnoredAny>(&record.doc).is_err() {
@@ -303,10 +474,11 @@ impl IngestPipeline {
             let tx = self.worker_for(&record.stream).await?;
             self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
             if tx
-                .send(WorkItem {
+                .send(WorkerMsg::Doc(WorkItem {
                     source,
+                    identity: DocIdentity::new(record.id, record.seq),
                     pos: record.pos,
-                })
+                }))
                 .await
                 .is_err()
             {
@@ -318,13 +490,41 @@ impl IngestPipeline {
                 warn!(stream = %record.stream, "worker gone during replay; record dropped");
             }
         }
+        if !pending_tombstones.is_empty() {
+            self.inner
+                .metastore
+                .upsert_tombstones(&pending_tombstones)
+                .await?;
+        }
         if count > 0 {
             info!(count, "replayed WAL records into pipeline");
         }
         Ok(count)
     }
 
-    async fn worker_for(&self, stream: &str) -> IngestResult<mpsc::Sender<WorkItem>> {
+    /// Cut the stream's current batch into a split now and resolve once it
+    /// is published (or immediately when nothing is buffered on this
+    /// node). Backs `?refresh=true|wait_for`. Only this node's buffer is
+    /// flushed — with bulk handoff the flag travels to the node that
+    /// indexed the batch, which is the one whose buffer matters.
+    pub async fn flush_stream(&self, stream: &str) -> IngestResult<()> {
+        let tx = match self.inner.workers.read().unwrap().get(stream) {
+            Some(tx) => tx.clone(),
+            // No worker: nothing buffered here.
+            None => return Ok(()),
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if tx.send(WorkerMsg::Flush(done_tx)).await.is_err() {
+            // Worker retired between the lookup and the send; its buffer
+            // was flushed on the way out.
+            return Ok(());
+        }
+        // A dropped sender means the worker exited after flushing.
+        let _ = done_rx.await;
+        Ok(())
+    }
+
+    async fn worker_for(&self, stream: &str) -> IngestResult<mpsc::Sender<WorkerMsg>> {
         if let Some(tx) = self.inner.workers.read().unwrap().get(stream) {
             return Ok(tx.clone());
         }
@@ -343,6 +543,7 @@ impl IngestPipeline {
             self.inner.clone(),
             stream.to_string(),
             record.id,
+            record.is_document_mode(),
             schema,
             rx,
         ));
@@ -365,13 +566,21 @@ async fn stream_worker(
     inner: Arc<PipelineInner>,
     stream: String,
     stream_id: i64,
+    document_mode: bool,
     schema: MappedSchema,
-    mut rx: mpsc::Receiver<WorkItem>,
+    mut rx: mpsc::Receiver<WorkerMsg>,
 ) {
     let max_docs = inner.config.max_batch_docs.max(1);
-    let max_age = Duration::from_secs(inner.config.max_batch_secs.max(1));
+    let age_secs = if document_mode {
+        inner.config.document_max_batch_secs
+    } else {
+        inner.config.max_batch_secs
+    };
+    let max_age = Duration::from_secs(age_secs.max(1));
     let idle_exit = Duration::from_secs(WORKER_IDLE_EXIT_SECS);
     let mut buffer: Vec<WorkItem> = Vec::new();
+    // Refresh waiters, answered after the next flush completes.
+    let mut waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle_exit;
     // Re-resolved before each flush so a mapping change (PUT /{index})
     // takes effect on the next split, not only after a restart (L7).
@@ -380,13 +589,23 @@ async fn stream_worker(
 
     loop {
         let flush_now = tokio::select! {
-            item = rx.recv() => match item {
-                Some(item) => {
+            msg = rx.recv() => match msg {
+                Some(WorkerMsg::Doc(item)) => {
                     if buffer.is_empty() {
                         deadline = tokio::time::Instant::now() + max_age;
                     }
                     buffer.push(item);
                     buffer.len() >= max_docs
+                }
+                Some(WorkerMsg::Flush(done)) => {
+                    if buffer.is_empty() {
+                        // Nothing to cut: the waiter is satisfied now.
+                        let _ = done.send(());
+                        false
+                    } else {
+                        waiters.push(done);
+                        true
+                    }
                 }
                 None => {
                     // Channel closed: final flush then exit.
@@ -406,11 +625,17 @@ async fn stream_worker(
                     // re-creates a fresh worker via worker_for.
                     inner.workers.write().unwrap().remove(&stream);
                     rx.close();
-                    while let Ok(item) = rx.try_recv() {
-                        buffer.push(item);
+                    while let Ok(msg) = rx.try_recv() {
+                        match msg {
+                            WorkerMsg::Doc(item) => buffer.push(item),
+                            WorkerMsg::Flush(done) => waiters.push(done),
+                        }
                     }
                     if !buffer.is_empty() {
                         flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+                    }
+                    for done in waiters.drain(..) {
+                        let _ = done.send(());
                     }
                     info!(stream, "idle stream worker retired");
                     return;
@@ -428,6 +653,9 @@ async fn stream_worker(
                 mapping_json = record.mapping;
             }
             flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+            for done in waiters.drain(..) {
+                let _ = done.send(());
+            }
             deadline = tokio::time::Instant::now() + idle_exit;
         }
     }
@@ -553,7 +781,7 @@ async fn flush_inner(
                 // retry starts from a fresh one, so a builder corrupted
                 // by an unwound panic can at worst fail this attempt.
                 let added = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    builder.add_json_with_source(doc, Some(&item.source), fallback)
+                    builder.add_document(doc, Some(&item.source), &item.identity, fallback)
                 }));
                 match added {
                     Ok(Ok(())) => {}
@@ -609,17 +837,20 @@ async fn flush_inner(
     }
     if let Err(e) = inner
         .metastore
-        .stage_split(
-            &packaged.meta.split_id,
+        .stage_split(&rsearch_metastore::NewSplit {
+            split_id: &packaged.meta.split_id,
             stream_id,
-            &key,
-            packaged.meta.doc_count as i64,
-            packaged.size_bytes as i64,
-            packaged.meta.time_start_millis,
-            packaged.meta.time_end_millis,
-            packaged.footer_len as i64,
-            Some(&inner.config.node_id),
-        )
+            storage_key: &key,
+            doc_count: packaged.meta.doc_count as i64,
+            size_bytes: packaged.size_bytes as i64,
+            time_start_millis: packaged.meta.time_start_millis,
+            time_end_millis: packaged.meta.time_end_millis,
+            footer_len: packaged.footer_len as i64,
+            created_by: Some(&inner.config.node_id),
+            seq_min: packaged.meta.seq_min,
+            seq_max: packaged.meta.seq_max,
+            tombstone_seq_applied: 0,
+        })
         .await
     {
         return Err((IngestError::Metastore(e), batch));
@@ -628,4 +859,26 @@ async fn flush_inner(
         return Err((IngestError::Metastore(e), batch));
     }
     Ok(Some((packaged.meta.split_id, indexed)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeqClock;
+
+    #[test]
+    fn seq_clock_is_monotonic_and_observes() {
+        let clock = SeqClock::default();
+        let a = clock.next();
+        let b = clock.next();
+        assert!(b > a);
+        // Observing a sequence from the future (a peer whose clock is
+        // ahead) pushes the next stamp past it.
+        let far = a + 10_000_000_000;
+        clock.observe(far);
+        assert!(clock.next() > far);
+        // Observing the past changes nothing.
+        let c = clock.next();
+        clock.observe(a);
+        assert!(clock.next() > c);
+    }
 }

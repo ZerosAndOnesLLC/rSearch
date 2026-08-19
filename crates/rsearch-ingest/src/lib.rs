@@ -15,5 +15,5 @@ pub use inputs::spawn_inputs;
 pub use syslog::parse_syslog;
 pub use bulk::{BulkAction, BulkItem, BulkParseOutcome, parse_bulk_body};
 pub use error::{IngestError, IngestResult};
-pub use pipeline::{IngestPipeline, PipelineConfig};
-pub use wal::{Wal, WalPos, WalRecord, WalReplay};
+pub use pipeline::{IngestPipeline, PipelineConfig, SeqClock, StreamInfo};
+pub use wal::{Wal, WalItem, WalPos, WalRecord, WalReplay};

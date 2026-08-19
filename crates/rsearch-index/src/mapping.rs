@@ -7,10 +7,23 @@ use tantivy::schema::{
 
 use crate::error::{IndexError, IndexResult};
 
-/// Reserved fields present in every rsearch schema.
+/// Reserved stored `_source` field (the client's original document).
 pub const SOURCE_FIELD: &str = "_source";
+/// Reserved indexed+fast `_timestamp` field every document is sorted by.
 pub const TIMESTAMP_FIELD: &str = "_timestamp";
+/// Reserved JSON field unmapped keys are indexed under.
 pub const DYNAMIC_FIELD: &str = "_dynamic";
+/// Reserved document-id field (the client's `_id` or a generated UUID).
+/// Present in splits with `schema_version >= 1`.
+pub const ID_FIELD: &str = "_id";
+/// Reserved write-sequence field: a node-local monotonic stamp (micros
+/// since epoch) taken when the write was accepted. Orders versions of the
+/// same `_id` and scopes tombstones. Present with `schema_version >= 1`.
+pub const SEQ_FIELD: &str = "_seq";
+/// Schema version written into new splits. `0` (or absent in the footer)
+/// is the legacy layout without `_id`/`_seq`; `1` adds them after the
+/// mapped fields so legacy field ordinals are unchanged.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// Supported field types — the ES mapping subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,12 +131,25 @@ pub struct MappedSchema {
     pub fields: BTreeMap<String, (Field, FieldType)>,
     /// The mapping this schema was built from.
     pub mapping: IndexMapping,
+    /// Handle to the stored `_id` field; None for legacy (version 0)
+    /// schemas, which have no document ids.
+    pub id: Option<Field>,
+    /// Handle to the `_seq` fast field; None for legacy schemas.
+    pub seq: Option<Field>,
+    /// The layout version this schema follows.
+    pub schema_version: u32,
 }
 
 impl MappedSchema {
-    /// Build the Tantivy schema: reserved fields plus one field per
-    /// mapping entry, typed per [`FieldType`].
+    /// Build the current-version Tantivy schema: reserved fields plus one
+    /// field per mapping entry, typed per [`FieldType`].
     pub fn build(mapping: IndexMapping) -> Self {
+        Self::build_versioned(mapping, CURRENT_SCHEMA_VERSION)
+    }
+
+    /// Build the schema for a given layout version — used to interpret a
+    /// split exactly as it was written (field ordinals must match).
+    pub fn build_versioned(mapping: IndexMapping, schema_version: u32) -> Self {
         let mut builder = Schema::builder();
         let source = builder.add_text_field(SOURCE_FIELD, STORED);
         let timestamp = builder.add_date_field(
@@ -154,6 +180,16 @@ impl MappedSchema {
             };
             fields.insert(name.clone(), (field, *ty));
         }
+        // Appended last so a version-0 split's mapped-field ordinals are
+        // identical to a version-1 split built from the same mapping.
+        let (id, seq) = if schema_version >= 1 {
+            (
+                Some(builder.add_text_field(ID_FIELD, STRING | STORED)),
+                Some(builder.add_i64_field(SEQ_FIELD, INDEXED | FAST)),
+            )
+        } else {
+            (None, None)
+        };
 
         Self {
             schema: builder.build(),
@@ -162,6 +198,9 @@ impl MappedSchema {
             dynamic,
             fields,
             mapping,
+            id,
+            seq,
+            schema_version,
         }
     }
 }
@@ -211,7 +250,25 @@ mod tests {
         assert!(schema.schema.get_field(SOURCE_FIELD).is_ok());
         assert!(schema.schema.get_field(TIMESTAMP_FIELD).is_ok());
         assert!(schema.schema.get_field(DYNAMIC_FIELD).is_ok());
+        assert!(schema.schema.get_field(ID_FIELD).is_ok());
+        assert!(schema.schema.get_field(SEQ_FIELD).is_ok());
         assert!(schema.fields.is_empty());
+        assert_eq!(schema.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_schema_keeps_mapped_field_ordinals() {
+        let mapping = IndexMapping::from_json(&serde_json::json!({
+            "properties": {"a": {"type": "keyword"}, "b": {"type": "long"}}
+        }))
+        .unwrap();
+        let legacy = MappedSchema::build_versioned(mapping.clone(), 0);
+        let current = MappedSchema::build(mapping);
+        assert!(legacy.id.is_none() && legacy.seq.is_none());
+        assert!(legacy.schema.get_field(ID_FIELD).is_err());
+        for name in ["a", "b"] {
+            assert_eq!(legacy.fields[name].0, current.fields[name].0);
+        }
     }
 
     #[test]

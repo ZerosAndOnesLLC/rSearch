@@ -26,6 +26,14 @@ pub struct ControlMetrics {
     pub repair_failures: AtomicU64,
     pub drain_copies_moved: AtomicU64,
     pub drain_failures: AtomicU64,
+    /// Document-mode compaction: splits rewritten without hidden versions.
+    pub compactions: AtomicU64,
+    /// Documents physically removed by compaction rewrites.
+    pub compacted_docs: AtomicU64,
+    /// Tombstone rows purged from the metastore.
+    pub tombstones_purged: AtomicU64,
+    /// Tombstone rows pending (as of the last compaction scan).
+    pub tombstones_pending: AtomicU64,
 }
 
 fn counter(out: &mut String, name: &str, help: &str, value: u64) {
@@ -138,6 +146,30 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             "rsearch_drain_failures_total",
             "Drain copy attempts that failed or timed out.",
             control.drain_failures.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_compactions_total",
+            "Document-mode splits rewritten without their tombstoned versions.",
+            control.compactions.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_compacted_docs_total",
+            "Document versions physically removed by compaction.",
+            control.compacted_docs.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "rsearch_tombstones_pending",
+            "Tombstone rows in the metastore as of the last compaction scan.",
+            control.tombstones_pending.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_tombstones_purged_total",
+            "Tombstone rows purged once no split could still hold a hidden version.",
+            control.tombstones_purged.load(Ordering::Relaxed),
         );
     }
 

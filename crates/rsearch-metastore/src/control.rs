@@ -89,7 +89,8 @@ impl Metastore {
     ) -> MetastoreResult<Vec<SplitRecord>> {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
-                    time_start_millis, time_end_millis, footer_len, created_by
+                    time_start_millis, time_end_millis, footer_len, created_by,
+                    seq_min, seq_max, tombstone_seq_applied
              FROM splits
              WHERE state = 'published' AND size_bytes < $1
              ORDER BY stream_id, time_start_millis
@@ -135,7 +136,8 @@ impl Metastore {
     ) -> MetastoreResult<Vec<SplitRecord>> {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
-                    time_start_millis, time_end_millis, footer_len, created_by
+                    time_start_millis, time_end_millis, footer_len, created_by,
+                    seq_min, seq_max, tombstone_seq_applied
              FROM splits
              WHERE state = 'staged'
                AND created_at < now() - make_interval(secs => $1)
@@ -156,7 +158,8 @@ impl Metastore {
     ) -> MetastoreResult<Vec<SplitRecord>> {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
-                    time_start_millis, time_end_millis, footer_len, created_by
+                    time_start_millis, time_end_millis, footer_len, created_by,
+                    seq_min, seq_max, tombstone_seq_applied
              FROM splits
              WHERE state = 'marked_for_delete'
                AND updated_at < now() - make_interval(secs => $1)

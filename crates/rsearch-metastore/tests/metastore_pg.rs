@@ -3,7 +3,7 @@
 //!     cargo test -p rsearch-metastore -- --ignored
 
 use rsearch_common::config::MetastoreConfig;
-use rsearch_metastore::{Metastore, MetastoreError, SplitState};
+use rsearch_metastore::{Metastore, MetastoreError, NewSplit, SplitState, StreamMode};
 
 async fn metastore() -> Option<Metastore> {
     let url = std::env::var("RSEARCH_TEST_DATABASE_URL").ok()?;
@@ -46,22 +46,69 @@ async fn stream_crud_and_mapping() {
 
 #[tokio::test]
 #[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn stream_mode_is_fixed_once_data_exists() {
+    let Some(ms) = metastore().await else { return };
+    let name = unique("mode");
+
+    // Auto-created streams are log mode; an empty stream may switch.
+    let stream = ms.ensure_stream(&name).await.unwrap();
+    assert_eq!(stream.mode(), StreamMode::Log);
+    ms.set_stream_mode(&name, StreamMode::Document).await.unwrap();
+    assert!(ms.get_stream(&name).await.unwrap().is_document_mode());
+    // ensure_stream_with_mode never flips an existing stream.
+    let again = ms.ensure_stream_with_mode(&name, StreamMode::Log).await.unwrap();
+    assert_eq!(again.mode(), StreamMode::Document);
+
+    // Once a split exists the mode is fixed.
+    let split_id = unique("split");
+    ms.stage_split(&NewSplit {
+        split_id: &split_id,
+        stream_id: stream.id,
+        storage_key: "k",
+        doc_count: 1,
+        size_bytes: 1,
+        time_start_millis: 0,
+        time_end_millis: 0,
+        footer_len: 0,
+        created_by: None,
+        seq_min: None,
+        seq_max: None,
+        tombstone_seq_applied: 0,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        ms.set_stream_mode(&name, StreamMode::Log).await,
+        Err(MetastoreError::StreamModeFixed(_))
+    ));
+    assert!(matches!(
+        ms.set_stream_mode(&unique("missing"), StreamMode::Log).await,
+        Err(MetastoreError::StreamNotFound(_))
+    ));
+    ms.delete_stream(&name).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
 async fn split_state_machine() {
     let Some(ms) = metastore().await else { return };
     let stream = ms.ensure_stream(&unique("splits")).await.unwrap();
     let split_id = unique("split");
 
-    ms.stage_split(
-        &split_id,
-        stream.id,
-        &format!("streams/{}/{}.split", stream.name, split_id),
-        1000,
-        4096,
-        1_753_300_000_000,
-        1_753_300_060_000,
-        512,
-        Some("node-a"),
-    )
+    ms.stage_split(&NewSplit {
+        split_id: &split_id,
+        stream_id: stream.id,
+        storage_key: &format!("streams/{}/{}.split", stream.name, split_id),
+        doc_count: 1000,
+        size_bytes: 4096,
+        time_start_millis: 1_753_300_000_000,
+        time_end_millis: 1_753_300_060_000,
+        footer_len: 512,
+        created_by: Some("node-a"),
+        seq_min: Some(10),
+        seq_max: Some(20),
+        tombstone_seq_applied: 0,
+    })
     .await
     .unwrap();
 
@@ -235,4 +282,111 @@ async fn replication_targets_draining_last_resort() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn tombstones_upsert_and_page_by_seq() {
+    use rsearch_metastore::NewTombstone;
+    let Some(ms) = metastore().await else { return };
+    let stream = ms.ensure_stream(&unique("tomb")).await.unwrap();
+    let t = |doc: &str, before: i64| NewTombstone {
+        stream_id: stream.id,
+        doc_id: doc.to_string(),
+        before_seq: before,
+    };
+
+    // Duplicates within one batch collapse to the max before_seq.
+    ms.upsert_tombstones(&[t("a", 10), t("b", 20), t("a", 15)])
+        .await
+        .unwrap();
+    let rows = ms.tombstones_since(stream.id, 0, 100).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    let a = rows.iter().find(|r| r.doc_id == "a").unwrap().clone();
+    assert_eq!(a.before_seq, 15);
+    let last_seq = rows.iter().map(|r| r.seq).max().unwrap();
+
+    // Nothing new since the last seq.
+    assert!(ms.tombstones_since(stream.id, last_seq, 100).await.unwrap().is_empty());
+
+    // Raising an existing row re-sequences it so incremental readers see
+    // it again; lowering is ignored (keeps the max).
+    ms.upsert_tombstones(&[t("a", 30), t("b", 5)]).await.unwrap();
+    let newer = ms.tombstones_since(stream.id, last_seq, 100).await.unwrap();
+    assert_eq!(newer.len(), 1);
+    assert_eq!((newer[0].doc_id.as_str(), newer[0].before_seq), ("a", 30));
+    assert!(newer[0].seq > a.seq);
+    let all = ms.tombstones_since(stream.id, 0, 100).await.unwrap();
+    assert_eq!(all.iter().find(|r| r.doc_id == "b").unwrap().before_seq, 20);
+    assert_eq!(all.len(), 2);
+
+    // Bounds lookup: what a new write must exceed.
+    let mut bounds = ms
+        .tombstone_bounds(&[(stream.id, "a".into()), (stream.id, "zzz".into())])
+        .await
+        .unwrap();
+    bounds.sort();
+    assert_eq!(bounds, vec![(stream.id, "a".to_string(), 30)]);
+
+    // Paging honors the limit in seq order.
+    let page = ms.tombstones_since(stream.id, 0, 1).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].doc_id, "b");
+
+    ms.delete_stream(&stream.name).await.unwrap();
+    assert!(
+        ms.tombstones_since(stream.id, 0, 10).await.unwrap().is_empty(),
+        "cascade"
+    );
+
+    // ---- purge (same test: purge is global, so it must not run
+    // concurrently with the assertions above).
+    let stream = ms.ensure_stream(&unique("purge")).await.unwrap();
+    let t = |doc: &str, before: i64| NewTombstone {
+        stream_id: stream.id,
+        doc_id: doc.to_string(),
+        before_seq: before,
+    };
+    ms.upsert_tombstones(&[t("a", 10), t("b", 20)]).await.unwrap();
+    let rows = ms.tombstones_since(stream.id, 0, 10).await.unwrap();
+    let (seq_a, seq_b) = (rows[0].seq, rows[1].seq);
+    fn split<'a>(stream_id: i64, id: &'a str, applied: i64) -> NewSplit<'a> {
+        NewSplit {
+        split_id: id,
+        stream_id,
+        storage_key: "k",
+        doc_count: 1,
+        size_bytes: 1,
+        time_start_millis: 0,
+        time_end_millis: 0,
+        footer_len: 0,
+        created_by: None,
+        seq_min: Some(1),
+        seq_max: Some(2),
+        tombstone_seq_applied: applied,
+        }
+    }
+    let s1 = unique("s1");
+    ms.stage_split(&split(stream.id, &s1, seq_a)).await.unwrap();
+    ms.publish_split(&s1).await.unwrap();
+
+    let remaining = |ms: &Metastore, id: i64| async move {
+        ms.tombstones_since(id, 0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.seq)
+            .collect::<Vec<_>>()
+    };
+    // Grace not elapsed: nothing purged even though a is applied.
+    ms.purge_tombstones(3600.0, 1_000).await.unwrap();
+    assert_eq!(remaining(&ms, stream.id).await, vec![seq_a, seq_b]);
+    // Grace 0: only a (seq <= floor); b is above the floor.
+    ms.purge_tombstones(0.0, 1_000).await.unwrap();
+    assert_eq!(remaining(&ms, stream.id).await, vec![seq_b]);
+    // Raising the floor releases b.
+    ms.mark_tombstones_applied(&s1, seq_b).await.unwrap();
+    ms.purge_tombstones(0.0, 1_000).await.unwrap();
+    assert!(remaining(&ms, stream.id).await.is_empty());
+    ms.delete_stream(&stream.name).await.unwrap();
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tantivy::{Index, IndexWriter, TantivyDocument};
 
-use crate::document::DocumentConverter;
+use crate::document::{DocIdentity, DocumentConverter};
 use crate::error::{IndexError, IndexResult};
 use crate::mapping::MappedSchema;
 use crate::split_file::{self, SplitMeta};
@@ -19,6 +19,8 @@ pub struct SplitBuilder {
     doc_count: u64,
     min_ts_millis: i64,
     max_ts_millis: i64,
+    min_seq: i64,
+    max_seq: i64,
 }
 
 /// A finished split: a single bundled file on local disk plus its
@@ -63,6 +65,8 @@ impl SplitBuilder {
             doc_count: 0,
             min_ts_millis: i64::MAX,
             max_ts_millis: i64::MIN,
+            min_seq: i64::MAX,
+            max_seq: i64::MIN,
         })
     }
 
@@ -76,34 +80,39 @@ impl SplitBuilder {
         self.doc_count
     }
 
-    /// Convert and buffer one document (serializes `_source` from `doc`).
+    /// Convert and buffer one document (serializes `_source` from `doc`)
+    /// under a fresh generated id at sequence 0.
     pub fn add_json(
         &mut self,
         doc: serde_json::Value,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
-        self.add_json_with_source(doc, None, fallback_timestamp)
+        let identity = DocIdentity::generated();
+        self.add_document(doc, None, &identity, fallback_timestamp)
     }
 
-    /// Convert and buffer one document, storing `source` verbatim as
-    /// `_source` (the client's original line) instead of re-serializing.
-    /// The document is consumed — its unmapped fields move into `_dynamic`
-    /// without a deep clone.
-    pub fn add_json_with_source(
+    /// Convert and buffer one document with an explicit identity, storing
+    /// `source` verbatim as `_source` (the client's original line) when
+    /// given instead of re-serializing. The document is consumed — its
+    /// unmapped fields move into `_dynamic` without a deep clone.
+    pub fn add_document(
         &mut self,
         doc: serde_json::Value,
         source: Option<&str>,
+        identity: &DocIdentity,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
         let (converted, ts): (TantivyDocument, _) =
             self.converter
-                .convert_with_source(doc, source, fallback_timestamp)?;
+                .convert_with_source(doc, source, identity, fallback_timestamp)?;
         let millis = ts.into_timestamp_millis();
         // Update the advertised time range only after the doc is accepted,
         // so a rejected add can't widen the split's range (L6).
         self.writer.add_document(converted)?;
         self.min_ts_millis = self.min_ts_millis.min(millis);
         self.max_ts_millis = self.max_ts_millis.max(millis);
+        self.min_seq = self.min_seq.min(identity.seq);
+        self.max_seq = self.max_seq.max(identity.seq);
         self.doc_count += 1;
         Ok(())
     }
@@ -129,6 +138,9 @@ impl SplitBuilder {
             time_start_millis: self.min_ts_millis,
             time_end_millis: self.max_ts_millis,
             mapping: self.converter.schema().mapping.to_json(),
+            schema_version: self.converter.schema().schema_version,
+            seq_min: self.converter.schema().seq.map(|_| self.min_seq),
+            seq_max: self.converter.schema().seq.map(|_| self.max_seq),
         };
 
         let file_path = self.work_dir.path().join(format!("{}.split", self.split_id));

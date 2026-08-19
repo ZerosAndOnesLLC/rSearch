@@ -3,7 +3,15 @@
 //! deleted once every document they contain has been published in a split.
 //!
 //! Record layout: [len: u32 LE][crc32(payload): u32 LE][payload]
-//! where payload = [stream_len: u16 LE][stream][doc JSON bytes].
+//! where payload (v2) =
+//!   [0x8000 | stream_len: u16 LE][stream][flags | id_len: u16 LE][id][seq: i64 LE][doc JSON bytes]
+//! `flags` is bit 15 of the id length field: set when the write must be
+//! accompanied by a tombstone hiding older versions of `id` (document-mode
+//! replace) — replay re-issues it so a crash between the WAL append and
+//! the tombstone write can't leave the old version visible.
+//! Legacy (v1) payloads — written before documents carried an identity —
+//! are [stream_len: u16 LE][stream][doc JSON bytes] with the high bit of
+//! `stream_len` clear; they replay with a generated id at sequence 0.
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Read, Write};
@@ -17,16 +25,44 @@ pub struct WalPos {
     pub segment: u64,
 }
 
+/// One record to append: a document plus its identity, bound for a stream.
+#[derive(Debug, Clone)]
+pub struct WalItem {
+    /// Target stream.
+    pub stream: String,
+    /// Document id (`_id`).
+    pub id: String,
+    /// Write sequence stamp (`_seq`).
+    pub seq: i64,
+    /// The write replaces older versions of `id` (document-mode stream):
+    /// a tombstone `before_seq = seq` accompanies it, and replay re-issues
+    /// that tombstone.
+    pub tombstone: bool,
+    /// Raw document JSON (the client's original line).
+    pub doc: std::sync::Arc<str>,
+}
+
 /// A replayed record.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// Target stream the document was accepted for.
     pub stream: String,
+    /// Document id; a fresh UUID for legacy records that carried none.
+    pub id: String,
+    /// Write sequence stamp; 0 for legacy records.
+    pub seq: i64,
+    /// Whether a tombstone `before_seq = seq` must accompany the document.
+    pub tombstone: bool,
     /// Raw document JSON bytes as originally appended.
     pub doc: Vec<u8>,
     /// Position to confirm once the document is published.
     pub pos: WalPos,
 }
+
+/// High bit of the `stream_len` field marks a v2 payload (with identity).
+const V2_FLAG: u16 = 0x8000;
+/// High bit of the `id_len` field: the write carries a tombstone.
+const TOMBSTONE_FLAG: u16 = 0x8000;
 
 struct SegmentState {
     outstanding: u64,
@@ -143,19 +179,15 @@ impl Wal {
         ))
     }
 
-    /// Append a batch of (stream, doc) pairs durably. Returns the position
-    /// of each record. Blocking — call via spawn_blocking.
+    /// Append a batch of records durably. Returns the position of each
+    /// record. Blocking — call via spawn_blocking.
     ///
     /// Two phases: records are written and OS-flushed under the writer lock
     /// (records serialized directly, CRC streamed — no per-record temp
     /// buffer), then the fsync runs under a separate gate so concurrent
     /// appends coalesce into one fsync (group commit) instead of each
     /// paying its own.
-    pub fn append_batch<S, D>(&self, items: &[(S, D)]) -> std::io::Result<Vec<WalPos>>
-    where
-        S: AsRef<str>,
-        D: AsRef<str>,
-    {
+    pub fn append_batch(&self, items: &[WalItem]) -> std::io::Result<Vec<WalPos>> {
         use std::sync::atomic::Ordering;
         let mut positions = Vec::with_capacity(items.len());
         // Segments sealed by rotation during this batch are fsynced below,
@@ -165,27 +197,45 @@ impl Wal {
         let mut victims: Vec<PathBuf> = Vec::new();
         let (fd, my_gen) = {
             let mut inner = self.inner.lock().unwrap();
-            for (stream, doc) in items {
-                let doc = doc.as_ref().as_bytes();
+            for item in items {
+                let doc = item.doc.as_bytes();
                 if inner.current_len >= self.max_segment_bytes {
                     let (old_file, mut gc) = self.rotate(&mut inner)?;
                     sealed.push(old_file);
                     victims.append(&mut gc);
                 }
-                let stream_bytes = stream.as_ref().as_bytes();
-                let payload_len = 2 + stream_bytes.len() + doc.len();
-                let len_field = stream_bytes.len() as u16;
-                // Stream the CRC over the three payload slices; write them
+                let stream_bytes = item.stream.as_bytes();
+                let id_bytes = item.id.as_bytes();
+                if stream_bytes.len() >= V2_FLAG as usize
+                    || id_bytes.len() >= TOMBSTONE_FLAG as usize
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "stream name or document id too long for the WAL",
+                    ));
+                }
+                let payload_len = 2 + stream_bytes.len() + 2 + id_bytes.len() + 8 + doc.len();
+                let len_field = stream_bytes.len() as u16 | V2_FLAG;
+                let id_len_field =
+                    id_bytes.len() as u16 | if item.tombstone { TOMBSTONE_FLAG } else { 0 };
+                let seq_bytes = item.seq.to_le_bytes();
+                // Stream the CRC over the payload slices; write them
                 // directly to the buffered writer (no intermediate Vec).
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(&len_field.to_le_bytes());
                 hasher.update(stream_bytes);
+                hasher.update(&id_len_field.to_le_bytes());
+                hasher.update(id_bytes);
+                hasher.update(&seq_bytes);
                 hasher.update(doc);
                 let crc = hasher.finalize();
                 inner.writer.write_all(&(payload_len as u32).to_le_bytes())?;
                 inner.writer.write_all(&crc.to_le_bytes())?;
                 inner.writer.write_all(&len_field.to_le_bytes())?;
                 inner.writer.write_all(stream_bytes)?;
+                inner.writer.write_all(&id_len_field.to_le_bytes())?;
+                inner.writer.write_all(id_bytes)?;
+                inner.writer.write_all(&seq_bytes)?;
                 inner.writer.write_all(doc)?;
                 inner.current_len += 8 + payload_len as u64;
                 let seq = inner.current_seq;
@@ -327,7 +377,19 @@ struct SegmentCursor {
     seq: u64,
     reader: std::io::BufReader<std::fs::File>,
     buf: Vec<u8>,
-    stream_len: usize,
+    /// Parsed layout of the record in `buf`.
+    layout: RecordLayout,
+}
+
+/// Byte offsets of a validated record's parts within the payload buffer.
+#[derive(Default, Clone, Copy)]
+struct RecordLayout {
+    stream: (usize, usize),
+    /// `None` for a legacy (v1) record without identity.
+    id: Option<(usize, usize)>,
+    seq: i64,
+    tombstone: bool,
+    doc_start: usize,
 }
 
 impl SegmentCursor {
@@ -336,7 +398,7 @@ impl SegmentCursor {
             seq,
             reader: std::io::BufReader::new(std::fs::File::open(path)?),
             buf: Vec::new(),
-            stream_len: 0,
+            layout: RecordLayout::default(),
         })
     }
 
@@ -363,18 +425,50 @@ impl SegmentCursor {
         if crc32fast::hash(&self.buf) != crc {
             return false; // corruption — stop replaying this segment
         }
-        let stream_len = u16::from_le_bytes(self.buf[0..2].try_into().unwrap()) as usize;
+        let len_field = u16::from_le_bytes(self.buf[0..2].try_into().unwrap());
+        let stream_len = (len_field & !V2_FLAG) as usize;
         if 2 + stream_len > self.buf.len() {
             return false;
         }
-        self.stream_len = stream_len;
+        let mut layout = RecordLayout {
+            stream: (2, 2 + stream_len),
+            ..RecordLayout::default()
+        };
+        if len_field & V2_FLAG == 0 {
+            layout.doc_start = 2 + stream_len;
+        } else {
+            let mut at = 2 + stream_len;
+            if at + 2 > self.buf.len() {
+                return false;
+            }
+            let id_len_field = u16::from_le_bytes(self.buf[at..at + 2].try_into().unwrap());
+            let id_len = (id_len_field & !TOMBSTONE_FLAG) as usize;
+            layout.tombstone = id_len_field & TOMBSTONE_FLAG != 0;
+            at += 2;
+            if at + id_len + 8 > self.buf.len() {
+                return false;
+            }
+            layout.id = Some((at, at + id_len));
+            at += id_len;
+            layout.seq = i64::from_le_bytes(self.buf[at..at + 8].try_into().unwrap());
+            layout.doc_start = at + 8;
+        }
+        self.layout = layout;
         true
     }
 
     fn record(&self) -> WalRecord {
+        let (s0, s1) = self.layout.stream;
+        let id = match self.layout.id {
+            Some((i0, i1)) => String::from_utf8_lossy(&self.buf[i0..i1]).to_string(),
+            None => uuid::Uuid::new_v4().simple().to_string(),
+        };
         WalRecord {
-            stream: String::from_utf8_lossy(&self.buf[2..2 + self.stream_len]).to_string(),
-            doc: self.buf[2 + self.stream_len..].to_vec(),
+            stream: String::from_utf8_lossy(&self.buf[s0..s1]).to_string(),
+            id,
+            seq: self.layout.seq,
+            tombstone: self.layout.tombstone,
+            doc: self.buf[self.layout.doc_start..].to_vec(),
             pos: WalPos { segment: self.seq },
         }
     }
@@ -414,10 +508,51 @@ impl Iterator for WalReplay {
 mod tests {
     use super::*;
 
-    fn items(n: usize, stream: &str) -> Vec<(String, String)> {
+    fn items(n: usize, stream: &str) -> Vec<WalItem> {
         (0..n)
-            .map(|i| (stream.to_string(), format!("{{\"n\":{i}}}")))
+            .map(|i| WalItem {
+                stream: stream.to_string(),
+                id: format!("id-{i}"),
+                seq: 1_000 + i as i64,
+                tombstone: i % 2 == 1,
+                doc: std::sync::Arc::from(format!("{{\"n\":{i}}}")),
+            })
             .collect()
+    }
+
+    /// Hand-write a legacy (v1) record: [len][crc][stream_len][stream][doc].
+    fn append_legacy(path: &Path, stream: &str, doc: &str) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(stream.len() as u16).to_le_bytes());
+        payload.extend_from_slice(stream.as_bytes());
+        payload.extend_from_slice(doc.as_bytes());
+        let mut out = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        out.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        out.write_all(&crc32fast::hash(&payload).to_le_bytes()).unwrap();
+        out.write_all(&payload).unwrap();
+    }
+
+    #[test]
+    fn replays_identity_and_legacy_records() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = Wal::open(dir.path(), 1 << 20).unwrap();
+            wal.append_batch(&items(2, "app")).unwrap();
+        }
+        append_legacy(&segment_path(dir.path(), 0), "legacy", "{\"old\":true}");
+        let (_, replayed) = Wal::open(dir.path(), 1 << 20).unwrap();
+        let records: Vec<WalRecord> = replayed.collect::<std::io::Result<_>>().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].id, "id-0");
+        assert_eq!(records[0].seq, 1_000);
+        assert!(!records[0].tombstone);
+        assert_eq!(records[1].doc, b"{\"n\":1}");
+        assert!(records[1].tombstone);
+        assert_eq!(records[2].stream, "legacy");
+        assert_eq!(records[2].seq, 0);
+        assert!(!records[2].tombstone);
+        assert_eq!(records[2].id.len(), 32, "legacy records get a generated id");
+        assert_eq!(records[2].doc, b"{\"old\":true}");
     }
 
     #[test]

@@ -37,6 +37,19 @@ fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
     if let Some((field, ty)) = schema.fields.get(name) {
         return Resolved::Typed(*field, *ty);
     }
+    // Reserved identity fields: keyword `_id`, numeric `_seq`. A legacy
+    // split (no such fields) falls through to a `_dynamic` path that no
+    // document has, so the clause simply matches nothing there.
+    if name == rsearch_index::ID_FIELD
+        && let Some(field) = schema.id
+    {
+        return Resolved::Typed(field, FieldType::Keyword);
+    }
+    if name == rsearch_index::SEQ_FIELD
+        && let Some(field) = schema.seq
+    {
+        return Resolved::Typed(field, FieldType::Long);
+    }
     Resolved::Dynamic(schema.dynamic, name.to_string())
 }
 
@@ -260,6 +273,7 @@ pub fn translate_query(
         "bool" => translate_bool(index, schema, body),
         "term" => translate_term(schema, body),
         "terms" => translate_terms(schema, body),
+        "ids" => translate_ids(schema, body),
         "range" => translate_range(schema, body),
         "exists" => translate_exists(schema, body),
         "match" => translate_match(index, schema, body, false),
@@ -267,7 +281,7 @@ pub fn translate_query(
         "query_string" => translate_query_string(index, schema, body),
         other => Err(SearchError::BadRequest(format!(
             "unsupported query type '{other}' (supported: match_all, bool, term, terms, \
-             range, exists, match, match_phrase, query_string)"
+             ids, range, exists, match, match_phrase, query_string)"
         ))),
     }
 }
@@ -398,6 +412,30 @@ fn translate_term(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Q
         .ok_or_else(|| SearchError::BadRequest("term query needs a field".into()))?;
     let value = spec.get("value").unwrap_or(spec);
     term_query_for(schema, name, value)
+}
+
+/// Cap on `ids.values` (ES's default `max_terms_count` is 65536; a bulk
+/// lookup chunks at 1000).
+const MAX_IDS_VALUES: usize = 10_000;
+
+/// `{"ids": {"values": ["a", "b"]}}` — documents whose `_id` is listed.
+fn translate_ids(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
+    let values = body
+        .get("values")
+        .and_then(Value::as_array)
+        .ok_or_else(|| SearchError::BadRequest("ids query needs a 'values' array".into()))?;
+    if values.len() > MAX_IDS_VALUES {
+        return Err(SearchError::BadRequest(format!(
+            "ids query accepts at most {MAX_IDS_VALUES} values"
+        )));
+    }
+    let clauses: Vec<(Occur, Box<dyn Query>)> = values
+        .iter()
+        .map(|v| {
+            term_query_for(schema, rsearch_index::ID_FIELD, v).map(|q| (Occur::Should, q))
+        })
+        .collect::<SearchResult<_>>()?;
+    Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
 fn translate_terms(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {

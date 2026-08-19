@@ -7,6 +7,29 @@ use tantivy::time::format_description::well_known::Rfc3339;
 use crate::error::{IndexError, IndexResult};
 use crate::mapping::{FieldType, MappedSchema};
 
+/// A document's identity within its stream: the `_id` (client-supplied or
+/// generated) and the write sequence stamp that orders versions of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocIdentity {
+    /// The document id (`_id`).
+    pub id: String,
+    /// Node-local monotonic write stamp (micros since epoch); `0` for
+    /// documents whose write predates sequence tracking.
+    pub seq: i64,
+}
+
+impl DocIdentity {
+    /// Identity with the given id and sequence.
+    pub fn new(id: impl Into<String>, seq: i64) -> Self {
+        Self { id: id.into(), seq }
+    }
+
+    /// A fresh UUID id at sequence 0.
+    pub fn generated() -> Self {
+        Self::new(uuid::Uuid::new_v4().simple().to_string(), 0)
+    }
+}
+
 /// Extract a document timestamp from `@timestamp` or `timestamp` fields.
 /// Accepts RFC 3339 strings, epoch seconds, or epoch milliseconds
 /// (numbers >= 1e12 are treated as milliseconds).
@@ -82,12 +105,15 @@ impl DocumentConverter {
     }
 
     /// Convert one document, deriving the stored `_source` from the doc.
+    /// Identity is a fresh generated id at sequence 0 (tests, legacy
+    /// re-index paths).
     pub fn convert(
         &self,
         doc: serde_json::Value,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
-        self.convert_with_source(doc, None, fallback_timestamp)
+        let id = DocIdentity::generated();
+        self.convert_with_source(doc, None, &id, fallback_timestamp)
     }
 
     /// Convert one document. `source` is the exact bytes to store as
@@ -103,6 +129,7 @@ impl DocumentConverter {
         &self,
         doc: serde_json::Value,
         source: Option<&str>,
+        identity: &DocIdentity,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<(TantivyDocument, tantivy::DateTime)> {
         let timestamp = extract_timestamp(&doc).unwrap_or(fallback_timestamp);
@@ -118,6 +145,10 @@ impl DocumentConverter {
 
         let mut out = TantivyDocument::new();
         out.add_date(self.schema.timestamp, timestamp);
+        if let (Some(id_field), Some(seq_field)) = (self.schema.id, self.schema.seq) {
+            out.add_text(id_field, &identity.id);
+            out.add_i64(seq_field, identity.seq);
+        }
         match (source, serialized) {
             (Some(source), _) => out.add_text(self.schema.source, source),
             (None, Some(serialized)) => out.add_text(self.schema.source, serialized),
@@ -317,7 +348,7 @@ mod tests {
                 fallback(),
             )
             .unwrap();
-        // 2 service + 3 status + _source + _timestamp
-        assert_eq!(doc.field_values().count(), 7);
+        // 2 service + 3 status + _source + _timestamp + _id + _seq
+        assert_eq!(doc.field_values().count(), 9);
     }
 }

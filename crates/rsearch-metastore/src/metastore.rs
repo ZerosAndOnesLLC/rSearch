@@ -4,10 +4,11 @@ use sqlx::postgres::PgPoolOptions;
 use rsearch_common::config::MetastoreConfig;
 
 use crate::error::{MetastoreError, MetastoreResult};
-use crate::types::{SplitRecord, SplitState, StreamRecord, StreamStats};
+use crate::types::{NewSplit, SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats};
 
-const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
-     size_bytes, time_start_millis, time_end_millis, footer_len, created_by";
+pub(crate) const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
+     size_bytes, time_start_millis, time_end_millis, footer_len, created_by, \
+     seq_min, seq_max, tombstone_seq_applied";
 
 /// Postgres-backed metadata store shared by every node role: streams,
 /// splits, nodes, placement, auth, routing rules, and alerts. Cloning
@@ -61,7 +62,7 @@ impl Metastore {
         let row = sqlx::query_as::<_, StreamRecord>(
             "INSERT INTO streams (name) VALUES ($1)
              ON CONFLICT (name) DO UPDATE SET updated_at = now()
-             RETURNING id, name, mapping, retention_hours",
+             RETURNING id, name, mapping, retention_hours, mode",
         )
         .bind(name)
         .fetch_one(&self.pool)
@@ -72,7 +73,7 @@ impl Metastore {
     /// Look up a stream by name; `StreamNotFound` if missing.
     pub async fn get_stream(&self, name: &str) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours FROM streams WHERE name = $1",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -83,7 +84,7 @@ impl Metastore {
     /// Per-stream stats over published splits (for `_cat/indices`).
     pub async fn stream_stats(&self) -> MetastoreResult<Vec<StreamStats>> {
         Ok(sqlx::query_as::<_, StreamStats>(
-            "SELECT st.name, st.retention_hours,
+            "SELECT st.name, st.retention_hours, st.mode,
                     COUNT(s.id) FILTER (WHERE s.state = 'published') AS split_count,
                     COALESCE(SUM(s.doc_count) FILTER (WHERE s.state = 'published'), 0)::bigint AS doc_count,
                     COALESCE(SUM(s.size_bytes) FILTER (WHERE s.state = 'published'), 0)::bigint AS size_bytes
@@ -99,7 +100,7 @@ impl Metastore {
     /// Look up a stream by id; `StreamNotFound` if missing.
     pub async fn get_stream_by_id(&self, id: i64) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours FROM streams WHERE id = $1",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -110,7 +111,7 @@ impl Metastore {
     /// All streams, ordered by name.
     pub async fn list_streams(&self) -> MetastoreResult<Vec<StreamRecord>> {
         Ok(sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours FROM streams ORDER BY name",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -132,6 +133,47 @@ impl Metastore {
         .await?;
         if result.rows_affected() == 0 {
             return Err(MetastoreError::StreamNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Fetch-or-create a stream with an explicit mode. An existing stream
+    /// keeps its mode; the caller compares and decides (mode is fixed once
+    /// the stream holds data — see [`Metastore::set_stream_mode`]).
+    pub async fn ensure_stream_with_mode(
+        &self,
+        name: &str,
+        mode: StreamMode,
+    ) -> MetastoreResult<StreamRecord> {
+        let row = sqlx::query_as::<_, StreamRecord>(
+            "INSERT INTO streams (name, mode) VALUES ($1, $2)
+             ON CONFLICT (name) DO UPDATE SET updated_at = now()
+             RETURNING id, name, mapping, retention_hours, mode",
+        )
+        .bind(name)
+        .bind(mode.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Change a stream's mode. Only allowed while the stream holds no
+    /// splits (a log stream's documents have no tombstone semantics to
+    /// retrofit); otherwise `StreamModeFixed`.
+    pub async fn set_stream_mode(&self, name: &str, mode: StreamMode) -> MetastoreResult<()> {
+        let result = sqlx::query(
+            "UPDATE streams SET mode = $2, updated_at = now()
+             WHERE name = $1
+               AND NOT EXISTS (SELECT 1 FROM splits WHERE splits.stream_id = streams.id)",
+        )
+        .bind(name)
+        .bind(mode.as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            // Distinguish "no such stream" from "has data".
+            self.get_stream(name).await?;
+            return Err(MetastoreError::StreamModeFixed(name.to_string()));
         }
         Ok(())
     }
@@ -167,33 +209,25 @@ impl Metastore {
     // ---- split lifecycle ----
 
     /// Register a freshly-uploaded split in `staged` state.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn stage_split(
-        &self,
-        split_id: &str,
-        stream_id: i64,
-        storage_key: &str,
-        doc_count: i64,
-        size_bytes: i64,
-        time_start_millis: i64,
-        time_end_millis: i64,
-        footer_len: i64,
-        created_by: Option<&str>,
-    ) -> MetastoreResult<()> {
+    pub async fn stage_split(&self, split: &NewSplit<'_>) -> MetastoreResult<()> {
         sqlx::query(
             "INSERT INTO splits (split_id, stream_id, storage_key, doc_count, size_bytes,
-                                 time_start_millis, time_end_millis, footer_len, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                 time_start_millis, time_end_millis, footer_len, created_by,
+                                 seq_min, seq_max, tombstone_seq_applied)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
-        .bind(split_id)
-        .bind(stream_id)
-        .bind(storage_key)
-        .bind(doc_count)
-        .bind(size_bytes)
-        .bind(time_start_millis)
-        .bind(time_end_millis)
-        .bind(footer_len)
-        .bind(created_by)
+        .bind(split.split_id)
+        .bind(split.stream_id)
+        .bind(split.storage_key)
+        .bind(split.doc_count)
+        .bind(split.size_bytes)
+        .bind(split.time_start_millis)
+        .bind(split.time_end_millis)
+        .bind(split.footer_len)
+        .bind(split.created_by)
+        .bind(split.seq_min)
+        .bind(split.seq_max)
+        .bind(split.tombstone_seq_applied)
         .execute(&self.pool)
         .await?;
         Ok(())

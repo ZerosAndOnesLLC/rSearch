@@ -44,6 +44,16 @@ pub struct SplitMeta {
     pub time_end_millis: i64,
     /// The index mapping the split was built with (ES mapping shape).
     pub mapping: serde_json::Value,
+    /// Schema layout version (see `mapping::CURRENT_SCHEMA_VERSION`);
+    /// absent in footers written before `_id`/`_seq` existed.
+    #[serde(default)]
+    pub schema_version: u32,
+    /// Lowest `_seq` in the split; None when documents carry no ids.
+    #[serde(default)]
+    pub seq_min: Option<i64>,
+    /// Highest `_seq` in the split; None when documents carry no ids.
+    #[serde(default)]
+    pub seq_max: Option<i64>,
 }
 
 /// Full footer contents: bundled file map + split metadata.

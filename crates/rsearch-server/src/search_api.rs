@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use rsearch_metastore::MetastoreError;
+use rsearch_metastore::{MetastoreError, StreamMode};
 use rsearch_search::{SearchError, SearchRequest};
 
 use crate::state::AppState;
@@ -204,24 +204,8 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 /// GET /{index}/_mapping — Grafana fetches this to discover fields.
 pub async fn get_mapping(State(state): State<AppState>, Path(index): Path<String>) -> Response {
     match state.metastore.get_stream(&index).await {
-        Ok(stream) => {
-            let mut properties = stream
-                .mapping
-                .get("properties")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            // The timestamp field is always present and always a date.
-            properties["@timestamp"] = json!({"type": "date"});
-            Json(json!({
-                index: {"mappings": {"properties": properties}}
-            }))
-            .into_response()
-        }
-        Err(MetastoreError::StreamNotFound(_)) => es_error(
-            StatusCode::NOT_FOUND,
-            "index_not_found_exception",
-            &format!("no such index [{index}]"),
-        ),
+        Ok(stream) => Json(json!({ index: {"mappings": mappings_json(&stream)} })).into_response(),
+        Err(MetastoreError::StreamNotFound(_)) => index_not_found(&index),
         Err(e) => es_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -230,7 +214,24 @@ pub async fn get_mapping(State(state): State<AppState>, Path(index): Path<String
     }
 }
 
-/// PUT /{index} — create (or update the mapping of) a stream.
+/// Read the stream mode out of a `PUT /{index}` body: ES-shaped
+/// `settings.index.mode`, `settings.mode`, or a top-level `mode`.
+fn mode_from_body(body: &Value) -> Result<Option<StreamMode>, String> {
+    let raw = body
+        .pointer("/settings/index/mode")
+        .or_else(|| body.pointer("/settings/mode"))
+        .or_else(|| body.get("mode"));
+    match raw {
+        None => Ok(None),
+        Some(Value::String(s)) => StreamMode::parse(s)
+            .map(Some)
+            .ok_or_else(|| format!("unknown index mode '{s}' (expected 'log' or 'document')")),
+        Some(other) => Err(format!("index mode must be a string, got {other}")),
+    }
+}
+
+/// PUT /{index} — create a stream (optionally with `settings.index.mode`)
+/// or update its mapping. The mode is fixed once the stream holds data.
 pub async fn put_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -250,9 +251,17 @@ pub async fn put_index(
             }
         }
     };
-    let mapping = body_json.get("mappings").cloned().unwrap_or(json!({}));
+    let mode = match mode_from_body(&body_json) {
+        Ok(mode) => mode,
+        Err(reason) => {
+            return es_error(StatusCode::BAD_REQUEST, "illegal_argument_exception", &reason);
+        }
+    };
+    let mapping = body_json.get("mappings").cloned();
     // Validate before storing.
-    if let Err(e) = rsearch_index::IndexMapping::from_json(&mapping) {
+    if let Some(mapping) = &mapping
+        && let Err(e) = rsearch_index::IndexMapping::from_json(mapping)
+    {
         return es_error(
             StatusCode::BAD_REQUEST,
             "mapper_parsing_exception",
@@ -260,8 +269,30 @@ pub async fn put_index(
         );
     }
     let result = async {
-        state.metastore.ensure_stream(&index).await?;
-        state.metastore.update_stream_mapping(&index, &mapping).await
+        let record = match mode {
+            Some(mode) => state.metastore.ensure_stream_with_mode(&index, mode).await?,
+            None => state.metastore.ensure_stream(&index).await?,
+        };
+        if let Some(mode) = mode
+            && record.mode() != mode
+        {
+            // Existing stream with a different mode: allowed only while it
+            // is still empty (e.g. auto-created by a first _bulk).
+            state.metastore.set_stream_mode(&index, mode).await?;
+            // This node's caches see the change now; other nodes within
+            // their 10s TTLs (a mode can only change while the stream is
+            // empty, so nothing written in that window is affected yet).
+            if let Some(pipeline) = &state.pipeline {
+                pipeline.forget_stream(&index);
+            }
+            for service in [&state.search, &state.doc_lookup].into_iter().flatten() {
+                service.invalidate_stream(&index);
+            }
+        }
+        if let Some(mapping) = &mapping {
+            state.metastore.update_stream_mapping(&index, mapping).await?;
+        }
+        Ok::<_, MetastoreError>(())
     }
     .await;
     match result {
@@ -271,12 +302,84 @@ pub async fn put_index(
             "index": index,
         }))
         .into_response(),
+        Err(MetastoreError::StreamModeFixed(_)) => es_error(
+            StatusCode::CONFLICT,
+            "illegal_argument_exception",
+            &format!("index [{index}] already holds data; its mode cannot be changed"),
+        ),
         Err(e) => es_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             &e.to_string(),
         ),
     }
+}
+
+/// ES-shaped settings block for a stream.
+fn settings_json(stream: &rsearch_metastore::StreamRecord) -> Value {
+    json!({
+        "index": {
+            "mode": stream.mode,
+            "retention_hours": stream.retention_hours,
+            "number_of_shards": "1",
+            "number_of_replicas": "0",
+        }
+    })
+}
+
+/// ES-shaped mappings block for a stream.
+fn mappings_json(stream: &rsearch_metastore::StreamRecord) -> Value {
+    let mut properties = stream
+        .mapping
+        .get("properties")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    // The timestamp field is always present and always a date.
+    properties["@timestamp"] = json!({"type": "date"});
+    json!({"properties": properties})
+}
+
+/// GET /{index}/_settings
+pub async fn get_settings(State(state): State<AppState>, Path(index): Path<String>) -> Response {
+    match state.metastore.get_stream(&index).await {
+        Ok(stream) => Json(json!({ index: {"settings": settings_json(&stream)} })).into_response(),
+        Err(MetastoreError::StreamNotFound(_)) => index_not_found(&index),
+        Err(e) => es_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", &e.to_string()),
+    }
+}
+
+/// GET /{index} — settings + mappings (what stock clients call to
+/// discover an index).
+pub async fn get_index(State(state): State<AppState>, Path(index): Path<String>) -> Response {
+    match state.metastore.get_stream(&index).await {
+        Ok(stream) => Json(json!({
+            index: {
+                "aliases": {},
+                "mappings": mappings_json(&stream),
+                "settings": settings_json(&stream),
+            }
+        }))
+        .into_response(),
+        Err(MetastoreError::StreamNotFound(_)) => index_not_found(&index),
+        Err(e) => es_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", &e.to_string()),
+    }
+}
+
+/// HEAD /{index} — 200 if the index exists, 404 otherwise.
+pub async fn head_index(State(state): State<AppState>, Path(index): Path<String>) -> Response {
+    match state.metastore.get_stream(&index).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(MetastoreError::StreamNotFound(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub(crate) fn index_not_found(index: &str) -> Response {
+    es_error(
+        StatusCode::NOT_FOUND,
+        "index_not_found_exception",
+        &format!("no such index [{index}]"),
+    )
 }
 
 /// GET / — the version handshake clients and shippers probe.

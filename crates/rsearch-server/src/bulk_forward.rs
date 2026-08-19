@@ -117,12 +117,17 @@ impl BulkForwarder {
         &self,
         addr: &str,
         default_index: Option<&str>,
+        refresh: bool,
         body: Bytes,
     ) -> Result<(u16, Bytes), String> {
         let mut url = url::Url::parse(addr).map_err(|e| format!("peer address '{addr}': {e}"))?;
         url.set_path("/_rsearch/internal/bulk");
         if let Some(index) = default_index {
             url.query_pairs_mut().append_pair("index", index);
+        }
+        if refresh {
+            // The peer indexes the batch, so its buffer is the one to cut.
+            url.query_pairs_mut().append_pair("refresh", "wait_for");
         }
         self.client
             .post_raw(url.as_str(), body)

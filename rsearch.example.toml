@@ -69,6 +69,8 @@ max_connections = 10
 [ingest]
 max_batch_docs = 500000  # cut a split at this many buffered docs...
 max_batch_secs = 30      # ...or when the oldest doc reaches this age
+document_max_batch_secs = 5  # age bound for document-mode streams (tighter
+                         # time-to-searchable; ?refresh=wait_for forces a cut)
 queue_capacity = 100000  # per-stream in-flight bound before 429s
 memory_budget_mb = 256   # tantivy writer heap per stream worker
 wal_segment_mb = 64      # WAL segment rotation size
@@ -87,6 +89,16 @@ gc_grace_secs = 600         # delay before deleting marked-for-delete splits
 staged_orphan_secs = 3600   # sweep splits stuck in 'staged' after a crash
 repair_stale_secs = 300     # replicated backend: holder silence before re-replication
 allow_insecure_webhooks = false  # require https + block private IPs for alerts
+# Document-mode streams: tombstoned versions are hidden at query time and
+# removed physically by compaction, which runs when a stream accumulates
+# compact_min_tombstones or its oldest tombstone passes compact_max_age_secs
+# (the bound on how long a deleted document survives in storage).
+compact_min_tombstones = 1000
+compact_max_age_secs = 3600
+compact_splits_per_tick = 8
+tombstone_purge_grace_secs = 3600  # keep tombstones at least this long after
+                                   # every split has applied them (covers docs
+                                   # still buffered/unreplayed on ingest nodes)
 
 # Network log inputs (disabled by default). Each routes to a stream and is
 # subject to routing rules.

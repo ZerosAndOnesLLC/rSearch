@@ -8,6 +8,7 @@ mod auth_api;
 mod bulk_api;
 mod bulk_forward;
 mod control;
+mod doc_api;
 mod internal_api;
 mod loki_api;
 mod metrics;
@@ -158,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             PipelineConfig {
                 max_batch_docs: config.ingest.max_batch_docs,
                 max_batch_secs: config.ingest.max_batch_secs,
+                document_max_batch_secs: config.ingest.document_max_batch_secs,
                 queue_capacity: config.ingest.queue_capacity,
                 work_dir: data_dir.join("staging"),
                 memory_budget: config.ingest.memory_budget_mb << 20,
@@ -193,7 +195,12 @@ async fn main() -> anyhow::Result<()> {
     // cache_max_mb is the node's whole budget, so two roles must not each
     // claim it in full (issue #18). Sharing also lets control-side merge
     // reads warm the cache search serves from.
-    let split_cache = if roles.contains(&Role::Search) || roles.contains(&Role::Control) {
+    // Ingest nodes need it too: document-mode read-modify-write ops
+    // (update, create, GET /_doc) look documents up through a searcher.
+    let needs_cache = roles.contains(&Role::Search)
+        || roles.contains(&Role::Control)
+        || roles.contains(&Role::Ingest);
+    let split_cache = if needs_cache {
         let cache_dir = PathBuf::from(&config.node.data_dir).join("cache");
         // Earlier releases gave control its own budget-sized cache here;
         // reclaim the dead directory rather than let it sit at up to a
@@ -214,13 +221,20 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Search role: stateless search service over the shared cache.
-    let search = if roles.contains(&Role::Search) {
+    // Stateless search service over the shared cache: serves /_search on
+    // search nodes and document lookups (update/create/GET) on ingest
+    // nodes — the same instance when a node runs both roles.
+    let lookup = if roles.contains(&Role::Search) || roles.contains(&Role::Ingest) {
         Some(std::sync::Arc::new(rsearch_search::SearchService::new(
             metastore.clone(),
             storage.clone(),
-            split_cache.clone().expect("split cache exists for search role"),
+            split_cache.clone().expect("split cache exists for search/ingest roles"),
         )))
+    } else {
+        None
+    };
+    let search = if roles.contains(&Role::Search) {
+        lookup.clone()
     } else {
         None
     };
@@ -277,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut state = AppState::new(&config, &roles, metastore, pipeline, search);
+    state.doc_lookup = lookup;
     state.draining = draining_flag;
     state.control = control_metrics;
     // Bulk handoff between ingest peers needs the cluster token both to
