@@ -152,8 +152,33 @@ pub struct Identity {
 
 impl Identity {
     fn allows_stream(&self, stream: &str) -> bool {
-        self.streams.iter().any(|s| s == "*" || s == stream)
+        self.streams.iter().any(|s| stream_glob_matches(s, stream))
     }
+}
+
+/// Stream-scope matching: an entry is an exact name or a glob where `*`
+/// matches any run of characters (`acme-*`, `*-audit`, `tenant-*-logs`),
+/// so a multi-tenant application can be scoped to a prefix it derives
+/// index names from instead of needing `*` or an up-front list.
+pub fn stream_glob_matches(pattern: &str, stream: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == stream;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !stream.starts_with(first) {
+        return false;
+    }
+    let mut rest = &stream[first.len()..];
+    // Middle pieces must appear in order; the final piece must end the
+    // name (and not overlap what the earlier pieces consumed).
+    for piece in &parts[1..parts.len() - 1] {
+        match rest.find(piece) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last) && rest.len() >= last.len()
 }
 
 #[derive(Debug, PartialEq)]
@@ -418,6 +443,32 @@ fn forbidden(reason: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_globs() {
+        let id = |streams: &[&str]| Identity {
+            name: "k".into(),
+            is_admin: false,
+            actions: HashSet::new(),
+            streams: streams.iter().map(|s| s.to_string()).collect(),
+        };
+        assert!(id(&["*"]).allows_stream("anything"));
+        assert!(id(&["items"]).allows_stream("items"));
+        assert!(!id(&["items"]).allows_stream("items-2"));
+        assert!(id(&["acme-*"]).allows_stream("acme-orders"));
+        assert!(id(&["acme-*"]).allows_stream("acme-"));
+        assert!(!id(&["acme-*"]).allows_stream("acmeorders"));
+        assert!(!id(&["acme-*"]).allows_stream("other-acme-x"));
+        assert!(id(&["*-audit"]).allows_stream("acme-audit"));
+        assert!(!id(&["*-audit"]).allows_stream("audit"));
+        assert!(id(&["t-*-logs"]).allows_stream("t-1-logs"));
+        assert!(id(&["t-*-logs"]).allows_stream("t-a-b-logs"));
+        assert!(!id(&["t-*-logs"]).allows_stream("t-logs"));
+        assert!(!id(&["t-*-logs"]).allows_stream("t-1-logsx"));
+        assert!(id(&["a*b*c"]).allows_stream("a1b2c"));
+        assert!(!id(&["a*b*c"]).allows_stream("acb"));
+        assert!(id(&["x", "acme-*"]).allows_stream("acme-y"));
+    }
 
     #[test]
     fn classifies_routes() {
