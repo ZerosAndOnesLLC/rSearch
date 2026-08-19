@@ -370,14 +370,14 @@ async fn tombstones_upsert_and_page_by_seq() {
     ms.stage_split(&split(stream.id, &s1, seq_a)).await.unwrap();
     ms.publish_split(&s1).await.unwrap();
 
-    let remaining = |ms: &Metastore, id: i64| async move {
+    async fn remaining(ms: &Metastore, id: i64) -> Vec<i64> {
         ms.tombstones_since(id, 0, 10)
             .await
             .unwrap()
             .into_iter()
             .map(|t| t.seq)
-            .collect::<Vec<_>>()
-    };
+            .collect()
+    }
     // Grace not elapsed: nothing purged even though a is applied.
     ms.purge_tombstones(3600.0, 1_000).await.unwrap();
     assert_eq!(remaining(&ms, stream.id).await, vec![seq_a, seq_b]);
