@@ -43,6 +43,10 @@ pub struct SplitReader {
     schema: Arc<MappedSchema>,
     /// Tombstone exclusions applied so far (see `apply_tombstones`).
     pub(crate) exclusions: std::sync::Mutex<Arc<crate::exclusions::ExclusionSet>>,
+    /// String-valued `_dynamic` paths, computed on first bare
+    /// `query_string` and reused: splits are immutable, so the term
+    /// dictionary never changes under us.
+    dynamic_paths: OnceLock<Vec<String>>,
 }
 
 impl SplitReader {
@@ -120,6 +124,7 @@ impl SplitReader {
             exclusions: std::sync::Mutex::new(Arc::new(
                 crate::exclusions::ExclusionSet::empty(segment_ids),
             )),
+            dynamic_paths: OnceLock::new(),
         })
     }
 
@@ -139,6 +144,21 @@ impl SplitReader {
     /// blocking context.
     pub fn searcher(&self) -> IndexResult<tantivy::Searcher> {
         Ok(self.reader.searcher())
+    }
+
+    /// The string-valued JSON paths present in this split's `_dynamic`
+    /// field, for fanning a bare `query_string` across unmapped fields.
+    /// Computed once per split (skip-scan of the term dictionary) and
+    /// cached. Call from a blocking context.
+    pub fn dynamic_string_paths(&self) -> IndexResult<&[String]> {
+        if let Some(paths) = self.dynamic_paths.get() {
+            return Ok(paths);
+        }
+        let paths = crate::dynamic_paths::dynamic_string_paths(
+            &self.reader.searcher(),
+            self.schema.dynamic,
+        )?;
+        Ok(self.dynamic_paths.get_or_init(|| paths))
     }
 
     /// Visit every document — used by the merge/compaction jobs to
