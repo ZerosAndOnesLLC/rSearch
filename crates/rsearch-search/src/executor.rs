@@ -853,7 +853,9 @@ fn search_one_split(
     // Translate against the split's own schema: field ordinals follow the
     // mapping the split was built with, which can differ from the stream's
     // current mapping (PUT /{index} after the split was written).
-    let mut query = translate_query(index, reader.mapped_schema(), query_json)?;
+    let mut query = translate_query(index, reader.mapped_schema(), query_json, &|| {
+        Ok(reader.dynamic_string_paths()?.to_vec())
+    })?;
     // Tombstoned versions are excluded inside the query so every collector
     // (top-k, Count, aggregations) agrees; the doc_count shortcut below
     // subtracts them instead of scanning.

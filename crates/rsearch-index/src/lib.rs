@@ -5,6 +5,7 @@
 mod builder;
 mod cache;
 mod document;
+mod dynamic_paths;
 mod error;
 mod exclusions;
 mod mapping;
@@ -12,6 +13,7 @@ mod reader;
 mod split_file;
 
 pub use builder::{PackagedSplit, SplitBuilder};
+pub use dynamic_paths::dynamic_string_paths;
 pub use tantivy::DateTime;
 pub use cache::SplitCache;
 pub use reader::{ReadDoc, SplitReader};
