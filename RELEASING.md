@@ -18,6 +18,8 @@ cargo check --workspace          # clean, no warnings
 cargo test --workspace
 ./scripts/ci.sh                  # fmt + cargo deny (FIPS bans) gate
 sqlx migrate run --source crates/rsearch-metastore/migrations   # against dev PG
+RSEARCH_TEST_DATABASE_URL=$DATABASE_URL cargo test --workspace -- --include-ignored  # Postgres-backed tests
+./tests/cluster/run-document-mode-test.sh    # document mode, single fs-backed node (Postgres only)
 ./tests/cluster/run-cluster-test.sh          # S3/MinIO topology
 ./tests/cluster/run-replicated-test.sh       # replicated backend, process-level
 ./tests/cluster/run-ha-compose-test.sh       # replicated backend, containers
