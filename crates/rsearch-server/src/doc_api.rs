@@ -75,7 +75,10 @@ async fn run_one(state: AppState, body: String, refresh: bool) -> Response {
 fn parse_doc(body: &str) -> Result<Value, Response> {
     match serde_json::from_str::<Value>(body) {
         Ok(doc) if doc.is_object() => Ok(doc),
-        Ok(_) => Err(error_response(StatusCode::BAD_REQUEST, "document must be a JSON object")),
+        Ok(_) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "document must be a JSON object",
+        )),
         Err(e) => Err(error_response(
             StatusCode::BAD_REQUEST,
             &format!("document is not valid JSON: {e}"),
@@ -105,7 +108,12 @@ pub async fn put_doc(
             );
         }
     };
-    run_one(state, one_item_body(action, &index, Some(&id), Some(&doc)), params.refresh()).await
+    run_one(
+        state,
+        one_item_body(action, &index, Some(&id), Some(&doc)),
+        params.refresh(),
+    )
+    .await
 }
 
 /// POST /{index}/_doc — index a document under a generated id.
@@ -119,7 +127,12 @@ pub async fn post_doc(
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    run_one(state, one_item_body("index", &index, None, Some(&doc)), params.refresh()).await
+    run_one(
+        state,
+        one_item_body("index", &index, None, Some(&doc)),
+        params.refresh(),
+    )
+    .await
 }
 
 /// PUT/POST /{index}/_create/{id} — create-only write.
@@ -133,7 +146,12 @@ pub async fn create_doc(
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    run_one(state, one_item_body("create", &index, Some(&id), Some(&doc)), params.refresh()).await
+    run_one(
+        state,
+        one_item_body("create", &index, Some(&id), Some(&doc)),
+        params.refresh(),
+    )
+    .await
 }
 
 /// POST /{index}/_update/{id} — partial update (`doc`, `doc_as_upsert`,
@@ -148,7 +166,12 @@ pub async fn update_doc(
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    run_one(state, one_item_body("update", &index, Some(&id), Some(&body)), params.refresh()).await
+    run_one(
+        state,
+        one_item_body("update", &index, Some(&id), Some(&body)),
+        params.refresh(),
+    )
+    .await
 }
 
 /// DELETE /{index}/_doc/{id}
@@ -159,7 +182,12 @@ pub async fn delete_doc(
 ) -> Response {
     // A delete is a tombstone: visible on this node at once, so there is
     // no buffer to cut — but honoring the flag keeps clients uniform.
-    run_one(state, one_item_body("delete", &index, Some(&id), None), params.refresh()).await
+    run_one(
+        state,
+        one_item_body("delete", &index, Some(&id), None),
+        params.refresh(),
+    )
+    .await
 }
 
 fn lookup_error(e: SearchError, index: &str) -> Response {
@@ -273,7 +301,10 @@ pub async fn delete_by_query(
             }
         }
     };
-    let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all": {}}));
+    let query = body
+        .get("query")
+        .cloned()
+        .unwrap_or_else(|| json!({"match_all": {}}));
     let mut deleted = 0usize;
     let mut rounds = 0usize;
     loop {

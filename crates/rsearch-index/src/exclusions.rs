@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tantivy::index::SegmentId;
 use tantivy::query::{ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use tantivy::schema::{IndexRecordOption, Term};
-use tantivy::index::SegmentId;
 use tantivy::{DocId, DocSet, Score, SegmentReader, TERMINATED};
 
 use crate::error::IndexResult;
@@ -89,7 +89,10 @@ impl ExclusionSet {
         let mut per_segment = Vec::with_capacity(self.per_segment.len());
         let mut total = 0;
         for (ord, existing) in self.per_segment.iter().enumerate() {
-            let added = additions.get_mut(ord).map(std::mem::take).unwrap_or_default();
+            let added = additions
+                .get_mut(ord)
+                .map(std::mem::take)
+                .unwrap_or_default();
             let docs: Arc<[DocId]> = if added.is_empty() {
                 existing.clone()
             } else {
@@ -349,9 +352,21 @@ mod tests {
             // cached set extends by the tail only.
             let set = r
                 .apply_tombstones(&[
-                    Tombstone { seq: 1, doc_id: "alpha".into(), before_seq: 30 },
-                    Tombstone { seq: 2, doc_id: "beta".into(), before_seq: 1_000 },
-                    Tombstone { seq: 3, doc_id: "alpha".into(), before_seq: 1_000 },
+                    Tombstone {
+                        seq: 1,
+                        doc_id: "alpha".into(),
+                        before_seq: 30,
+                    },
+                    Tombstone {
+                        seq: 2,
+                        doc_id: "beta".into(),
+                        before_seq: 1_000,
+                    },
+                    Tombstone {
+                        seq: 3,
+                        doc_id: "alpha".into(),
+                        before_seq: 1_000,
+                    },
                 ])
                 .unwrap();
             assert_eq!(set.len(), 3);
@@ -362,8 +377,16 @@ mod tests {
             // without any lookup; unknown ids are harmless.
             let set = r
                 .apply_tombstones(&[
-                    Tombstone { seq: 4, doc_id: "gamma".into(), before_seq: 10 },
-                    Tombstone { seq: 5, doc_id: "nobody".into(), before_seq: 1_000 },
+                    Tombstone {
+                        seq: 4,
+                        doc_id: "gamma".into(),
+                        before_seq: 10,
+                    },
+                    Tombstone {
+                        seq: 5,
+                        doc_id: "nobody".into(),
+                        before_seq: 1_000,
+                    },
                 ])
                 .unwrap();
             assert_eq!(set.len(), 3);
