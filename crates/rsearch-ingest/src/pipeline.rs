@@ -12,12 +12,39 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use rsearch_index::{IndexMapping, MappedSchema, SplitBuilder};
+use rsearch_index::{DocIdentity, IndexMapping, MappedSchema, SplitBuilder};
 use rsearch_metastore::Metastore;
 use rsearch_storage::Storage;
 
 use crate::error::{IngestError, IngestResult};
-use crate::wal::{Wal, WalPos, WalReplay};
+use crate::wal::{Wal, WalItem, WalPos, WalReplay};
+
+/// Node-local monotonic write-sequence source: micros since epoch, forced
+/// strictly increasing across calls so two writes to the same `_id` on
+/// one node always order, even within the same microsecond. Across nodes
+/// ordering relies on wall clocks (NTP) — the same assumption retention
+/// already makes.
+#[derive(Default)]
+pub struct SeqClock {
+    last: std::sync::atomic::AtomicI64,
+}
+
+impl SeqClock {
+    /// Next sequence stamp.
+    pub fn next(&self) -> i64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        // fetch_update: `last = max(last + 1, now)` atomically.
+        self.last
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+                Some(now.max(last.saturating_add(1)))
+            })
+            .map(|prev| now.max(prev.saturating_add(1)))
+            .unwrap_or(now)
+    }
+}
 
 /// Tuning knobs for the ingest pipeline.
 #[derive(Clone)]
@@ -44,6 +71,8 @@ struct WorkItem {
     /// re-parses on the blocking thread. Keeps ingest RSS low, which is
     /// the whole point of the engine.
     source: Arc<str>,
+    /// Document identity (`_id`, `_seq`).
+    identity: DocIdentity,
     pos: WalPos,
 }
 
@@ -80,6 +109,8 @@ struct PipelineInner {
     metrics: IngestMetrics,
     /// Routing rules, refreshed periodically from the metastore.
     rules: std::sync::RwLock<Arc<Vec<rsearch_metastore::RoutingRuleRecord>>>,
+    /// Write-sequence source shared by every ingest entry point.
+    seq: SeqClock,
 }
 
 /// Cloneable handle to the shared ingest pipeline: routes documents,
@@ -116,6 +147,7 @@ impl IngestPipeline {
                 worker_create: tokio::sync::Mutex::new(()),
                 metrics: IngestMetrics::default(),
                 rules: std::sync::RwLock::new(Arc::new(Vec::new())),
+                seq: SeqClock::default(),
             }),
         };
         // Keep the routing-rule cache warm.
@@ -190,22 +222,29 @@ impl IngestPipeline {
     ) -> IngestResult<(usize, usize)> {
         // Programmatic inputs have no original line, so serialize once and
         // share the Arc across every route.
-        let mut pairs: Vec<(String, Arc<str>)> = Vec::new();
+        let mut items: Vec<WalItem> = Vec::new();
         for doc in docs {
             let source: Arc<str> = Arc::from(doc.to_string());
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let seq = self.next_seq();
             for stream in self.expand_routes(default_stream, &doc) {
-                pairs.push((stream, source.clone()));
+                items.push(WalItem {
+                    stream,
+                    id: id.clone(),
+                    seq,
+                    doc: source.clone(),
+                });
             }
         }
-        if pairs.is_empty() {
+        if items.is_empty() {
             return Ok((0, 0));
         }
-        // The pairs move into the blocking task and back so the WAL append
+        // The items move into the blocking task and back so the WAL append
         // works on the existing strings — no per-document byte copies.
         let wal = self.inner.wal.clone();
-        let (pairs, positions) = tokio::task::spawn_blocking(move || {
-            let positions = wal.append_batch(&pairs);
-            (pairs, positions)
+        let (items, positions) = tokio::task::spawn_blocking(move || {
+            let positions = wal.append_batch(&items);
+            (items, positions)
         })
         .await
         .map_err(|e| IngestError::Wal(std::io::Error::other(e.to_string())))?;
@@ -213,8 +252,9 @@ impl IngestPipeline {
 
         let mut accepted = 0;
         let mut dropped = 0;
-        for ((stream, source), pos) in pairs.into_iter().zip(positions) {
-            match self.enqueue(&stream, source, pos).await {
+        for (item, pos) in items.into_iter().zip(positions) {
+            let identity = DocIdentity::new(item.id, item.seq);
+            match self.enqueue(&item.stream, item.doc, identity, pos).await {
                 Ok(()) => accepted += 1,
                 Err(_) => {
                     self.inner.wal.confirm(&[pos]);
@@ -238,15 +278,32 @@ impl IngestPipeline {
         &self.inner.wal
     }
 
+    /// Next write-sequence stamp (`_seq`) for a document accepted by this
+    /// node. Take it before the WAL append so the stamp is what gets
+    /// persisted and replayed.
+    pub fn next_seq(&self) -> i64 {
+        self.inner.seq.next()
+    }
+
     /// Enqueue a WAL-durable document for indexing. `source` is the exact
     /// document bytes — stored as `_source` and re-parsed by the indexer.
     /// Fails with [`IngestError::Saturated`] when the stream's queue is
     /// full — the caller reports a per-item 429 and confirms the WAL
     /// position.
-    pub async fn enqueue(&self, stream: &str, source: Arc<str>, pos: WalPos) -> IngestResult<()> {
+    pub async fn enqueue(
+        &self,
+        stream: &str,
+        source: Arc<str>,
+        identity: DocIdentity,
+        pos: WalPos,
+    ) -> IngestResult<()> {
         let tx = self.worker_for(stream).await?;
         let size = source.len() as u64;
-        match tx.try_send(WorkItem { source, pos }) {
+        match tx.try_send(WorkItem {
+            source,
+            identity,
+            pos,
+        }) {
             Ok(()) => {
                 self.note_enqueued(size);
                 Ok(())
@@ -305,6 +362,7 @@ impl IngestPipeline {
             if tx
                 .send(WorkItem {
                     source,
+                    identity: DocIdentity::new(record.id, record.seq),
                     pos: record.pos,
                 })
                 .await
@@ -553,7 +611,7 @@ async fn flush_inner(
                 // retry starts from a fresh one, so a builder corrupted
                 // by an unwound panic can at worst fail this attempt.
                 let added = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    builder.add_json_with_source(doc, Some(&item.source), fallback)
+                    builder.add_document(doc, Some(&item.source), &item.identity, fallback)
                 }));
                 match added {
                     Ok(Ok(())) => {}

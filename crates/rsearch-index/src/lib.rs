@@ -13,8 +13,11 @@ mod split_file;
 pub use builder::{PackagedSplit, SplitBuilder};
 pub use tantivy::DateTime;
 pub use cache::SplitCache;
-pub use reader::SplitReader;
-pub use document::{DocumentConverter, epoch_to_millis, extract_timestamp};
+pub use reader::{ReadDoc, SplitReader};
+pub use document::{DocIdentity, DocumentConverter, epoch_to_millis, extract_timestamp};
 pub use error::{IndexError, IndexResult};
-pub use mapping::{FieldType, IndexMapping, MappedSchema};
+pub use mapping::{
+    CURRENT_SCHEMA_VERSION, DYNAMIC_FIELD, FieldType, ID_FIELD, IndexMapping, MappedSchema,
+    SEQ_FIELD, SOURCE_FIELD, TIMESTAMP_FIELD,
+};
 pub use split_file::{BundleMeta, FOOTER_TAIL_LEN, FileSpan, SplitMeta, parse_footer_tail, parse_meta};

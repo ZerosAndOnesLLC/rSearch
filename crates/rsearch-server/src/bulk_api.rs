@@ -8,7 +8,8 @@ use axum::Json;
 use serde_json::{Value, json};
 
 use rsearch_common::crypto;
-use rsearch_ingest::{BulkParseOutcome, IngestError, parse_bulk_body};
+use rsearch_index::DocIdentity;
+use rsearch_ingest::{BulkParseOutcome, IngestError, WalItem, parse_bulk_body};
 use rsearch_storage::INTERNAL_TOKEN_HEADER;
 use tracing::warn;
 
@@ -142,22 +143,28 @@ async fn handle_bulk_local(
     let BulkParseOutcome {
         items, rejections, ..
     } = outcome;
-    let expanded: Vec<(usize, rsearch_ingest::BulkItem, Vec<String>)> = items
+    // Each item takes one write-sequence stamp, shared by all its routed
+    // copies, so the WAL, the split, and the bulk response agree on it.
+    let expanded: Vec<(usize, rsearch_ingest::BulkItem, Vec<String>, i64)> = items
         .into_iter()
         .map(|(position, item)| {
             let routes = pipeline.expand_routes(&item.stream, &item.doc);
-            (position, item, routes)
+            let seq = pipeline.next_seq();
+            (position, item, routes, seq)
         })
         .collect();
     let wal = pipeline.wal().clone();
-    let wal_items: Vec<(String, std::sync::Arc<str>)> = expanded
+    let wal_items: Vec<WalItem> = expanded
         .iter()
-        .flat_map(|(_, item, routes)| {
+        .flat_map(|(_, item, routes, seq)| {
             // WAL payload = the client's original line bytes (no
             // re-serialize, no byte copy — the Arc is shared).
-            routes
-                .iter()
-                .map(move |stream| (stream.clone(), item.raw.clone()))
+            routes.iter().map(move |stream| WalItem {
+                stream: stream.clone(),
+                id: item.doc_id.clone(),
+                seq: *seq,
+                doc: item.raw.clone(),
+            })
         })
         .collect();
     let positions = match tokio::task::spawn_blocking(move || wal.append_batch(&wal_items)).await {
@@ -180,7 +187,7 @@ async fn handle_bulk_local(
     // was accepted. Saturated routes get confirmed so the WAL drains.
     let mut responses: Vec<(usize, Value)> = Vec::new();
     let mut position_iter = positions.into_iter();
-    for (position, item, routes) in expanded {
+    for (position, item, routes, seq) in expanded {
         let action = item.action.as_str();
         let stream_name = item.stream;
         let doc_id = item.doc_id;
@@ -195,7 +202,8 @@ async fn handle_bulk_local(
                 internal_error = Some("internal: missing WAL position for routed copy".into());
                 break;
             };
-            match pipeline.enqueue(stream, raw.clone(), pos).await {
+            let identity = DocIdentity::new(doc_id.clone(), seq);
+            match pipeline.enqueue(stream, raw.clone(), identity, pos).await {
                 Ok(()) => accepted += 1,
                 Err(IngestError::Saturated) => {
                     pipeline.wal().confirm(&[pos]);
@@ -212,7 +220,7 @@ async fn handle_bulk_local(
                 action: {
                     "_index": stream_name,
                     "_id": doc_id,
-                    "_version": 1,
+                    "_version": seq,
                     "result": "created",
                     "status": 201,
                     "_shards": {"total": 1, "successful": 1, "failed": 0},

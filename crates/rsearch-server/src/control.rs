@@ -601,14 +601,25 @@ impl ControlPlane {
                     .await?,
             );
             builder = tokio::task::spawn_blocking(move || {
-                reader.for_each_doc(|doc, ts_millis| {
-                    // Docs lacking their own timestamp keep the original
-                    // one via the fallback.
-                    builder.add_json(
-                        doc,
-                        rsearch_index::DateTime::from_timestamp_millis(ts_millis),
-                    )
-                })?;
+                reader.for_each_doc(
+                    |_, _| false,
+                    |doc| {
+                        // Docs lacking their own timestamp keep the
+                        // original one via the fallback. Identity is
+                        // preserved; legacy docs (no id) get a fresh one at
+                        // sequence 0.
+                        let identity = match doc.id {
+                            Some(id) => rsearch_index::DocIdentity::new(id, doc.seq),
+                            None => rsearch_index::DocIdentity::generated(),
+                        };
+                        builder.add_document(
+                            doc.json,
+                            None,
+                            &identity,
+                            rsearch_index::DateTime::from_timestamp_millis(doc.timestamp_millis),
+                        )
+                    },
+                )?;
                 Ok::<_, rsearch_index::IndexError>(builder)
             })
             .await??;

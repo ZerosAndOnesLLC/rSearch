@@ -147,6 +147,9 @@ impl SearchRequest {
     }
 }
 
+/// A fetched page document: (page position, stored `_id`, `_source` text).
+type FetchedDoc = (usize, Option<String>, Option<String>);
+
 /// A hit reference — no `_source` yet; it's fetched only for the final
 /// page after the global merge, and includes a stable tiebreaker.
 #[derive(Clone)]
@@ -333,7 +336,6 @@ impl SearchService {
             .enumerate()
             .map(|(idx, split)| {
                 let this = &*self;
-                let schema = schema.clone();
                 let query = query.clone();
                 let aggregations = aggregations.clone();
                 let counted = counted.clone();
@@ -355,7 +357,6 @@ impl SearchService {
                     let outcome = tokio::task::spawn_blocking(move || {
                         search_one_split(
                             &reader,
-                            &schema,
                             &query,
                             aggregations,
                             fetch_limit,
@@ -413,16 +414,12 @@ impl SearchService {
             .take(request.size)
             .collect();
 
-        // Fetch _source only for the final page, grouped by split so each
-        // reader is used once (H4).
-        let page_entries = if request.include_source {
-            self.fetch_page_sources(&splits, &schema, &page, &request.stream)
-                .await?
-        } else {
-            page.iter()
-                .map(|hit| hit_envelope(hit, &splits, &request.stream, None))
-                .collect()
-        };
+        // Fetch the page's documents (`_id`, and `_source` unless disabled)
+        // only for the final page, grouped by split so each reader is used
+        // once (H4).
+        let page_entries = self
+            .fetch_page_sources(&splits, &page, &request.stream, request.include_source)
+            .await?;
 
         let merged_aggs = match (&aggregations, &aggs_json) {
             (Some(aggs), Some(_)) => {
@@ -478,14 +475,17 @@ impl SearchService {
         Ok(response)
     }
 
-    /// Fetch `_source` for the final page only, grouping by split so each
-    /// reader is used once on a single blocking task.
+    /// Fetch the stored documents for the final page only, grouping by
+    /// split so each reader is used once on a single blocking task. Yields
+    /// each hit's `_id` (the stored one, or the synthetic
+    /// `split:segment:doc` address for legacy splits without ids) and its
+    /// `_source` when `include_source`.
     async fn fetch_page_sources(
         &self,
         splits: &[rsearch_metastore::SplitRecord],
-        schema: &Arc<MappedSchema>,
         page: &[SplitHit],
         stream: &str,
+        include_source: bool,
     ) -> SearchResult<Vec<Value>> {
         use futures::stream::{self, StreamExt};
 
@@ -500,19 +500,25 @@ impl SearchService {
             .map(|(split_idx, wants)| {
                 let this = &*self;
                 let split = &splits[split_idx];
-                let schema = schema.clone();
                 async move {
                     let reader = this.reader(&split.split_id, &split.storage_key).await?;
                     tokio::task::spawn_blocking(move || {
                         let searcher = reader.searcher()?;
+                        let schema = reader.mapped_schema();
                         let mut out = Vec::with_capacity(wants.len());
                         for (pos, address) in wants {
                             let doc: TantivyDocument =
                                 searcher.doc(address).map_err(SearchError::Tantivy)?;
-                            let source = doc
-                                .get_first(schema.source)
-                                .and_then(|v| v.as_str().map(str::to_string));
-                            out.push((pos, source));
+                            let id = schema.id.and_then(|f| {
+                                doc.get_first(f).and_then(|v| v.as_str().map(str::to_string))
+                            });
+                            let source = include_source
+                                .then(|| {
+                                    doc.get_first(schema.source)
+                                        .and_then(|v| v.as_str().map(str::to_string))
+                                })
+                                .flatten();
+                            out.push((pos, id, source));
                         }
                         Ok::<_, SearchError>(out)
                     })
@@ -521,39 +527,51 @@ impl SearchService {
                 }
             })
             .collect();
-        let mut sources: Vec<Value> = vec![Value::Null; page.len()];
-        let fetched: Vec<Vec<(usize, Option<String>)>> = stream::iter(futs)
+        let mut fetched_docs: Vec<(Option<String>, Option<String>)> =
+            vec![(None, None); page.len()];
+        let fetched: Vec<Vec<FetchedDoc>> = stream::iter(futs)
             .buffer_unordered(SPLIT_SEARCH_CONCURRENCY)
             .collect::<Vec<SearchResult<_>>>()
             .await
             .into_iter()
             .collect::<SearchResult<Vec<_>>>()?;
-        for (pos, source) in fetched.into_iter().flatten() {
-            sources[pos] = source
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(Value::Null);
+        for (pos, id, source) in fetched.into_iter().flatten() {
+            fetched_docs[pos] = (id, source);
         }
         Ok(page
             .iter()
-            .zip(sources)
-            .map(|(hit, source)| hit_envelope(hit, splits, stream, Some(source)))
+            .zip(fetched_docs)
+            .map(|(hit, (id, source))| {
+                let source = include_source.then(|| {
+                    source
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(Value::Null)
+                });
+                hit_envelope(hit, splits, stream, id, source)
+            })
             .collect())
     }
 }
 
-/// Build the ES hit envelope. `source` is Some(value) when `_source` is
-/// requested (value may be Null if unfetchable), None to omit the field.
+/// Build the ES hit envelope. `id` is the stored `_id` when the split has
+/// one (legacy splits fall back to the synthetic split:segment:doc
+/// address); `source` is Some(value) when `_source` is requested (value
+/// may be Null if unfetchable), None to omit the field.
 fn hit_envelope(
     hit: &SplitHit,
     splits: &[rsearch_metastore::SplitRecord],
     stream: &str,
+    id: Option<String>,
     source: Option<Value>,
 ) -> Value {
     let split_id = &splits[hit.split_idx].split_id;
+    let id = id.unwrap_or_else(|| {
+        format!("{}:{}:{}", split_id, hit.doc.segment_ord, hit.doc.doc_id)
+    });
     let mut entry = json!({
         "_index": stream,
-        "_id": format!("{}:{}:{}", split_id, hit.doc.segment_ord, hit.doc.doc_id),
+        "_id": id,
         "_score": Value::Null,
         "sort": [hit.timestamp_millis],
     });
@@ -571,7 +589,6 @@ fn default_limits() -> AggregationLimitsGuard {
 #[allow(clippy::too_many_arguments)]
 fn search_one_split(
     reader: &SplitReader,
-    schema: &MappedSchema,
     query_json: &Value,
     aggregations: Option<Aggregations>,
     fetch_limit: usize,
@@ -582,7 +599,10 @@ fn search_one_split(
     fully_covered: bool,
 ) -> SearchResult<SplitOutcome> {
     let index = reader.index();
-    let query = translate_query(index, schema, query_json)?;
+    // Translate against the split's own schema: field ordinals follow the
+    // mapping the split was built with, which can differ from the stream's
+    // current mapping (PUT /{index} after the split was written).
+    let query = translate_query(index, reader.mapped_schema(), query_json)?;
     let searcher = reader.searcher()?;
 
     let order = if sort_desc { Order::Desc } else { Order::Asc };

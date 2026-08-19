@@ -300,6 +300,102 @@ Design decisions (locked):
       range clamping; L4 drain deletes the file on the draining node via
       peer DELETE (row-only fallback if unreachable)
 
+## Phase 14 — Document mode: index/update/delete by `_id` (issue #34)
+
+Goal: let an application use rSearch as a search index for *records it
+edits* — delete by `_id`, `index` on an existing `_id` replaces, stock ES
+client `_doc` routes, and a bounded/forced visibility window — without
+changing the log path's cost model. Design (Lucene live-docs in cache form,
+tombstones in the metastore since splits are immutable shared objects):
+
+- Every new split stores two reserved fields: `_id` (STRING|STORED, the
+  client's id or a generated UUID) and `_seq` (i64 INDEXED|FAST, a
+  node-local monotonic micros-since-epoch stamp taken when the write is
+  accepted). `SplitMeta.schema_version = 1` marks such splits; `0`/absent
+  = legacy (no ids — treated as never tombstoned).
+- A stream has `mode` ∈ {`log` (default), `document`}. Only document-mode
+  streams accept `delete`/`update`, write tombstones, and pay the
+  exclusion filter at query time. Log streams are untouched.
+- `doc_tombstones(seq BIGSERIAL, stream_id, doc_id, before_seq)`: "hide
+  every doc with this `_id` whose `_seq < before_seq`". `delete` inserts
+  (`before_seq = now`); `index`/`create`/`update` in document mode insert
+  (`before_seq = the new doc's _seq`) then WAL-append the doc, so reads
+  see exactly the newest version. Tombstone rows are written *before* the
+  WAL so a crash can't leave a replayed doc without its tombstone.
+- Search (every path funnels through `SearchService::search`): per
+  document-mode stream, the tombstone list is loaded incrementally (by
+  `seq`) into a short-TTL cache; per split the applicable tombstones are
+  resolved to an excluded doc set (term lookup on `_id` + `_seq` fast
+  column) and cached on the `SplitReader` (incremental by tombstone seq —
+  splits are immutable so the set only grows). The main query is wrapped
+  as `bool{must: q, must_not: ExcludeDocs}` so counts and aggregations
+  are correct; the H3 doc_count/skip_count fast paths are disabled when a
+  split has exclusions.
+- Compaction makes erasure physical: the merge job applies tombstones when
+  it re-indexes, records `tombstone_seq_applied` on the new split, and a
+  document-mode split with pending tombstones is rewritten on its own once
+  enough have accumulated or the oldest is past `compact_max_age_secs`
+  (bounded erasure latency). Tombstones are purged once no published split
+  can still contain a doc they hide.
+
+- [x] 14.1 Persist `_id` + `_seq` end to end: reserved schema fields
+      (appended after mapped fields so legacy split ordinals are
+      unchanged), `SplitMeta.schema_version`, `SplitBuilder::add_document
+      (doc, source, id, seq, fallback_ts)`, WAL payload v2 (flagged
+      stream_len high bit; legacy records replay with a generated id and
+      seq 0), `WorkItem{source,id,seq,pos}`, bulk/syslog/GELF/replay paths
+      carry them, merge re-indexes preserving id/seq, search hits return
+      the real `_id` (page fetch reads it from the doc store; legacy
+      splits keep the synthetic `split:seg:doc` id), `term`/`terms` on
+      `_id` and the `ids` query resolve `_id` by name against each split's
+      own schema. Per-split query translation uses the split's own
+      mapping (fixes ordinal drift after mapping changes).
+- [ ] 14.2 Stream `mode`: migration adds `streams.mode TEXT NOT NULL
+      DEFAULT 'log' CHECK (mode IN ('log','document'))`; `StreamRecord.mode`
+      + all column lists; `PUT /{index}` accepts `{"settings":{"index":
+      {"mode":"document"}}}` (also top-level `"mode"`); mode is fixed at
+      creation (409 on change); `GET /{index}/_settings`, `GET /{index}`
+      (settings+mappings), `_cat/indices` show mode; `ingest.
+      document_max_batch_secs` (default 5) bounds time-to-searchable for
+      document-mode streams; `PUT /{index}` classifies as
+      `Ingest(index)` (ingest keys already create streams via `_bulk`).
+- [ ] 14.3 Tombstones + deletion semantics: migration `doc_tombstones`
+      (+ `splits.seq_min/seq_max/tombstone_seq_applied`); metastore
+      upsert-batch / list-since-seq / stats; bulk `delete` accepted on
+      document-mode streams (rejected with the existing message on log
+      streams), `index`/`create` on document-mode streams tombstone older
+      versions; `_version` in responses = `_seq`; search-side exclusion
+      (ExcludeDocs query, per-reader excluded-doc cache, per-stream
+      tombstone cache with TTL + local invalidation on write, fast paths
+      disabled when exclusions apply). GET-by-id helper (term on `_id`,
+      exclusions applied, newest `_seq` wins) used by 14.4.
+- [ ] 14.4 ES document routes: `PUT/POST /{index}/_doc/{id}`, `POST
+      /{index}/_doc` (generated id), `GET/HEAD /{index}/_doc/{id}`,
+      `DELETE /{index}/_doc/{id}`, `PUT/POST /{index}/_create/{id}`
+      (409 if a live doc exists — checked against published splits, see
+      visibility caveat), `POST /{index}/_update/{id}` (`doc` merge,
+      `doc_as_upsert`; no scripts), bulk `update` (same semantics),
+      `POST /{index}/_delete_by_query`; all on document-mode streams
+      only (log streams 400 with a clear reason); `classify()` arms:
+      `_doc`/`_create`/`_update`/`_delete_by_query` writes →
+      `Ingest(index)`, reads → `Search(index)`.
+- [ ] 14.5 `?refresh=true|wait_for` on `_bulk` and the document routes
+      (document-mode streams): pipeline `flush_stream(stream)` cuts the
+      stream's current batch and resolves once it is published; bulk
+      handoff forwards the flag. Document the default window
+      (`ingest.max_batch_secs` / `document_max_batch_secs`).
+- [ ] 14.6 Compaction + purge: merge applies tombstones and stamps
+      `tombstone_seq_applied`; new control job rewrites document-mode
+      splits with pending tombstones (`compact_min_tombstones`,
+      `compact_max_age_secs`); tombstone purge once no published split
+      can hold a hidden doc; metrics for tombstones pending/purged.
+- [ ] 14.7 Tests + docs: unit tests (WAL v2 + legacy replay, bulk parse
+      of delete/update, exclusion query, tombstone applicability), an
+      ignored Postgres test for tombstone SQL, a `tests/cluster/
+      run-document-mode-test.sh` end-to-end (index → replace → delete →
+      refresh → compaction → GET 404); README document-mode section +
+      auth doc leading with `Authorization: Bearer`; reply on #34.
+
 ## Deferred (explicitly out of v1)
 
 - Distributed search fan-out across searchers (any searcher answers alone in v1)

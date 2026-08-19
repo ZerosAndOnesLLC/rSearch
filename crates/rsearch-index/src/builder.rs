@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tantivy::{Index, IndexWriter, TantivyDocument};
 
-use crate::document::DocumentConverter;
+use crate::document::{DocIdentity, DocumentConverter};
 use crate::error::{IndexError, IndexResult};
 use crate::mapping::MappedSchema;
 use crate::split_file::{self, SplitMeta};
@@ -76,28 +76,31 @@ impl SplitBuilder {
         self.doc_count
     }
 
-    /// Convert and buffer one document (serializes `_source` from `doc`).
+    /// Convert and buffer one document (serializes `_source` from `doc`)
+    /// under a fresh generated id at sequence 0.
     pub fn add_json(
         &mut self,
         doc: serde_json::Value,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
-        self.add_json_with_source(doc, None, fallback_timestamp)
+        let identity = DocIdentity::generated();
+        self.add_document(doc, None, &identity, fallback_timestamp)
     }
 
-    /// Convert and buffer one document, storing `source` verbatim as
-    /// `_source` (the client's original line) instead of re-serializing.
-    /// The document is consumed — its unmapped fields move into `_dynamic`
-    /// without a deep clone.
-    pub fn add_json_with_source(
+    /// Convert and buffer one document with an explicit identity, storing
+    /// `source` verbatim as `_source` (the client's original line) when
+    /// given instead of re-serializing. The document is consumed — its
+    /// unmapped fields move into `_dynamic` without a deep clone.
+    pub fn add_document(
         &mut self,
         doc: serde_json::Value,
         source: Option<&str>,
+        identity: &DocIdentity,
         fallback_timestamp: tantivy::DateTime,
     ) -> IndexResult<()> {
         let (converted, ts): (TantivyDocument, _) =
             self.converter
-                .convert_with_source(doc, source, fallback_timestamp)?;
+                .convert_with_source(doc, source, identity, fallback_timestamp)?;
         let millis = ts.into_timestamp_millis();
         // Update the advertised time range only after the doc is accepted,
         // so a rejected add can't widen the split's range (L6).
@@ -129,6 +132,7 @@ impl SplitBuilder {
             time_start_millis: self.min_ts_millis,
             time_end_millis: self.max_ts_millis,
             mapping: self.converter.schema().mapping.to_json(),
+            schema_version: self.converter.schema().schema_version,
         };
 
         let file_path = self.work_dir.path().join(format!("{}.split", self.split_id));

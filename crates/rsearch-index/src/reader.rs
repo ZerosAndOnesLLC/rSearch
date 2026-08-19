@@ -12,7 +12,21 @@ use rsearch_storage::Storage;
 
 use crate::cache::SplitCache;
 use crate::error::{IndexError, IndexResult};
+use crate::mapping::{ID_FIELD, IndexMapping, MappedSchema, SEQ_FIELD, SOURCE_FIELD, TIMESTAMP_FIELD};
 use crate::split_file::{BundleMeta, FOOTER_TAIL_LEN, parse_footer_tail, parse_meta};
+
+/// One document read back out of a split (merge / compaction re-index).
+#[derive(Debug)]
+pub struct ReadDoc {
+    /// Parsed `_source`.
+    pub json: serde_json::Value,
+    /// The document's `_timestamp`, epoch millis.
+    pub timestamp_millis: i64,
+    /// Stored `_id`; None in legacy splits (no id field).
+    pub id: Option<String>,
+    /// `_seq` write stamp; 0 in legacy splits.
+    pub seq: i64,
+}
 
 /// An opened split: footer metadata plus a lazily-fetching Tantivy index.
 /// Opening reads only the footer; internal files are range-read from
@@ -24,6 +38,9 @@ pub struct SplitReader {
     /// Built once and reused: splits are immutable, so re-opening every
     /// segment's readers per query is pure waste.
     reader: tantivy::IndexReader,
+    /// The mapped schema this split was written with (its own mapping and
+    /// layout version), so queries resolve fields by the split's ordinals.
+    schema: Arc<MappedSchema>,
 }
 
 impl SplitReader {
@@ -85,16 +102,29 @@ impl SplitReader {
         })
         .await
         .map_err(|e| IndexError::InvalidDocument(format!("open task failed: {e}")))??;
+        let mapping = IndexMapping::from_json(&meta.split.mapping).unwrap_or_default();
+        let schema = Arc::new(MappedSchema::build_versioned(mapping, meta.split.schema_version));
         Ok(Self {
             meta,
             index,
             reader,
+            schema,
         })
     }
 
     /// The underlying lazily-fetching Tantivy index.
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// The schema this split was built with (own mapping + layout version).
+    pub fn mapped_schema(&self) -> &Arc<MappedSchema> {
+        &self.schema
+    }
+
+    /// Whether documents in this split carry `_id`/`_seq`.
+    pub fn has_doc_ids(&self) -> bool {
+        self.schema.id.is_some()
     }
 
     /// A searcher over this immutable split, reusing the reader built at
@@ -104,26 +134,34 @@ impl SplitReader {
         Ok(self.reader.searcher())
     }
 
-    /// Visit every document as (parsed source JSON, timestamp millis) —
-    /// used by the merge job to re-index small splits. Call from a
-    /// blocking context. Streams the doc store one document at a time so
+    /// Visit every document — used by the merge/compaction jobs to
+    /// re-index splits. `skip(segment_ord, doc_id)` lets the caller drop
+    /// documents (tombstoned ones) without reading their source. Call from
+    /// a blocking context. Streams the doc store one document at a time so
     /// re-indexing a whole merge group holds O(one doc) in memory, not the
     /// entire group's parsed corpus.
     pub fn for_each_doc(
         &self,
-        mut visit: impl FnMut(serde_json::Value, i64) -> IndexResult<()>,
+        mut skip: impl FnMut(u32, tantivy::DocId) -> bool,
+        mut visit: impl FnMut(ReadDoc) -> IndexResult<()>,
     ) -> IndexResult<()> {
         let searcher = self.searcher()?;
         let schema = self.index.schema();
         let source_field = schema
-            .get_field(crate::mapping::SOURCE_FIELD)
+            .get_field(SOURCE_FIELD)
             .map_err(|_| IndexError::InvalidDocument("split lacks _source".into()))?;
-        for segment_reader in searcher.segment_readers() {
+        let id_field = schema.get_field(ID_FIELD).ok();
+        for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
             let store = segment_reader.get_store_reader(10)?;
-            let ts_column = segment_reader
-                .fast_fields()
-                .date(crate::mapping::TIMESTAMP_FIELD)?;
+            let ts_column = segment_reader.fast_fields().date(TIMESTAMP_FIELD)?;
+            let seq_column = match id_field {
+                Some(_) => Some(segment_reader.fast_fields().i64(SEQ_FIELD)?),
+                None => None,
+            };
             for doc_id in segment_reader.doc_ids_alive() {
+                if skip(segment_ord as u32, doc_id) {
+                    continue;
+                }
                 let doc: tantivy::TantivyDocument = store.get(doc_id)?;
                 let source = doc
                     .get_first(source_field)
@@ -134,11 +172,25 @@ impl SplitReader {
                 let json: serde_json::Value = serde_json::from_str(source).map_err(|e| {
                     IndexError::InvalidDocument(format!("corrupt _source: {e}"))
                 })?;
-                let ts = ts_column
+                let timestamp_millis = ts_column
                     .first(doc_id)
                     .map(|dt| dt.into_timestamp_millis())
                     .unwrap_or_default();
-                visit(json, ts)?;
+                let id = id_field.and_then(|f| {
+                    doc.get_first(f)
+                        .and_then(|v| tantivy::schema::Value::as_str(&v))
+                        .map(str::to_string)
+                });
+                let seq = seq_column
+                    .as_ref()
+                    .and_then(|c| c.first(doc_id))
+                    .unwrap_or(0);
+                visit(ReadDoc {
+                    json,
+                    timestamp_millis,
+                    id,
+                    seq,
+                })?;
             }
         }
         Ok(())
@@ -383,6 +435,72 @@ mod tests {
             "cache {} should be smaller than split {}",
             cache.total_bytes(),
             split_size
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_round_trips_through_split() {
+        use crate::document::DocIdentity;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(store_dir.path()));
+
+        let schema = MappedSchema::build(IndexMapping::default());
+        let mut builder = SplitBuilder::new("docs", schema, scratch.path(), 20 << 20).unwrap();
+        for (id, seq) in [("alpha", 10), ("beta", 20), ("alpha", 30)] {
+            builder
+                .add_document(
+                    serde_json::json!({"id": id, "seq": seq}),
+                    None,
+                    &DocIdentity::new(id, seq),
+                    tantivy::DateTime::from_timestamp_millis(1_753_300_000_000),
+                )
+                .unwrap();
+        }
+        let packaged = builder.finish().unwrap();
+        assert_eq!(packaged.meta.schema_version, crate::mapping::CURRENT_SCHEMA_VERSION);
+        let key = format!("splits/{}.split", packaged.meta.split_id);
+        storage.put_file(&key, &packaged.file_path).await.unwrap();
+
+        let cache = Arc::new(SplitCache::new(cache_dir.path(), 1 << 30).unwrap());
+        let reader = Arc::new(SplitReader::open(storage, &key, cache).await.unwrap());
+        assert!(reader.has_doc_ids());
+
+        let r = reader.clone();
+        let (alpha_count, seen) = tokio::task::spawn_blocking(move || {
+            let searcher = r.searcher().unwrap();
+            let id_field = r.mapped_schema().id.unwrap();
+            let query = TermQuery::new(
+                Term::from_field_text(id_field, "alpha"),
+                IndexRecordOption::Basic,
+            );
+            let alpha_count = searcher.search(&query, &Count).unwrap();
+            let mut seen = Vec::new();
+            r.for_each_doc(
+                |_, _| false,
+                |doc| {
+                    seen.push((doc.id.unwrap(), doc.seq));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            seen.sort();
+            (alpha_count, seen)
+        })
+        .await
+        .unwrap();
+        assert_eq!(alpha_count, 2);
+        assert_eq!(
+            seen,
+            vec![
+                ("alpha".to_string(), 10),
+                ("alpha".to_string(), 30),
+                ("beta".to_string(), 20)
+            ]
         );
     }
 }
