@@ -20,6 +20,11 @@ no garbage collector.
   automatic re-replication; no external object store required
 - **Tantivy index engine** — Lucene-class full-text search and
   ES-compatible aggregations with predictable, GC-free latency
+- **Document mode for application data** — per-index `mode: document`
+  turns on index-replaces / delete-by-`_id` / `_doc` routes /
+  `?refresh=wait_for`, with tombstones applied at query time and made
+  physical by compaction; log indices stay append-only and cost nothing
+  extra (see [Document mode](#document-mode-application-indices))
 
 ## FIPS compliance
 
@@ -104,7 +109,9 @@ curl -XPUT localhost:9200/_rsearch/users/admin \
 
 A reference multi-node topology (2 ingest + 2 search + 1 control over
 Postgres and MinIO) is in `docker-compose.yml`; the kill-a-node test
-suite that exercises it is `tests/cluster/run-cluster-test.sh`.
+suite that exercises it is `tests/cluster/run-cluster-test.sh`, and
+`tests/cluster/run-document-mode-test.sh` walks the document-mode API
+end to end on a single node.
 
 ## HA on block storage (no object store)
 
@@ -186,22 +193,89 @@ and IMDS are never touched.
 
 | Area | Endpoints |
 |------|-----------|
-| Ingest | `POST /_bulk`, `POST /{index}/_bulk` |
+| Ingest | `POST /_bulk`, `POST /{index}/_bulk` (`index`, `create`; plus `update`, `delete` on document-mode indices; `?refresh=true\|wait_for`) |
+| Documents | `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `POST /{index}/_doc`, `PUT/POST /{index}/_create/{id}`, `POST /{index}/_update/{id}`, `GET /{index}/_source/{id}`, `POST /{index}/_delete_by_query` (document-mode indices) |
 | Search | `POST /{index}/_search`, `POST /_msearch`, `GET /{index}/_mapping` |
-| Index admin | `PUT /{index}` (mapping), `GET /_cat/indices` |
+| Index admin | `PUT /{index}` (settings + mapping), `GET/HEAD /{index}`, `GET /{index}/_settings`, `GET /_cat/indices` |
 | Cluster | `GET /`, `GET /_cluster/health`, `GET /_cat/nodes` |
 | Streams | `PUT /_rsearch/streams/{name}/retention`, routing rules under `/_rsearch/routing_rules` |
 | Alerts | `PUT/GET/DELETE /_rsearch/alerts[/{name}]` (scheduled query → webhook) |
 | Auth | `POST /_rsearch/login`, users/api_keys under `/_rsearch/` |
 | Observability | `GET /metrics` (Prometheus), `GET /_rsearch/stats` (JSON) |
 
-Query DSL subset: `match_all`, `bool`, `term`, `terms`, `range`,
+Query DSL subset: `match_all`, `bool`, `term`, `terms`, `ids`, `range`,
 `exists`, `match`, `match_phrase`, `query_string`. Aggregations pass
 through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
+
+### Document mode (application indices)
+
+rSearch is a log engine first: an index is append-only, every write is a
+new document, and the only deletion is retention by time. Applications
+that index *records people edit* need more, so an index can be created
+in **document mode**:
+
+```bash
+curl -XPUT localhost:9200/items -H 'Content-Type: application/json' -d '{
+  "settings": {"index": {"mode": "document"}},
+  "mappings": {"properties": {"title": {"type": "keyword"}}}
+}'
+```
+
+(`mode` defaults to `log`; it can only change while the index is empty.)
+On a document-mode index:
+
+- `_id` is honored and persisted; `index` on an existing `_id` **replaces**
+  it (reads see exactly the newest version), `delete` hides every version,
+  `create` fails with 409 if a live version exists, `update` merges a
+  partial `doc` (`doc_as_upsert` / `upsert` supported, no scripts).
+- The stock ES document routes work unmodified — `PUT/GET/DELETE
+  /{index}/_doc/{id}`, `_create`, `_update`, `_source`,
+  `_delete_by_query` — and are one-item `_bulk` requests underneath, so
+  they share routing, peer handoff and WAL durability.
+- **Visibility**: a write becomes searchable when its split is cut —
+  within `ingest.document_max_batch_secs` (default 5s; log indices use
+  `ingest.max_batch_secs`, default 30s). `?refresh=true` or
+  `?refresh=wait_for` on `_bulk` or any document route cuts the split now
+  and returns once it is published, so a save-then-search flow sees its
+  own write. Deletes are visible immediately on the node that took them
+  and within ~1s elsewhere. `update`/`create`/GET read published splits
+  only, so a read-modify-write chain should set `refresh=wait_for` on
+  each step.
+- Under the hood: deleting or replacing writes a **tombstone** (one row per
+  index + `_id` in the metastore: "hide versions older than this write").
+  Searches apply tombstones inside the query so hits, counts and
+  aggregations agree; the excluded-document set is cached per split and
+  extended incrementally. Tombstones become **physical** when compaction
+  rewrites the split without the hidden versions: merges always do, and
+  a dedicated job rewrites document-mode splits once an index has
+  `control.compact_min_tombstones` (default 1000) or its oldest tombstone
+  is past `control.compact_max_age_secs` (default 1h) — that setting is
+  the bound on how long a deleted document survives in storage, so lower
+  it if an erasure SLA requires. Tombstone rows are purged once no split
+  can still hold a version they hide.
+- Log indices are untouched: they reject `delete`/`update` per item with
+  a reason that points at the setting, ignore `?refresh`, and carry no
+  query-time filtering.
+
+Hits from document-mode (and new log) indices return the real `_id` and
+`_version` (the write sequence); splits written before this feature keep
+their synthetic `split:segment:doc` ids.
+
+### Authentication for applications
+
+API keys are accepted as `Authorization: Bearer <key>` (preferred —
+`Authorization` is what HTTP clients, tracing middleware and proxies
+already redact) or `X-Api-Key: <key>`. A key carries an action set and a
+stream list, so an application can hold a least-privilege key: with
+`{"actions": ["ingest", "search"], "streams": ["items"]}` it can create
+its index (`PUT /items`), write and read documents, and nothing else.
+`PUT /{index}`, the document writes and `_delete_by_query` classify as
+stream-scoped `ingest`; document reads, `GET /{index}` and `_settings`
+as stream-scoped `search`. Everything under `/_rsearch/` stays admin.
 
 ### Loki-compatible API (Grafana Logs Drilldown)
 

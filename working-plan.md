@@ -389,7 +389,7 @@ tombstones in the metastore since splits are immutable shared objects):
       splits with pending tombstones (`compact_min_tombstones`,
       `compact_max_age_secs`); tombstone purge once no published split
       can hold a hidden doc; metrics for tombstones pending/purged.
-- [ ] 14.7 Tests + docs: unit tests (WAL v2 + legacy replay, bulk parse
+- [x] 14.7 Tests + docs: unit tests (WAL v2 + legacy replay, bulk parse
       of delete/update, exclusion query, tombstone applicability), an
       ignored Postgres test for tombstone SQL, a `tests/cluster/
       run-document-mode-test.sh` end-to-end (index → replace → delete →
@@ -397,6 +397,12 @@ tombstones in the metastore since splits are immutable shared objects):
       auth doc leading with `Authorization: Bearer`; reply on #34.
 
 ## Deferred (explicitly out of v1)
+
+- Document mode follow-ups (phase 14): a per-node recent-writes buffer so
+  `update`/`create`/GET see documents before their split is cut (today:
+  use `?refresh=wait_for`); glob patterns in API-key stream scopes
+  (`app-*`); `_mget`; `_update` scripts; `_version`-based optimistic
+  concurrency (`if_seq_no`)
 
 - Distributed search fan-out across searchers (any searcher answers alone in v1)
 - Replicated ingest WAL; Kafka/Kinesis sources
