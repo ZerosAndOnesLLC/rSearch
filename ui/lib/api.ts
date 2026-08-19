@@ -81,7 +81,11 @@ export async function search(
   if (fromMillis)
     filters.push({ range: { "@timestamp": { gte: fromMillis, lte: "now" } } });
   if (query.trim())
-    filters.push({ query_string: { query: query.trim() } });
+    // A log-search box wants every typed word to match; the API's
+    // default_operator is OR (ES-compatible), so ask for AND explicitly.
+    filters.push({
+      query_string: { query: query.trim(), default_operator: "and" },
+    });
   const body = {
     size,
     query: filters.length ? { bool: { filter: filters } } : { match_all: {} },

@@ -639,8 +639,9 @@ fn translate_match(
 /// `query_string` / `simple_query_string`. Honors `fields` (with ES `^boost`
 /// suffixes and a bare `*`) or `default_field`; without either, every
 /// mapped text field plus the dynamic catch-all is searched, so bare
-/// terms search everything tokenized. `default_operator` defaults to
-/// AND (log-search convention); pass `"or"` for ES's default.
+/// terms search everything tokenized. `default_operator` defaults to OR,
+/// as in Elasticsearch/OpenSearch; pass `"and"` to require every term
+/// (what a log-search box usually wants — the bundled console does).
 fn translate_query_string(
     index: &tantivy::Index,
     schema: &MappedSchema,
@@ -650,9 +651,9 @@ fn translate_query_string(
         .get("query")
         .and_then(Value::as_str)
         .ok_or_else(|| SearchError::BadRequest("query_string needs 'query'".into()))?;
-    let conjunction = !matches!(
+    let conjunction = matches!(
         body.get("default_operator").and_then(Value::as_str),
-        Some(op) if op.eq_ignore_ascii_case("or")
+        Some(op) if op.eq_ignore_ascii_case("and")
     );
 
     // Requested fields: `fields: [..]` wins, else `default_field`, else
@@ -842,10 +843,10 @@ mod tests {
             hits(&serde_json::json!({"query_string": {"query": "api", "fields": ["service"]}})),
             2
         );
-        // `*` means everything; AND is the default operator, OR opt-in.
+        // `*` means everything; OR is the default operator (ES), AND opt-in.
         assert_eq!(
             hits(&serde_json::json!({"query_string": {"query": "ada engine", "fields": ["*"]}})),
-            0
+            2
         );
         assert_eq!(
             hits(&serde_json::json!({"query_string": {"query": "ada", "fields": ["message", "name"]}})),
@@ -853,15 +854,20 @@ mod tests {
         );
         assert_eq!(
             hits(&serde_json::json!({"query_string": {
-                "query": "ada engine", "fields": ["message"], "default_operator": "or"}})),
-            2
+                "query": "ada engine", "fields": ["message"], "default_operator": "and"}})),
+            0
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"query_string": {
+                "query": "ada lovelace", "fields": ["message"], "default_operator": "AND"}})),
+            1
         );
         // simple_query_string is the same engine, and never a 400 on typos
         // (the broken clause is parsed leniently, not rejected).
         assert_eq!(
             hits(&serde_json::json!({"simple_query_string": {
                 "query": "lovelace \"unbalanced AND", "fields": ["message", "name"],
-                "default_operator": "or", "flags": "ALL"}})),
+                "flags": "ALL"}})),
             2
         );
         // A field list naming nothing searchable is an error, not silence.
