@@ -3,7 +3,7 @@
 //!     cargo test -p rsearch-metastore -- --ignored
 
 use rsearch_common::config::MetastoreConfig;
-use rsearch_metastore::{Metastore, MetastoreError, SplitState};
+use rsearch_metastore::{Metastore, MetastoreError, SplitState, StreamMode};
 
 async fn metastore() -> Option<Metastore> {
     let url = std::env::var("RSEARCH_TEST_DATABASE_URL").ok()?;
@@ -42,6 +42,37 @@ async fn stream_crud_and_mapping() {
         ms.get_stream(&name).await,
         Err(MetastoreError::StreamNotFound(_))
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn stream_mode_is_fixed_once_data_exists() {
+    let Some(ms) = metastore().await else { return };
+    let name = unique("mode");
+
+    // Auto-created streams are log mode; an empty stream may switch.
+    let stream = ms.ensure_stream(&name).await.unwrap();
+    assert_eq!(stream.mode(), StreamMode::Log);
+    ms.set_stream_mode(&name, StreamMode::Document).await.unwrap();
+    assert!(ms.get_stream(&name).await.unwrap().is_document_mode());
+    // ensure_stream_with_mode never flips an existing stream.
+    let again = ms.ensure_stream_with_mode(&name, StreamMode::Log).await.unwrap();
+    assert_eq!(again.mode(), StreamMode::Document);
+
+    // Once a split exists the mode is fixed.
+    let split_id = unique("split");
+    ms.stage_split(&split_id, stream.id, "k", 1, 1, 0, 0, 0, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ms.set_stream_mode(&name, StreamMode::Log).await,
+        Err(MetastoreError::StreamModeFixed(_))
+    ));
+    assert!(matches!(
+        ms.set_stream_mode(&unique("missing"), StreamMode::Log).await,
+        Err(MetastoreError::StreamNotFound(_))
+    ));
+    ms.delete_stream(&name).await.unwrap();
 }
 
 #[tokio::test]

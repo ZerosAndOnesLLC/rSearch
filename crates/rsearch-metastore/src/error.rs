@@ -16,6 +16,10 @@ pub enum MetastoreError {
     #[error("stream not found: {0}")]
     StreamNotFound(String),
 
+    /// The stream already holds data, so its mode can no longer change.
+    #[error("stream '{0}' already holds data; its mode cannot be changed")]
+    StreamModeFixed(String),
+
     /// Split missing, or not in the state a transition requires.
     #[error("split not found or not in expected state: {0}")]
     SplitStateConflict(String),

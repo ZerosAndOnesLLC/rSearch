@@ -360,6 +360,10 @@ pub struct IngestConfig {
     pub max_batch_docs: usize,
     /// Max seconds a batch may age before a split is cut.
     pub max_batch_secs: u64,
+    /// Same bound for document-mode streams, which trade smaller splits
+    /// for a tighter time-to-searchable (a user saves a record and
+    /// searches for it). `?refresh=wait_for` forces an immediate cut.
+    pub document_max_batch_secs: u64,
     /// Bound on the in-flight ingest queue (documents per stream) before
     /// per-item 429s are returned.
     pub queue_capacity: usize,
@@ -380,6 +384,7 @@ impl Default for IngestConfig {
         Self {
             max_batch_docs: 500_000,
             max_batch_secs: 30,
+            document_max_batch_secs: 5,
             queue_capacity: 100_000,
             memory_budget_mb: 256,
             wal_segment_mb: 64,

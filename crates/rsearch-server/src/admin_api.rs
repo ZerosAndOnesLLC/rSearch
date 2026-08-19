@@ -30,6 +30,7 @@ pub async fn cat_indices(State(state): State<AppState>) -> Response {
                         "store.size": format!("{}kb", s.size_bytes / 1024),
                         "splits": s.split_count,
                         "retention_hours": s.retention_hours,
+                        "mode": s.mode,
                     })
                 })
                 .collect::<Vec<_>>(),

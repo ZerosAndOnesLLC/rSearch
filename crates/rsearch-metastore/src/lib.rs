@@ -21,5 +21,6 @@ pub use routing::RoutingRuleRecord;
 pub use error::{MetastoreError, MetastoreResult};
 pub use metastore::Metastore;
 pub use types::{
-    NodeRecord, SplitRecord, SplitState, StreamRecord, StreamStats, UnderReplicatedKey,
+    NodeRecord, SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats,
+    UnderReplicatedKey,
 };

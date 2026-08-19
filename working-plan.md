@@ -350,7 +350,7 @@ tombstones in the metastore since splits are immutable shared objects):
       `_id` and the `ids` query resolve `_id` by name against each split's
       own schema. Per-split query translation uses the split's own
       mapping (fixes ordinal drift after mapping changes).
-- [ ] 14.2 Stream `mode`: migration adds `streams.mode TEXT NOT NULL
+- [x] 14.2 Stream `mode`: migration adds `streams.mode TEXT NOT NULL
       DEFAULT 'log' CHECK (mode IN ('log','document'))`; `StreamRecord.mode`
       + all column lists; `PUT /{index}` accepts `{"settings":{"index":
       {"mode":"document"}}}` (also top-level `"mode"`); mode is fixed at

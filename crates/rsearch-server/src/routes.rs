@@ -72,7 +72,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/loki/api/v1/tail", get(crate::loki_api::tail))
         .route("/{index}/_mapping", get(search_api::get_mapping))
-        .route("/{index}", axum::routing::put(search_api::put_index))
+        .route("/{index}/_settings", get(search_api::get_settings))
+        .route(
+            "/{index}",
+            axum::routing::put(search_api::put_index)
+                .get(search_api::get_index)
+                .head(search_api::head_index),
+        )
         .route("/_cat/indices", get(crate::admin_api::cat_indices))
         .route("/_rsearch/routing_rules", get(crate::admin_api::list_rules))
         .route(

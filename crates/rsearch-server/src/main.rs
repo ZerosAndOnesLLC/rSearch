@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
             PipelineConfig {
                 max_batch_docs: config.ingest.max_batch_docs,
                 max_batch_secs: config.ingest.max_batch_secs,
+                document_max_batch_secs: config.ingest.document_max_batch_secs,
                 queue_capacity: config.ingest.queue_capacity,
                 work_dir: data_dir.join("staging"),
                 memory_budget: config.ingest.memory_budget_mb << 20,

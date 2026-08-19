@@ -54,6 +54,8 @@ pub struct PipelineConfig {
     /// Flush a non-empty batch after this many seconds regardless of
     /// size (bounds time-to-searchable).
     pub max_batch_secs: u64,
+    /// The same bound for document-mode streams.
+    pub document_max_batch_secs: u64,
     /// Per-stream bounded queue depth in documents; a full queue
     /// rejects with [`IngestError::Saturated`].
     pub queue_capacity: usize,
@@ -401,6 +403,7 @@ impl IngestPipeline {
             self.inner.clone(),
             stream.to_string(),
             record.id,
+            record.is_document_mode(),
             schema,
             rx,
         ));
@@ -423,11 +426,17 @@ async fn stream_worker(
     inner: Arc<PipelineInner>,
     stream: String,
     stream_id: i64,
+    document_mode: bool,
     schema: MappedSchema,
     mut rx: mpsc::Receiver<WorkItem>,
 ) {
     let max_docs = inner.config.max_batch_docs.max(1);
-    let max_age = Duration::from_secs(inner.config.max_batch_secs.max(1));
+    let age_secs = if document_mode {
+        inner.config.document_max_batch_secs
+    } else {
+        inner.config.max_batch_secs
+    };
+    let max_age = Duration::from_secs(age_secs.max(1));
     let idle_exit = Duration::from_secs(WORKER_IDLE_EXIT_SECS);
     let mut buffer: Vec<WorkItem> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle_exit;

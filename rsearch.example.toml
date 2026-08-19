@@ -69,6 +69,8 @@ max_connections = 10
 [ingest]
 max_batch_docs = 500000  # cut a split at this many buffered docs...
 max_batch_secs = 30      # ...or when the oldest doc reaches this age
+document_max_batch_secs = 5  # age bound for document-mode streams (tighter
+                         # time-to-searchable; ?refresh=wait_for forces a cut)
 queue_capacity = 100000  # per-stream in-flight bound before 429s
 memory_budget_mb = 256   # tantivy writer heap per stream worker
 wal_segment_mb = 64      # WAL segment rotation size

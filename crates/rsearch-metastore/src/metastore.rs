@@ -4,7 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 use rsearch_common::config::MetastoreConfig;
 
 use crate::error::{MetastoreError, MetastoreResult};
-use crate::types::{SplitRecord, SplitState, StreamRecord, StreamStats};
+use crate::types::{SplitRecord, SplitState, StreamMode, StreamRecord, StreamStats};
 
 const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
      size_bytes, time_start_millis, time_end_millis, footer_len, created_by";
@@ -61,7 +61,7 @@ impl Metastore {
         let row = sqlx::query_as::<_, StreamRecord>(
             "INSERT INTO streams (name) VALUES ($1)
              ON CONFLICT (name) DO UPDATE SET updated_at = now()
-             RETURNING id, name, mapping, retention_hours",
+             RETURNING id, name, mapping, retention_hours, mode",
         )
         .bind(name)
         .fetch_one(&self.pool)
@@ -72,7 +72,7 @@ impl Metastore {
     /// Look up a stream by name; `StreamNotFound` if missing.
     pub async fn get_stream(&self, name: &str) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours FROM streams WHERE name = $1",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -83,7 +83,7 @@ impl Metastore {
     /// Per-stream stats over published splits (for `_cat/indices`).
     pub async fn stream_stats(&self) -> MetastoreResult<Vec<StreamStats>> {
         Ok(sqlx::query_as::<_, StreamStats>(
-            "SELECT st.name, st.retention_hours,
+            "SELECT st.name, st.retention_hours, st.mode,
                     COUNT(s.id) FILTER (WHERE s.state = 'published') AS split_count,
                     COALESCE(SUM(s.doc_count) FILTER (WHERE s.state = 'published'), 0)::bigint AS doc_count,
                     COALESCE(SUM(s.size_bytes) FILTER (WHERE s.state = 'published'), 0)::bigint AS size_bytes
@@ -99,7 +99,7 @@ impl Metastore {
     /// Look up a stream by id; `StreamNotFound` if missing.
     pub async fn get_stream_by_id(&self, id: i64) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours FROM streams WHERE id = $1",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -110,7 +110,7 @@ impl Metastore {
     /// All streams, ordered by name.
     pub async fn list_streams(&self) -> MetastoreResult<Vec<StreamRecord>> {
         Ok(sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours FROM streams ORDER BY name",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -132,6 +132,47 @@ impl Metastore {
         .await?;
         if result.rows_affected() == 0 {
             return Err(MetastoreError::StreamNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Fetch-or-create a stream with an explicit mode. An existing stream
+    /// keeps its mode; the caller compares and decides (mode is fixed once
+    /// the stream holds data — see [`Metastore::set_stream_mode`]).
+    pub async fn ensure_stream_with_mode(
+        &self,
+        name: &str,
+        mode: StreamMode,
+    ) -> MetastoreResult<StreamRecord> {
+        let row = sqlx::query_as::<_, StreamRecord>(
+            "INSERT INTO streams (name, mode) VALUES ($1, $2)
+             ON CONFLICT (name) DO UPDATE SET updated_at = now()
+             RETURNING id, name, mapping, retention_hours, mode",
+        )
+        .bind(name)
+        .bind(mode.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Change a stream's mode. Only allowed while the stream holds no
+    /// splits (a log stream's documents have no tombstone semantics to
+    /// retrofit); otherwise `StreamModeFixed`.
+    pub async fn set_stream_mode(&self, name: &str, mode: StreamMode) -> MetastoreResult<()> {
+        let result = sqlx::query(
+            "UPDATE streams SET mode = $2, updated_at = now()
+             WHERE name = $1
+               AND NOT EXISTS (SELECT 1 FROM splits WHERE splits.stream_id = streams.id)",
+        )
+        .bind(name)
+        .bind(mode.as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            // Distinguish "no such stream" from "has data".
+            self.get_stream(name).await?;
+            return Err(MetastoreError::StreamModeFixed(name.to_string()));
         }
         Ok(())
     }

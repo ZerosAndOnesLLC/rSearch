@@ -35,6 +35,37 @@ impl std::str::FromStr for SplitState {
     }
 }
 
+/// How a stream treats writes to an existing `_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamMode {
+    /// Append-only log store: every write is a new document; `delete` and
+    /// `update` are rejected. The default.
+    Log,
+    /// Document index: `index` on an existing `_id` replaces it, `delete`
+    /// and `update` work, reads filter tombstoned versions.
+    Document,
+}
+
+impl StreamMode {
+    /// The mode's wire/storage name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StreamMode::Log => "log",
+            StreamMode::Document => "document",
+        }
+    }
+
+    /// Parse the wire/storage name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "log" => Some(StreamMode::Log),
+            "document" => Some(StreamMode::Document),
+            _ => None,
+        }
+    }
+}
+
 /// A stream (index) row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct StreamRecord {
@@ -46,6 +77,20 @@ pub struct StreamRecord {
     pub mapping: serde_json::Value,
     /// Retention window in hours; None = keep forever.
     pub retention_hours: Option<i32>,
+    /// Raw mode string; parse via [`StreamRecord::mode`].
+    pub mode: String,
+}
+
+impl StreamRecord {
+    /// Parsed [`StreamMode`]; unknown strings fall back to `Log`.
+    pub fn mode(&self) -> StreamMode {
+        StreamMode::parse(&self.mode).unwrap_or(StreamMode::Log)
+    }
+
+    /// Whether this stream is a document-mode index.
+    pub fn is_document_mode(&self) -> bool {
+        self.mode() == StreamMode::Document
+    }
 }
 
 /// A split (immutable index file) row.
@@ -90,6 +135,8 @@ pub struct StreamStats {
     pub name: String,
     /// Retention window in hours; None = keep forever.
     pub retention_hours: Option<i32>,
+    /// Stream mode (`log` | `document`).
+    pub mode: String,
     /// Number of published splits.
     pub split_count: i64,
     /// Total documents across published splits.

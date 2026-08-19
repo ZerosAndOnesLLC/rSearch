@@ -182,11 +182,24 @@ fn classify(method: &str, path: &str) -> Action {
         // Search / read
         (_, [index, "_search"]) => Action::Search(Some(index.to_string())),
         ("POST", ["_msearch"]) => Action::Search(None),
-        ("GET", [index, "_mapping"]) => Action::Search(Some(index.to_string())),
+        ("GET", [index, "_mapping"]) | ("GET", [index, "_settings"]) => {
+            Action::Search(Some(index.to_string()))
+        }
+
         ("GET", ["_cat", ..]) | ("GET", ["_rsearch", "stats"]) => Action::Search(None),
         // Prometheus scrape — same read level as stats; scrape configs
         // pass a session or API-key token as a bearer credential.
         ("GET", ["metrics"]) => Action::Search(None),
+        // Single-segment index paths, after every reserved top-level route
+        // above. Index creation / mapping update is an ingest-level action:
+        // an ingest key scoped to a stream already creates it implicitly
+        // via _bulk, so PUT /{index} (mode + mapping) needs no more.
+        ("PUT", [index]) if !index.starts_with('_') => {
+            Action::Ingest(Some(index.to_string()))
+        }
+        ("GET" | "HEAD", [index]) if !index.starts_with('_') => {
+            Action::Search(Some(index.to_string()))
+        }
         // Everything else that mutates: admin.
         _ => Action::Admin,
     }
@@ -422,7 +435,19 @@ mod tests {
         assert_eq!(classify("GET", "/loki/api/v1/tail"), Action::Search(None));
         assert_eq!(classify("GET", "/loki/api/v1/index/volume"), Action::Search(None));
         assert_eq!(classify("GET", "/ready"), Action::Open);
-        assert_eq!(classify("PUT", "/app-logs"), Action::Admin);
+        // Index create/describe are stream-scoped ingest/search actions so
+        // an application can hold a least-privilege key (#34).
+        assert_eq!(classify("PUT", "/app-logs"), Action::Ingest(Some("app-logs".into())));
+        assert_eq!(classify("GET", "/app-logs"), Action::Search(Some("app-logs".into())));
+        assert_eq!(classify("HEAD", "/app-logs"), Action::Search(Some("app-logs".into())));
+        assert_eq!(
+            classify("GET", "/app-logs/_settings"),
+            Action::Search(Some("app-logs".into()))
+        );
+        // Reserved top-level paths never fall into the index arms.
+        assert_eq!(classify("PUT", "/_rsearch"), Action::Admin);
+        assert_eq!(classify("GET", "/_rsearch"), Action::Admin);
+        assert_eq!(classify("GET", "/metrics"), Action::Search(None));
         assert_eq!(classify("PUT", "/_rsearch/users/alice"), Action::Admin);
         assert_eq!(
             classify("PUT", "/_rsearch/routing_rules/x"),
