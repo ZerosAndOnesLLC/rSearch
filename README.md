@@ -204,7 +204,11 @@ and IMDS are never touched.
 | Observability | `GET /metrics` (Prometheus), `GET /_rsearch/stats` (JSON) |
 
 Query DSL subset: `match_all`, `bool`, `term`, `terms`, `ids`, `range`,
-`exists`, `match`, `match_phrase`, `query_string`. Aggregations pass
+`exists`, `match`, `match_phrase`, `query_string`, `simple_query_string`
+(the same lenient parser — a typo never 400s; `fields` with `^boost`,
+`default_field`, and `default_operator` are honored, `flags` is accepted
+and ignored; bare terms search the mapped text fields, unmapped fields by
+`name:term` or via `fields`). Aggregations pass
 through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 
@@ -287,6 +291,11 @@ already redact) or `X-Api-Key: <key>`. A key carries an action set and a
 stream list, so an application can hold a least-privilege key: with
 `{"actions": ["ingest", "search"], "streams": ["items"]}` it can create
 its index (`PUT /items`), write and read documents, and nothing else.
+Stream entries are exact names or globs (`*` matches any run of
+characters): `"streams": ["acme-*"]` scopes a multi-tenant application to
+the indices it derives from its tenant names without `*` or an up-front
+list; `*` alone still means every stream (required for `/_bulk` without
+an index in the URL, `/_msearch`, and the Loki API).
 `PUT /{index}`, the document writes and `_delete_by_query` classify as
 stream-scoped `ingest`; document reads, `GET /{index}` and `_settings`
 as stream-scoped `search`. Everything under `/_rsearch/` stays admin.
