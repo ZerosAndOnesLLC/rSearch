@@ -247,12 +247,19 @@ fn scan_time_bounds(node: &Value, start: &mut Option<i64>, end: &mut Option<i64>
     }
 }
 
+/// Lazily lists the string-valued `_dynamic` paths of the split being
+/// searched, so a bare `query_string` can fan out across unmapped fields
+/// (issue #42). Only invoked when a query actually needs it; the split
+/// reader caches the underlying term-dictionary scan.
+pub type DynamicPathsFn<'a> = dyn Fn() -> SearchResult<Vec<String>> + 'a;
+
 /// Translate an ES query object into a Tantivy query against `schema`.
 /// `index` supplies tokenizers for match/query_string queries.
 pub fn translate_query(
     index: &tantivy::Index,
     schema: &MappedSchema,
     query: &Value,
+    dynamic_paths: &DynamicPathsFn,
 ) -> SearchResult<Box<dyn Query>> {
     let obj = query
         .as_object()
@@ -270,7 +277,7 @@ pub fn translate_query(
 
     match kind.as_str() {
         "match_all" => Ok(Box::new(AllQuery)),
-        "bool" => translate_bool(index, schema, body),
+        "bool" => translate_bool(index, schema, body, dynamic_paths),
         "term" => translate_term(schema, body),
         "terms" => translate_terms(schema, body),
         "ids" => translate_ids(schema, body),
@@ -278,11 +285,11 @@ pub fn translate_query(
         "exists" => translate_exists(schema, body),
         "match" => translate_match(index, schema, body, false),
         "match_phrase" => translate_match(index, schema, body, true),
-        "query_string" => translate_query_string(index, schema, body),
+        "query_string" => translate_query_string(index, schema, body, dynamic_paths),
         // Same engine: our query_string parse is already lenient (never a
         // 400 on a typo), which is the property simple_query_string exists
         // for; `flags` is accepted and ignored.
-        "simple_query_string" => translate_query_string(index, schema, body),
+        "simple_query_string" => translate_query_string(index, schema, body, dynamic_paths),
         other => Err(SearchError::BadRequest(format!(
             "unsupported query type '{other}' (supported: match_all, bool, term, terms, \
              ids, range, exists, match, match_phrase, query_string, simple_query_string)"
@@ -294,6 +301,7 @@ fn translate_bool(
     index: &tantivy::Index,
     schema: &MappedSchema,
     body: &Value,
+    dynamic_paths: &DynamicPathsFn,
 ) -> SearchResult<Box<dyn Query>> {
     let obj = body
         .as_object()
@@ -311,7 +319,7 @@ fn translate_bool(
                 single => vec![single],
             };
             for item in items {
-                clauses.push((occur, translate_query(index, schema, item)?));
+                clauses.push((occur, translate_query(index, schema, item, dynamic_paths)?));
             }
         }
     }
@@ -638,14 +646,17 @@ fn translate_match(
 
 /// `query_string` / `simple_query_string`. Honors `fields` (with ES `^boost`
 /// suffixes and a bare `*`) or `default_field`; without either, every
-/// mapped text field plus the dynamic catch-all is searched, so bare
-/// terms search everything tokenized. `default_operator` defaults to OR,
-/// as in Elasticsearch/OpenSearch; pass `"and"` to require every term
-/// (what a log-search box usually wants — the bundled console does).
+/// mapped text field plus every string-valued `_dynamic` path is
+/// searched, so bare terms search everything tokenized — matching ES,
+/// where `default_field` defaults to `*` (issue #42). `default_operator`
+/// defaults to OR, as in Elasticsearch/OpenSearch; pass `"and"` to
+/// require every term (what a log-search box usually wants — the bundled
+/// console does).
 fn translate_query_string(
     index: &tantivy::Index,
     schema: &MappedSchema,
     body: &Value,
+    all_dynamic_paths: &DynamicPathsFn,
 ) -> SearchResult<Box<dyn Query>> {
     let query_text = body
         .get("query")
@@ -689,7 +700,14 @@ fn translate_query_string(
                 .filter(|(_, ty)| *ty == FieldType::Text)
                 .map(|(field, _)| *field),
         );
+        // Kept as a parser default so explicit `path:term` syntax inside
+        // the query text resolves into `_dynamic`. A bare term against a
+        // JSON field only probes the empty path, though — the parser
+        // cannot fan it across every path (issue #42), so each
+        // string-valued path the split actually contains gets its own
+        // clause below.
         default_fields.push(schema.dynamic);
+        dynamic_paths.extend(all_dynamic_paths()?.into_iter().map(|path| (path, 1.0)));
     } else {
         for spec in &requested {
             let (name, boost) = match spec.rsplit_once('^') {
@@ -764,6 +782,16 @@ mod tests {
         tantivy::Index::create_in_ram(schema.schema.clone())
     }
 
+    /// Path provider for tests: scans the in-RAM index the way the real
+    /// executor's split reader does (minus the per-split cache).
+    fn paths_of<'a>(idx: &'a tantivy::Index, schema: &'a MappedSchema) -> impl Fn() -> SearchResult<Vec<String>> + 'a {
+        move || {
+            let searcher = idx.reader().map_err(SearchError::Tantivy)?.searcher();
+            rsearch_index::dynamic_string_paths(&searcher, schema.dynamic)
+                .map_err(SearchError::Tantivy)
+        }
+    }
+
     #[test]
     fn translates_supported_queries() {
         let s = schema();
@@ -787,7 +815,7 @@ mod tests {
             }}),
             serde_json::json!({"term": {"unmapped_field": "value"}}),
         ] {
-            translate_query(&idx, &s, &query)
+            translate_query(&idx, &s, &query, &paths_of(&idx, &s))
                 .unwrap_or_else(|e| panic!("query {query} failed: {e}"));
         }
     }
@@ -813,16 +841,17 @@ mod tests {
         }
         writer.commit().unwrap();
         let searcher = idx.reader().unwrap().searcher();
-        let q = translate_query(&idx, &s, query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let q = translate_query(&idx, &s, query, &paths_of(&idx, &s))
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
         searcher.search(&q, &Count).unwrap()
     }
 
     #[test]
     fn query_string_honors_fields_and_default_field() {
-        // Bare terms search the mapped text fields; unmapped values are
-        // reachable by path (`name:lovelace`) or via `fields` — Tantivy's
-        // parser can't fan a bare term across every JSON path.
-        assert_eq!(hits(&serde_json::json!({"query_string": {"query": "lovelace"}})), 1);
+        // Bare terms search mapped text fields AND every string-valued
+        // dynamic path (issue #42): "lovelace" is in doc 1's message and
+        // doc 2's unmapped name.
+        assert_eq!(hits(&serde_json::json!({"query_string": {"query": "lovelace"}})), 2);
         assert_eq!(hits(&serde_json::json!({"query_string": {"query": "name:lovelace"}})), 1);
         // Only the mapped text field.
         assert_eq!(
@@ -874,8 +903,78 @@ mod tests {
         let s = schema();
         let idx = index(&s);
         assert!(
-            translate_query(&idx, &s, &serde_json::json!({"query_string": {"query": "x", "fields": ["status"]}}))
-                .is_err()
+            translate_query(
+                &idx,
+                &s,
+                &serde_json::json!({"query_string": {"query": "x", "fields": ["status"]}}),
+                &paths_of(&idx, &s),
+            )
+            .is_err()
+        );
+    }
+
+    /// Issue #42: an index whose mapping declares no text fields (the
+    /// default for indices that documents are simply posted into) must
+    /// still match bare `query_string` terms — everything lives in
+    /// `_dynamic`, and each string-valued path gets fanned out.
+    #[test]
+    fn bare_query_string_searches_dynamic_paths() {
+        use rsearch_index::DocumentConverter;
+        use tantivy::collector::Count;
+        let s = MappedSchema::build(rsearch_index::IndexMapping::default());
+        let idx = index(&s);
+        let converter = DocumentConverter::new(s.clone());
+        let mut writer = idx.writer_with_num_threads(1, 20 << 20).unwrap();
+        for doc in [
+            serde_json::json!({"message": "23 jobs scheduled", "ctx": {"queue": "default"}}),
+            serde_json::json!({"message": "idle worker", "log.level": "error", "code": 500}),
+        ] {
+            let (doc, _) = converter
+                .convert(doc, tantivy::DateTime::from_timestamp_millis(0))
+                .unwrap();
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = idx.reader().unwrap().searcher();
+        let count = |query: &serde_json::Value| {
+            let q = translate_query(&idx, &s, query, &paths_of(&idx, &s))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            searcher.search(&q, &Count).unwrap()
+        };
+        // Bare term, top-level path.
+        assert_eq!(count(&serde_json::json!({"query_string": {"query": "jobs"}})), 1);
+        // Nested path and a dotted literal key both participate.
+        assert_eq!(count(&serde_json::json!({"query_string": {"query": "queue"}})), 0);
+        assert_eq!(count(&serde_json::json!({"query_string": {"query": "default"}})), 1);
+        assert_eq!(count(&serde_json::json!({"query_string": {"query": "error"}})), 1);
+        // `fields: ["*"]` is the same path (Grafana sends this shape).
+        assert_eq!(
+            count(&serde_json::json!({"query_string": {"query": "jobs", "fields": ["*"]}})),
+            1
+        );
+        // OR across docs; AND narrows within a path.
+        assert_eq!(
+            count(&serde_json::json!({"query_string": {"query": "jobs idle"}})),
+            2
+        );
+        assert_eq!(
+            count(&serde_json::json!({"query_string": {
+                "query": "jobs scheduled", "default_operator": "and"}})),
+            1
+        );
+        // Known divergence from ES: each path is its own parse, so AND
+        // does not span different unmapped fields ("idle" in message,
+        // "error" in log.level — ES would match doc 2). Same pre-existing
+        // limitation as an explicit multi-path `fields` list.
+        assert_eq!(
+            count(&serde_json::json!({"query_string": {
+                "query": "idle error", "default_operator": "and"}})),
+            0
+        );
+        // simple_query_string rides the same engine.
+        assert_eq!(
+            count(&serde_json::json!({"simple_query_string": {"query": "jobs"}})),
+            1
         );
     }
 
@@ -887,6 +986,7 @@ mod tests {
             &idx,
             &s,
             &serde_json::json!({"fuzzy": {"message": "opps"}}),
+            &paths_of(&idx, &s),
         )
         .unwrap_err();
         assert!(matches!(err, SearchError::BadRequest(_)));
