@@ -338,13 +338,9 @@ async fn tombstones_upsert_and_page_by_seq() {
         ms.tombstones_since(stream.id, 0, 10).await.unwrap().is_empty(),
         "cascade"
     );
-}
 
-#[tokio::test]
-#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
-async fn tombstone_purge_respects_split_floor_and_grace() {
-    use rsearch_metastore::NewTombstone;
-    let Some(ms) = metastore().await else { return };
+    // ---- purge (same test: purge is global, so it must not run
+    // concurrently with the assertions above).
     let stream = ms.ensure_stream(&unique("purge")).await.unwrap();
     let t = |doc: &str, before: i64| NewTombstone {
         stream_id: stream.id,
@@ -374,15 +370,23 @@ async fn tombstone_purge_respects_split_floor_and_grace() {
     ms.stage_split(&split(stream.id, &s1, seq_a)).await.unwrap();
     ms.publish_split(&s1).await.unwrap();
 
+    let remaining = |ms: &Metastore, id: i64| async move {
+        ms.tombstones_since(id, 0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.seq)
+            .collect::<Vec<_>>()
+    };
     // Grace not elapsed: nothing purged even though a is applied.
-    assert_eq!(ms.purge_tombstones(3600.0, 100).await.unwrap(), 0);
+    ms.purge_tombstones(3600.0, 1_000).await.unwrap();
+    assert_eq!(remaining(&ms, stream.id).await, vec![seq_a, seq_b]);
     // Grace 0: only a (seq <= floor); b is above the floor.
-    assert_eq!(ms.purge_tombstones(0.0, 100).await.unwrap(), 1);
-    let left = ms.tombstones_since(stream.id, 0, 10).await.unwrap();
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].seq, seq_b);
+    ms.purge_tombstones(0.0, 1_000).await.unwrap();
+    assert_eq!(remaining(&ms, stream.id).await, vec![seq_b]);
     // Raising the floor releases b.
     ms.mark_tombstones_applied(&s1, seq_b).await.unwrap();
-    assert_eq!(ms.purge_tombstones(0.0, 100).await.unwrap(), 1);
+    ms.purge_tombstones(0.0, 1_000).await.unwrap();
+    assert!(remaining(&ms, stream.id).await.is_empty());
     ms.delete_stream(&stream.name).await.unwrap();
 }
