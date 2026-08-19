@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use rsearch_search::{SearchError, SearchRequest};
 
-use crate::bulk_api::{error_response, execute_bulk};
+use crate::bulk_api::{error_response, execute_bulk, parse_refresh};
 use crate::state::AppState;
 
 /// Query parameters the document routes understand.
@@ -20,9 +20,14 @@ use crate::state::AppState;
 pub struct DocParams {
     /// `create` makes PUT/POST `_doc/{id}` behave like `_create/{id}`.
     op_type: Option<String>,
-    /// `true` | `wait_for` | `false` (see phase 14.5).
-    #[allow(dead_code)]
+    /// `true` | `wait_for` — respond only once the write is searchable.
     refresh: Option<String>,
+}
+
+impl DocParams {
+    fn refresh(&self) -> bool {
+        parse_refresh(self.refresh.as_deref())
+    }
 }
 
 /// Render the ES action line + body for a one-item bulk request.
@@ -42,8 +47,8 @@ fn one_item_body(action: &str, index: &str, id: Option<&str>, doc: Option<&Value
 
 /// Run a one-item bulk and unwrap the item into the ES single-document
 /// response shape (the item body, with its `status` as the HTTP status).
-async fn run_one(state: AppState, body: String) -> Response {
-    let result = match execute_bulk(state, None, body).await {
+async fn run_one(state: AppState, body: String, refresh: bool) -> Response {
+    let result = match execute_bulk(state, None, body, refresh).await {
         Ok(result) => result,
         Err(response) => return response,
     };
@@ -100,33 +105,35 @@ pub async fn put_doc(
             );
         }
     };
-    run_one(state, one_item_body(action, &index, Some(&id), Some(&doc))).await
+    run_one(state, one_item_body(action, &index, Some(&id), Some(&doc)), params.refresh()).await
 }
 
 /// POST /{index}/_doc — index a document under a generated id.
 pub async fn post_doc(
     State(state): State<AppState>,
     Path(index): Path<String>,
+    Query(params): Query<DocParams>,
     body: String,
 ) -> Response {
     let doc = match parse_doc(&body) {
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    run_one(state, one_item_body("index", &index, None, Some(&doc))).await
+    run_one(state, one_item_body("index", &index, None, Some(&doc)), params.refresh()).await
 }
 
 /// PUT/POST /{index}/_create/{id} — create-only write.
 pub async fn create_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
+    Query(params): Query<DocParams>,
     body: String,
 ) -> Response {
     let doc = match parse_doc(&body) {
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    run_one(state, one_item_body("create", &index, Some(&id), Some(&doc))).await
+    run_one(state, one_item_body("create", &index, Some(&id), Some(&doc)), params.refresh()).await
 }
 
 /// POST /{index}/_update/{id} — partial update (`doc`, `doc_as_upsert`,
@@ -134,21 +141,25 @@ pub async fn create_doc(
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
+    Query(params): Query<DocParams>,
     body: String,
 ) -> Response {
     let body = match parse_doc(&body) {
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    run_one(state, one_item_body("update", &index, Some(&id), Some(&body))).await
+    run_one(state, one_item_body("update", &index, Some(&id), Some(&body)), params.refresh()).await
 }
 
 /// DELETE /{index}/_doc/{id}
 pub async fn delete_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
+    Query(params): Query<DocParams>,
 ) -> Response {
-    run_one(state, one_item_body("delete", &index, Some(&id), None)).await
+    // A delete is a tombstone: visible on this node at once, so there is
+    // no buffer to cut — but honoring the flag keeps clients uniform.
+    run_one(state, one_item_body("delete", &index, Some(&id), None), params.refresh()).await
 }
 
 fn lookup_error(e: SearchError, index: &str) -> Response {
@@ -297,7 +308,7 @@ pub async fn delete_by_query(
         for id in &ids {
             bulk.push_str(&one_item_body("delete", &index, Some(id), None));
         }
-        let result = match execute_bulk(state.clone(), None, bulk).await {
+        let result = match execute_bulk(state.clone(), None, bulk, false).await {
             Ok(result) => result,
             Err(response) => return response,
         };

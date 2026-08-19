@@ -83,6 +83,13 @@ pub struct PipelineConfig {
     pub node_id: String,
 }
 
+/// What a stream worker receives: documents to index, or a request to cut
+/// the current batch now (`?refresh=wait_for`) and say when it's published.
+enum WorkerMsg {
+    Doc(WorkItem),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 struct WorkItem {
     /// Original document bytes. The queue holds only these (not a parsed
     /// Value, which is several times larger in memory) — the indexer
@@ -119,7 +126,7 @@ struct PipelineInner {
     /// Stream → worker sender. Read-locked (sync, never across an await)
     /// on the per-document hot path; the write lock is only ever taken to
     /// insert a newly created worker.
-    workers: std::sync::RwLock<HashMap<String, mpsc::Sender<WorkItem>>>,
+    workers: std::sync::RwLock<HashMap<String, mpsc::Sender<WorkerMsg>>>,
     /// Single-flights first-time worker creation so the metastore resolve
     /// never runs under `workers` — enqueues to existing streams are not
     /// blocked while a new stream's row is being created.
@@ -349,11 +356,11 @@ impl IngestPipeline {
     ) -> IngestResult<()> {
         let tx = self.worker_for(stream).await?;
         let size = source.len() as u64;
-        match tx.try_send(WorkItem {
+        match tx.try_send(WorkerMsg::Doc(WorkItem {
             source,
             identity,
             pos,
-        }) {
+        })) {
             Ok(()) => {
                 self.note_enqueued(size);
                 Ok(())
@@ -410,11 +417,11 @@ impl IngestPipeline {
             let tx = self.worker_for(&record.stream).await?;
             self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
             if tx
-                .send(WorkItem {
+                .send(WorkerMsg::Doc(WorkItem {
                     source,
                     identity: DocIdentity::new(record.id, record.seq),
                     pos: record.pos,
-                })
+                }))
                 .await
                 .is_err()
             {
@@ -432,7 +439,29 @@ impl IngestPipeline {
         Ok(count)
     }
 
-    async fn worker_for(&self, stream: &str) -> IngestResult<mpsc::Sender<WorkItem>> {
+    /// Cut the stream's current batch into a split now and resolve once it
+    /// is published (or immediately when nothing is buffered on this
+    /// node). Backs `?refresh=true|wait_for`. Only this node's buffer is
+    /// flushed — with bulk handoff the flag travels to the node that
+    /// indexed the batch, which is the one whose buffer matters.
+    pub async fn flush_stream(&self, stream: &str) -> IngestResult<()> {
+        let tx = match self.inner.workers.read().unwrap().get(stream) {
+            Some(tx) => tx.clone(),
+            // No worker: nothing buffered here.
+            None => return Ok(()),
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if tx.send(WorkerMsg::Flush(done_tx)).await.is_err() {
+            // Worker retired between the lookup and the send; its buffer
+            // was flushed on the way out.
+            return Ok(());
+        }
+        // A dropped sender means the worker exited after flushing.
+        let _ = done_rx.await;
+        Ok(())
+    }
+
+    async fn worker_for(&self, stream: &str) -> IngestResult<mpsc::Sender<WorkerMsg>> {
         if let Some(tx) = self.inner.workers.read().unwrap().get(stream) {
             return Ok(tx.clone());
         }
@@ -476,7 +505,7 @@ async fn stream_worker(
     stream_id: i64,
     document_mode: bool,
     schema: MappedSchema,
-    mut rx: mpsc::Receiver<WorkItem>,
+    mut rx: mpsc::Receiver<WorkerMsg>,
 ) {
     let max_docs = inner.config.max_batch_docs.max(1);
     let age_secs = if document_mode {
@@ -487,6 +516,8 @@ async fn stream_worker(
     let max_age = Duration::from_secs(age_secs.max(1));
     let idle_exit = Duration::from_secs(WORKER_IDLE_EXIT_SECS);
     let mut buffer: Vec<WorkItem> = Vec::new();
+    // Refresh waiters, answered after the next flush completes.
+    let mut waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle_exit;
     // Re-resolved before each flush so a mapping change (PUT /{index})
     // takes effect on the next split, not only after a restart (L7).
@@ -495,13 +526,23 @@ async fn stream_worker(
 
     loop {
         let flush_now = tokio::select! {
-            item = rx.recv() => match item {
-                Some(item) => {
+            msg = rx.recv() => match msg {
+                Some(WorkerMsg::Doc(item)) => {
                     if buffer.is_empty() {
                         deadline = tokio::time::Instant::now() + max_age;
                     }
                     buffer.push(item);
                     buffer.len() >= max_docs
+                }
+                Some(WorkerMsg::Flush(done)) => {
+                    if buffer.is_empty() {
+                        // Nothing to cut: the waiter is satisfied now.
+                        let _ = done.send(());
+                        false
+                    } else {
+                        waiters.push(done);
+                        true
+                    }
                 }
                 None => {
                     // Channel closed: final flush then exit.
@@ -521,11 +562,17 @@ async fn stream_worker(
                     // re-creates a fresh worker via worker_for.
                     inner.workers.write().unwrap().remove(&stream);
                     rx.close();
-                    while let Ok(item) = rx.try_recv() {
-                        buffer.push(item);
+                    while let Ok(msg) = rx.try_recv() {
+                        match msg {
+                            WorkerMsg::Doc(item) => buffer.push(item),
+                            WorkerMsg::Flush(done) => waiters.push(done),
+                        }
                     }
                     if !buffer.is_empty() {
                         flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+                    }
+                    for done in waiters.drain(..) {
+                        let _ = done.send(());
                     }
                     info!(stream, "idle stream worker retired");
                     return;
@@ -543,6 +590,9 @@ async fn stream_worker(
                 mapping_json = record.mapping;
             }
             flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+            for done in waiters.drain(..) {
+                let _ = done.send(());
+            }
             deadline = tokio::time::Instant::now() + idle_exit;
         }
     }

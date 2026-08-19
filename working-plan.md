@@ -379,7 +379,7 @@ tombstones in the metastore since splits are immutable shared objects):
       only (log streams 400 with a clear reason); `classify()` arms:
       `_doc`/`_create`/`_update`/`_delete_by_query` writes →
       `Ingest(index)`, reads → `Search(index)`.
-- [ ] 14.5 `?refresh=true|wait_for` on `_bulk` and the document routes
+- [x] 14.5 `?refresh=true|wait_for` on `_bulk` and the document routes
       (document-mode streams): pipeline `flush_stream(stream)` cuts the
       stream's current batch and resolves once it is published; bulk
       handoff forwards the flag. Document the default window

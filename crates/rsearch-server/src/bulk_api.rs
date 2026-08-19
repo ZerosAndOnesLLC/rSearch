@@ -19,22 +19,46 @@ use tracing::warn;
 
 use crate::state::AppState;
 
-pub async fn bulk_root(State(state): State<AppState>, body: String) -> Response {
-    handle_bulk(state, None, body).await
+/// `?refresh=` on `_bulk` and the document routes: `true` / `wait_for`
+/// (treated alike — both wait until the written documents are searchable)
+/// or `false` / absent. Only document-mode streams honor it; log streams
+/// ignore it so a shipper that sets it can't force a split per request.
+pub fn parse_refresh(value: Option<&str>) -> bool {
+    matches!(value, Some("true") | Some("wait_for") | Some(""))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct BulkQuery {
+    refresh: Option<String>,
+}
+
+pub async fn bulk_root(
+    State(state): State<AppState>,
+    Query(query): Query<BulkQuery>,
+    body: String,
+) -> Response {
+    handle_bulk(state, None, body, parse_refresh(query.refresh.as_deref())).await
 }
 
 pub async fn bulk_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
+    Query(query): Query<BulkQuery>,
     body: String,
 ) -> Response {
-    handle_bulk(state, Some(index), body).await
+    handle_bulk(state, Some(index), body, parse_refresh(query.refresh.as_deref())).await
 }
 
 #[derive(serde::Deserialize)]
 pub struct InternalBulkQuery {
     index: Option<String>,
+    refresh: Option<String>,
 }
+
+/// How long a refresh waits for the cut split to publish before the
+/// response goes out anyway (the documents are WAL-durable and will
+/// appear; a storage/metastore outage must not hang the client forever).
+const REFRESH_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Receive a batch handed off by a peer (#19). Authenticated by the
 /// cluster token like the internal object API; always indexes locally —
@@ -64,14 +88,20 @@ pub async fn bulk_internal(
         );
     }
     forwarder.received.fetch_add(1, Ordering::Relaxed);
-    match handle_bulk_local(state, query.index, body).await {
+    let refresh = parse_refresh(query.refresh.as_deref());
+    match handle_bulk_local(state, query.index, body, refresh).await {
         Ok(result) => Json(result).into_response(),
         Err(response) => response,
     }
 }
 
-async fn handle_bulk(state: AppState, default_index: Option<String>, body: String) -> Response {
-    match execute_bulk(state, default_index, body).await {
+async fn handle_bulk(
+    state: AppState,
+    default_index: Option<String>,
+    body: String,
+    refresh: bool,
+) -> Response {
+    match execute_bulk(state, default_index, body, refresh).await {
         Ok(result) => Json(result).into_response(),
         Err(response) => response,
     }
@@ -85,6 +115,7 @@ pub async fn execute_bulk(
     state: AppState,
     default_index: Option<String>,
     body: String,
+    refresh: bool,
 ) -> Result<Value, Response> {
     if state.draining.load(Ordering::Relaxed) {
         // Draining: refuse new writes so the WAL empties out before
@@ -109,7 +140,7 @@ pub async fn execute_bulk(
         && let Some((peer_id, peer_addr)) = forwarder.pick_target().await
     {
         match forwarder
-            .forward(&peer_addr, default_index.as_deref(), body.clone().into())
+            .forward(&peer_addr, default_index.as_deref(), refresh, body.clone().into())
             .await
         {
             // Relay only a peer 2xx (its per-item results). Anything else
@@ -138,7 +169,7 @@ pub async fn execute_bulk(
             }
         }
     }
-    handle_bulk_local(state, default_index, body).await
+    handle_bulk_local(state, default_index, body, refresh).await
 }
 
 /// Reason given when `delete`/`update` hit a log-mode stream.
@@ -276,6 +307,7 @@ async fn handle_bulk_local(
     state: AppState,
     default_index: Option<String>,
     body: String,
+    refresh: bool,
 ) -> Result<Value, Response> {
     let started = Instant::now();
     let Some(pipeline) = state.pipeline.clone() else {
@@ -615,6 +647,8 @@ async fn handle_bulk_local(
     // Enqueue each routed copy; an item succeeds if at least one route
     // was accepted. Saturated routes get confirmed so the WAL drains.
     let mut position_iter = positions.into_iter();
+    // Document-mode streams that received a write, for ?refresh.
+    let mut to_refresh: Vec<String> = Vec::new();
     for plan in writes {
         let action = plan.wire_action;
         let stream_name = &plan.item.stream;
@@ -634,7 +668,15 @@ async fn handle_bulk_local(
                 .enqueue(stream, plan.item.raw.clone(), identity, pos)
                 .await
             {
-                Ok(()) => accepted += 1,
+                Ok(()) => {
+                    accepted += 1;
+                    if refresh
+                        && infos.get(stream).is_some_and(|i| i.mode == StreamMode::Document)
+                        && !to_refresh.contains(stream)
+                    {
+                        to_refresh.push(stream.clone());
+                    }
+                }
                 Err(IngestError::Saturated) => {
                     pipeline.wal().confirm(&[pos]);
                     saturated = true;
@@ -672,6 +714,26 @@ async fn handle_bulk_local(
         });
     }
     results.sort_by_key(|r| r.position);
+
+    // ?refresh: cut the written streams' batches now and wait (bounded)
+    // until they are published, so a search right after this response
+    // sees the documents.
+    if !to_refresh.is_empty() {
+        let wait = async {
+            for stream in &to_refresh {
+                if let Err(e) = pipeline.flush_stream(stream).await {
+                    warn!(stream, error = %e, "refresh flush failed");
+                }
+            }
+        };
+        if tokio::time::timeout(REFRESH_WAIT_LIMIT, wait).await.is_err() {
+            warn!(
+                streams = ?to_refresh,
+                "refresh wait exceeded {}s; responding without it",
+                REFRESH_WAIT_LIMIT.as_secs()
+            );
+        }
+    }
 
     let errors = results.iter().any(|r| {
         r.body
