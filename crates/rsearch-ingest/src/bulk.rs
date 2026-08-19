@@ -116,12 +116,14 @@ pub fn parse_bulk_body(
             .or(default_index)
             .unwrap_or("")
             .to_string();
-        let explicit_id = meta.get("_id").and_then(|v| v.as_str()).is_some();
-        let doc_id = meta
-            .get("_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        // ES coerces numeric ids to strings ({"_id": 42} == {"_id": "42"}).
+        let explicit = match meta.get("_id") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        };
+        let explicit_id = explicit.is_some();
+        let doc_id = explicit.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
         let Some(action) = BulkAction::parse(action_name) else {
             return Err(format!(
@@ -247,6 +249,20 @@ mod tests {
         assert_eq!(update.doc["doc"]["x"], 1);
         assert_eq!(out.items[2].1.action, BulkAction::Index);
         assert!(!out.items[2].1.explicit_id);
+    }
+
+    #[test]
+    fn numeric_ids_are_coerced_to_strings() {
+        let body = concat!(
+            "{\"index\":{\"_index\":\"recs\",\"_id\":42}}\n",
+            "{\"v\":1}\n",
+            "{\"delete\":{\"_index\":\"recs\",\"_id\":7}}\n",
+        );
+        let out = parse_bulk_body(body, None).unwrap();
+        assert!(out.rejections.is_empty());
+        assert_eq!(out.items[0].1.doc_id, "42");
+        assert!(out.items[0].1.explicit_id);
+        assert_eq!(out.items[1].1.doc_id, "7");
     }
 
     #[test]

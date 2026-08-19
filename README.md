@@ -253,10 +253,24 @@ On a document-mode index:
   rewrites the split without the hidden versions: merges always do, and
   a dedicated job rewrites document-mode splits once an index has
   `control.compact_min_tombstones` (default 1000) or its oldest tombstone
-  is past `control.compact_max_age_secs` (default 1h) — that setting is
-  the bound on how long a deleted document survives in storage, so lower
-  it if an erasure SLA requires. Tombstone rows are purged once no split
-  can still hold a version they hide.
+  is past `control.compact_max_age_secs` (default 1h). A deleted document
+  is therefore physically gone after that age plus the sweep
+  (`control.compact_splits_per_tick`, default 8 per control tick, so a
+  stream with many splits takes several ticks) plus `control.gc_grace_secs`
+  for the old split object — lower those if an erasure SLA requires.
+  Tombstone rows are purged once every split of the stream has applied
+  them and they are older than `control.tombstone_purge_grace_secs`
+  (default 1h); that grace also covers documents still buffered on an
+  ingest node, so **drain an ingest node's WAL before taking it down for
+  longer than `compact_max_age_secs + tombstone_purge_grace_secs`** (a
+  replayed document whose tombstone was purged would reappear).
+- Ordering across nodes: each write gets a sequence from a hybrid logical
+  clock — wall-clock micros pushed past every sequence the node has
+  observed for the ids it writes (their existing tombstone bounds and the
+  stream's highest published sequence) — so a replacement taken by a node
+  whose clock lags still orders after the version it replaces. Keep node
+  clocks NTP-synced anyway; skew only shows up as slightly non-monotonic
+  `_version` values.
 - Log indices are untouched: they reject `delete`/`update` per item with
   a reason that points at the setting, ignore `?refresh`, and carry no
   query-time filtering.

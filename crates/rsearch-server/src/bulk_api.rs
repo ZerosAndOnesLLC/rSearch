@@ -181,38 +181,51 @@ fn log_mode_reason(action: &str, stream: &str) -> String {
     )
 }
 
-/// Look up the current live version of a document for a read-modify-write
-/// action. `Err` carries a closure producing the per-item error body.
-async fn lookup_current(
+/// Per-item error for a failed lookup (closure over action/index/id).
+type LookupErr = Box<dyn Fn(&str, &str, &str) -> Value + Send + Sync>;
+
+/// Current live versions for all (stream, id) pairs that read-modify-write
+/// actions in this batch need, in one `ids` search per stream. Ids not
+/// found are simply absent. A stream-level failure is returned per
+/// stream so each of its items can answer with the same error.
+async fn lookup_batch(
     state: &AppState,
-    stream: &str,
-    id: &str,
-) -> Result<Option<rsearch_search::FoundDocument>, Box<dyn Fn(&str, &str, &str) -> Value + Send>> {
-    let Some(lookup) = &state.doc_lookup else {
-        return Err(Box::new(|action, index, id| {
-            item_err(
-                action,
-                index,
-                Some(id),
-                400,
-                "illegal_argument_exception",
-                "document lookups need a node running the ingest or search role",
-            )
-        }));
-    };
-    match lookup.get_document(stream, id).await {
-        Ok(found) => Ok(found),
-        // A stream that exists but has no splits yet has nothing to find.
-        Err(rsearch_search::SearchError::Metastore(
-            rsearch_metastore::MetastoreError::StreamNotFound(_),
-        )) => Ok(None),
-        Err(e) => {
-            let reason = e.to_string();
-            Err(Box::new(move |action, index, id| {
-                item_err(action, index, Some(id), 503, "unavailable_shards_exception", &reason)
-            }))
-        }
+    wanted: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Result<HashMap<String, rsearch_search::FoundDocument>, LookupErr>> {
+    let mut out = HashMap::new();
+    for (stream, ids) in wanted {
+        let Some(lookup) = &state.doc_lookup else {
+            out.insert(
+                stream.clone(),
+                Err(Box::new(|action: &str, index: &str, id: &str| {
+                    item_err(
+                        action,
+                        index,
+                        Some(id),
+                        400,
+                        "illegal_argument_exception",
+                        "document lookups need a node running the ingest or search role",
+                    )
+                }) as LookupErr),
+            );
+            continue;
+        };
+        let result = match lookup.get_documents(stream, ids).await {
+            Ok(found) => Ok(found),
+            // A stream that exists but has no splits yet has nothing to find.
+            Err(rsearch_search::SearchError::Metastore(
+                rsearch_metastore::MetastoreError::StreamNotFound(_),
+            )) => Ok(HashMap::new()),
+            Err(e) => {
+                let reason = e.to_string();
+                Err(Box::new(move |action: &str, index: &str, id: &str| {
+                    item_err(action, index, Some(id), 503, "unavailable_shards_exception", &reason)
+                }) as LookupErr)
+            }
+        };
+        out.insert(stream.clone(), result);
     }
+    out
 }
 
 /// Apply an ES `_update` body to the current document. Returns the new
@@ -269,6 +282,24 @@ fn merge_json(target: &mut Value, patch: &Value) {
             }
         }
         (target, patch) => *target = patch.clone(),
+    }
+}
+
+/// A search immediately after a local tombstone write must see it: drop
+/// the freshness of the affected streams' tombstone caches on this node —
+/// both the public search service and the write path's lookup service
+/// (the same instance when a node runs both roles).
+fn invalidate_tombstone_caches(state: &AppState, tombstones: &[NewTombstone]) {
+    let mut seen = std::collections::HashSet::new();
+    for t in tombstones {
+        if seen.insert(t.stream_id) {
+            if let Some(search) = &state.search {
+                search.invalidate_tombstones(t.stream_id);
+            }
+            if let Some(lookup) = &state.doc_lookup {
+                lookup.invalidate_tombstones(t.stream_id);
+            }
+        }
     }
 }
 
@@ -335,38 +366,118 @@ async fn handle_bulk_local(
         })
         .collect();
 
-    // Resolve every named stream's id + mode up front (creating missing
-    // streams, as _bulk always has): the mode decides what each action
-    // means.
+    // Resolve every named stream's id + mode up front: the mode decides
+    // what each action means. Writes create missing streams (as _bulk
+    // always has); delete/update against a stream that doesn't exist is a
+    // 404 like ES, not an implicit creation.
     let mut infos: HashMap<String, StreamInfo> = HashMap::new();
     async fn resolve_info(
         pipeline: &rsearch_ingest::IngestPipeline,
         infos: &mut HashMap<String, StreamInfo>,
         stream: &str,
-    ) -> Result<StreamInfo, Response> {
+        create: bool,
+    ) -> Result<Option<StreamInfo>, Response> {
         if let Some(info) = infos.get(stream) {
-            return Ok(*info);
+            return Ok(Some(*info));
         }
-        match pipeline.stream_info(stream).await {
-            Ok(info) => {
+        let resolved = if create {
+            pipeline.stream_info(stream).await.map(Some)
+        } else {
+            pipeline.stream_info_if_exists(stream).await
+        };
+        match resolved {
+            Ok(Some(info)) => {
                 infos.insert(stream.to_string(), info);
-                Ok(info)
+                Ok(Some(info))
             }
+            Ok(None) => Ok(None),
             Err(e) => Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!("metastore unavailable: {e}"),
             )),
         }
     }
-    for (_, item) in &items {
-        resolve_info(&pipeline, &mut infos, &item.stream).await?;
+    let mut kept: Vec<(usize, rsearch_ingest::BulkItem)> = Vec::with_capacity(items.len());
+    for (position, item) in items {
+        let create = matches!(item.action, BulkAction::Index | BulkAction::Create);
+        match resolve_info(&pipeline, &mut infos, &item.stream, create).await? {
+            Some(_) => kept.push((position, item)),
+            None => results.push(ItemResult {
+                position,
+                body: item_err(
+                    item.action.as_str(),
+                    &item.stream,
+                    Some(&item.doc_id),
+                    404,
+                    "index_not_found_exception",
+                    &format!("no such index [{}]", item.stream),
+                ),
+            }),
+        }
+    }
+    let items = kept;
+
+    // Hybrid-clock causality: every write to an explicit id on a
+    // document-mode stream must stamp a sequence above the bound any
+    // earlier write (on any node) recorded for that id — otherwise a node
+    // whose wall clock lags would produce a "newer" version that the
+    // existing tombstone hides. One indexed lookup per batch.
+    let doc_mode = |infos: &HashMap<String, StreamInfo>, stream: &str| {
+        infos
+            .get(stream)
+            .is_some_and(|i| i.mode == StreamMode::Document)
+    };
+    let id_pairs: Vec<(i64, String)> = items
+        .iter()
+        .filter(|(_, item)| item.explicit_id && doc_mode(&infos, &item.stream))
+        .filter_map(|(_, item)| infos.get(&item.stream).map(|i| (i.id, item.doc_id.clone())))
+        .collect();
+    if !id_pairs.is_empty() {
+        match state.metastore.tombstone_bounds(&id_pairs).await {
+            Ok(bounds) => {
+                if let Some(max) = bounds.iter().map(|(_, _, b)| *b).max() {
+                    pipeline.observe_seq(max);
+                }
+            }
+            Err(e) => {
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("metastore unavailable: {e}"),
+                ));
+            }
+        }
     }
 
     // Read-modify-write actions on document-mode streams (update, create)
-    // look the current version up first and become plain index writes —
-    // or per-item errors. Lookups see published splits only (a write still
-    // in an ingest buffer is invisible until its split is cut; use
-    // ?refresh=wait_for on the prior write when that matters).
+    // look the current version up first — batched per stream — and become
+    // plain index writes, or per-item errors. Lookups see published
+    // splits only (a write still in an ingest buffer is invisible until
+    // its split is cut; use ?refresh=wait_for on the prior write when that
+    // matters).
+    let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
+    for (_, item) in &items {
+        let needs = match item.action {
+            BulkAction::Update => doc_mode(&infos, &item.stream),
+            BulkAction::Create => doc_mode(&infos, &item.stream) && item.explicit_id,
+            _ => false,
+        };
+        if needs {
+            wanted
+                .entry(item.stream.clone())
+                .or_default()
+                .push(item.doc_id.clone());
+        }
+    }
+    let looked_up = lookup_batch(&state, &wanted).await;
+    let current_of = |stream: &str,
+                      id: &str|
+     -> Result<Option<rsearch_search::FoundDocument>, &LookupErr> {
+        match looked_up.get(stream) {
+            Some(Ok(found)) => Ok(found.get(id).cloned()),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    };
     struct Planned {
         position: usize,
         item: rsearch_ingest::BulkItem,
@@ -381,9 +492,7 @@ async fn handle_bulk_local(
     let mut planned: Vec<Planned> = Vec::with_capacity(items.len());
     for (position, mut item) in items {
         let action = item.action.as_str();
-        let document_mode = infos
-            .get(&item.stream)
-            .is_some_and(|i| i.mode == StreamMode::Document);
+        let document_mode = doc_mode(&infos, &item.stream);
         let mut outcome = ("created", 201);
         match item.action {
             BulkAction::Index if document_mode && item.explicit_id => {
@@ -395,7 +504,7 @@ async fn handle_bulk_local(
             }
             BulkAction::Index => {}
             BulkAction::Create if document_mode && item.explicit_id => {
-                match lookup_current(&state, &item.stream, &item.doc_id).await {
+                match current_of(&item.stream, &item.doc_id) {
                     Ok(Some(current)) => {
                         results.push(ItemResult {
                             position,
@@ -439,7 +548,7 @@ async fn handle_bulk_local(
                     });
                     continue;
                 }
-                let current = match lookup_current(&state, &item.stream, &item.doc_id).await {
+                let current = match current_of(&item.stream, &item.doc_id) {
                     Ok(current) => current,
                     Err(body) => {
                         results.push(ItemResult {
@@ -516,35 +625,23 @@ async fn handle_bulk_local(
     // request; resolve those too.
     for plan in &planned {
         for stream in &plan.routes {
-            resolve_info(&pipeline, &mut infos, stream).await?;
+            resolve_info(&pipeline, &mut infos, stream, true).await?;
         }
     }
 
-    // Tombstones are written before anything is WAL-appended: a crash
-    // between the two can lose an unacked write (the client retries), but
-    // never leaves a replayed document without the tombstone that hides
-    // its predecessors.
+    // Delete tombstones are written now, before the response says
+    // "deleted". Replacement tombstones (explicit-id index/create on a
+    // document-mode stream) are written only *after* the new version is
+    // WAL-durable and accepted — a rejected write (429/500) must leave the
+    // old version visible, not hide it. The WAL record carries the
+    // tombstone flag so a crash between the append and the upsert is
+    // repaired on replay.
     let mut tombstones: Vec<NewTombstone> = Vec::new();
     let mut writes: Vec<&Planned> = Vec::new();
     for plan in &planned {
         let action = plan.wire_action;
         match plan.item.action {
-            BulkAction::Index | BulkAction::Create => {
-                if plan.item.explicit_id {
-                    for stream in &plan.routes {
-                        if let Some(info) = infos.get(stream)
-                            && info.mode == StreamMode::Document
-                        {
-                            tombstones.push(NewTombstone {
-                                stream_id: info.id,
-                                doc_id: plan.item.doc_id.clone(),
-                                before_seq: plan.seq,
-                            });
-                        }
-                    }
-                }
-                writes.push(plan);
-            }
+            BulkAction::Index | BulkAction::Create => writes.push(plan),
             BulkAction::Delete => match infos.get(&plan.item.stream) {
                 Some(info) if info.mode == StreamMode::Document => {
                     tombstones.push(NewTombstone {
@@ -597,16 +694,16 @@ async fn handle_bulk_local(
                 &format!("metastore unavailable (tombstones): {e}"),
             ));
         }
-        // A search immediately after this write on this node must see it.
-        if let Some(search) = &state.search {
-            let mut seen = std::collections::HashSet::new();
-            for t in &tombstones {
-                if seen.insert(t.stream_id) {
-                    search.invalidate_tombstones(t.stream_id);
-                }
-            }
-        }
+        invalidate_tombstone_caches(&state, &tombstones);
     }
+    // Whether a routed copy of an explicit-id write replaces older
+    // versions (document-mode target) and so carries a tombstone.
+    let replaces = |plan: &Planned, stream: &str| {
+        plan.item.explicit_id
+            && infos
+                .get(stream)
+                .is_some_and(|i| i.mode == StreamMode::Document)
+    };
 
     // The durability point: append every routed copy to the WAL with a
     // single fsync.
@@ -620,6 +717,7 @@ async fn handle_bulk_local(
                 stream: stream.clone(),
                 id: plan.item.doc_id.clone(),
                 seq: plan.seq,
+                tombstone: replaces(plan, stream),
                 doc: plan.item.raw.clone(),
             })
         })
@@ -649,6 +747,8 @@ async fn handle_bulk_local(
     let mut position_iter = positions.into_iter();
     // Document-mode streams that received a write, for ?refresh.
     let mut to_refresh: Vec<String> = Vec::new();
+    // Replacement tombstones for accepted copies, written below.
+    let mut replacement_tombstones: Vec<NewTombstone> = Vec::new();
     for plan in writes {
         let action = plan.wire_action;
         let stream_name = &plan.item.stream;
@@ -670,11 +770,19 @@ async fn handle_bulk_local(
             {
                 Ok(()) => {
                     accepted += 1;
-                    if refresh
-                        && infos.get(stream).is_some_and(|i| i.mode == StreamMode::Document)
-                        && !to_refresh.contains(stream)
+                    if let Some(info) = infos.get(stream)
+                        && info.mode == StreamMode::Document
                     {
-                        to_refresh.push(stream.clone());
+                        if replaces(plan, stream) {
+                            replacement_tombstones.push(NewTombstone {
+                                stream_id: info.id,
+                                doc_id: doc_id.clone(),
+                                before_seq: plan.seq,
+                            });
+                        }
+                        if refresh && !to_refresh.contains(stream) {
+                            to_refresh.push(stream.clone());
+                        }
                     }
                 }
                 Err(IngestError::Saturated) => {
@@ -714,6 +822,36 @@ async fn handle_bulk_local(
         });
     }
     results.sort_by_key(|r| r.position);
+
+    // The accepted replacements' tombstones. The documents are already
+    // WAL-durable with the tombstone flag, so a metastore failure here is
+    // retried in the background rather than failing acked items; until it
+    // lands, the old and new version are both visible (never the reverse).
+    if !replacement_tombstones.is_empty() {
+        match state.metastore.upsert_tombstones(&replacement_tombstones).await {
+            Ok(()) => invalidate_tombstone_caches(&state, &replacement_tombstones),
+            Err(e) => {
+                warn!(error = %e, count = replacement_tombstones.len(), "replacement tombstones failed; retrying in background");
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut backoff = std::time::Duration::from_millis(500);
+                    loop {
+                        tokio::time::sleep(backoff).await;
+                        match state.metastore.upsert_tombstones(&replacement_tombstones).await {
+                            Ok(()) => {
+                                invalidate_tombstone_caches(&state, &replacement_tombstones);
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "replacement tombstones still failing");
+                                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
 
     // ?refresh: cut the written streams' batches now and wait (bounded)
     // until they are published, so a search right after this response

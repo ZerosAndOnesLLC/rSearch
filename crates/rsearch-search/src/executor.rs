@@ -54,6 +54,10 @@ const DEFAULT_TRACK_TOTAL_HITS: usize = 10_000;
 const TOMBSTONE_CACHE_TTL: Duration = Duration::from_secs(1);
 /// Tombstone rows fetched per metastore round trip.
 const TOMBSTONE_PAGE: i64 = 10_000;
+/// How often a stream's cached tombstone list is rebuilt from scratch so
+/// rows the control plane purged drop out of memory (incremental refreshes
+/// only ever append).
+const TOMBSTONE_REBUILD_EVERY: Duration = Duration::from_secs(300);
 /// Hard ceiling on from+size (ES max_result_window).
 const MAX_RESULT_WINDOW: usize = 10_000;
 /// Max splits one query may touch. A query over more than this (an
@@ -186,6 +190,8 @@ struct StreamTombstones {
     entries: Arc<Vec<Tombstone>>,
     /// None = explicitly invalidated (a local write); refresh on next use.
     fetched_at: Option<Instant>,
+    /// When the list was last loaded from scratch.
+    rebuilt_at: Instant,
 }
 
 struct SplitOutcome {
@@ -221,6 +227,10 @@ pub struct SearchService {
     streams: std::sync::Mutex<HashMap<String, (Arc<CachedStream>, Instant)>>,
     /// Stream id → tombstone list (document-mode streams only).
     tombstones: std::sync::Mutex<HashMap<i64, StreamTombstones>>,
+    /// Per-stream single-flight for tombstone refreshes, so N concurrent
+    /// queries after a TTL expiry (or a cold start) page the metastore
+    /// once, not N times.
+    tombstone_refresh: std::sync::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
 
 impl SearchService {
@@ -241,7 +251,14 @@ impl SearchService {
             opening: std::sync::Mutex::new(HashMap::new()),
             streams: std::sync::Mutex::new(HashMap::new()),
             tombstones: std::sync::Mutex::new(HashMap::new()),
+            tombstone_refresh: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Forget a cached stream record (after this node changed its mode or
+    /// mapping) so the next query re-reads it.
+    pub fn invalidate_stream(&self, name: &str) {
+        self.streams.lock().unwrap().remove(name);
     }
 
     /// Drop the freshness of a stream's cached tombstones so the next
@@ -254,31 +271,68 @@ impl SearchService {
     }
 
     /// The stream's tombstones, ascending by seq, extended from the
-    /// metastore when the cache is stale.
+    /// metastore when the cache is stale. Steady state costs one small
+    /// query per TTL (usually returning nothing, in which case the cached
+    /// list is reused untouched); every `TOMBSTONE_REBUILD_EVERY` the list
+    /// is reloaded from scratch so purged rows leave memory.
     async fn tombstones_for(&self, stream_id: i64) -> SearchResult<Arc<Vec<Tombstone>>> {
-        let cached = {
-            let map = self.tombstones.lock().unwrap();
-            map.get(&stream_id).map(|t| (t.entries.clone(), t.fetched_at))
+        let snapshot = |this: &Self| {
+            this.tombstones
+                .lock()
+                .unwrap()
+                .get(&stream_id)
+                .map(|t| (t.entries.clone(), t.fetched_at, t.rebuilt_at))
         };
-        if let Some((entries, Some(at))) = &cached
-            && at.elapsed() < TOMBSTONE_CACHE_TTL
+        let fresh = |fetched_at: Option<Instant>| {
+            fetched_at.is_some_and(|at| at.elapsed() < TOMBSTONE_CACHE_TTL)
+        };
+        if let Some((entries, fetched_at, _)) = snapshot(self)
+            && fresh(fetched_at)
+        {
+            return Ok(entries);
+        }
+        // Single-flight per stream.
+        let gate = self
+            .tombstone_refresh
+            .lock()
+            .unwrap()
+            .entry(stream_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = gate.lock().await;
+        let cached = snapshot(self);
+        if let Some((entries, fetched_at, _)) = &cached
+            && fresh(*fetched_at)
         {
             return Ok(entries.clone());
         }
-        let mut entries: Vec<Tombstone> = cached
-            .map(|(e, _)| e.as_ref().clone())
-            .unwrap_or_default();
-        let mut after = entries.last().map(|t| t.seq).unwrap_or(0);
+        let rebuild = cached
+            .as_ref()
+            .is_none_or(|(_, _, rebuilt_at)| rebuilt_at.elapsed() >= TOMBSTONE_REBUILD_EVERY);
+        let (mut entries, mut after, rebuilt_at) = match (&cached, rebuild) {
+            (Some((entries, _, rebuilt_at)), false) => {
+                (None, entries.last().map(|t| t.seq).unwrap_or(0), *rebuilt_at)
+            }
+            _ => (Some(Vec::new()), 0, Instant::now()),
+        };
         loop {
             let page = self
                 .metastore
                 .tombstones_since(stream_id, after, TOMBSTONE_PAGE)
                 .await?;
             let done = (page.len() as i64) < TOMBSTONE_PAGE;
-            if let Some(last) = page.last() {
-                after = last.seq;
+            if page.is_empty() {
+                break;
             }
-            entries.extend(page.into_iter().map(|t| Tombstone {
+            after = page.last().map(|t| t.seq).unwrap_or(after);
+            // Clone the cached list only once something new arrived.
+            let list = entries.get_or_insert_with(|| {
+                cached
+                    .as_ref()
+                    .map(|(e, _, _)| e.as_ref().clone())
+                    .unwrap_or_default()
+            });
+            list.extend(page.into_iter().map(|t| Tombstone {
                 seq: t.seq,
                 doc_id: t.doc_id,
                 before_seq: t.before_seq,
@@ -287,7 +341,11 @@ impl SearchService {
                 break;
             }
         }
-        let entries = Arc::new(entries);
+        let entries = match entries {
+            Some(list) => Arc::new(list),
+            // Nothing new: keep the existing Arc.
+            None => cached.as_ref().map(|(e, _, _)| e.clone()).unwrap_or_default(),
+        };
         let mut map = self.tombstones.lock().unwrap();
         if map.len() > 10_000 {
             map.clear();
@@ -297,6 +355,7 @@ impl SearchService {
             StreamTombstones {
                 entries: entries.clone(),
                 fetched_at: Some(Instant::now()),
+                rebuilt_at,
             },
         );
         Ok(entries)
@@ -332,7 +391,15 @@ impl SearchService {
         Ok(cached)
     }
 
-    async fn reader(&self, split_id: &str, storage_key: &str) -> SearchResult<Arc<SplitReader>> {
+    /// Open (or reuse) a split's reader. `applied_through` is the split's
+    /// `tombstone_seq_applied`: a fresh reader starts there, so tombstones
+    /// compaction already made physical are never looked up again.
+    async fn reader(
+        &self,
+        split_id: &str,
+        storage_key: &str,
+        applied_through: i64,
+    ) -> SearchResult<Arc<SplitReader>> {
         if let Some(reader) = self.reader_shard(split_id).lock().unwrap().get(split_id) {
             return Ok(reader.clone());
         }
@@ -353,7 +420,10 @@ impl SearchService {
         // otherwise leak it forever (one map entry per failing split id).
         let opened = SplitReader::open(self.storage.clone(), storage_key, self.cache.clone()).await;
         let reader = match opened {
-            Ok(reader) => Arc::new(reader),
+            Ok(reader) => {
+                reader.seed_applied_through(applied_through);
+                Arc::new(reader)
+            }
             Err(e) => {
                 self.opening.lock().unwrap().remove(split_id);
                 return Err(e.into());
@@ -374,29 +444,51 @@ impl SearchService {
     /// an ingest buffer is not visible yet (use `?refresh=wait_for` on the
     /// write when a read-after-write must see it).
     pub async fn get_document(&self, stream: &str, id: &str) -> SearchResult<Option<FoundDocument>> {
+        let mut found = self.get_documents(stream, std::slice::from_ref(&id.to_string())).await?;
+        Ok(found.remove(id))
+    }
+
+    /// Look up many documents by `_id` in a few searches (one `ids` query
+    /// per chunk of ids) — the newest live version of each id found.
+    pub async fn get_documents(
+        &self,
+        stream: &str,
+        ids: &[String],
+    ) -> SearchResult<HashMap<String, FoundDocument>> {
         // Several live versions of one id can only coexist transiently
-        // (same-instant writes on different nodes); take the newest.
-        let request = SearchRequest {
-            stream: stream.to_string(),
-            query: json!({"ids": {"values": [id]}}),
-            from: 0,
-            size: 16,
-            sort_desc: true,
-            aggs: None,
-            include_source: true,
-            track_total_hits: Some(0),
-        };
-        let response = self.search(request).await?;
-        let best = response["hits"]["hits"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|hit| hit["_id"].as_str() == Some(id))
-            .max_by_key(|hit| hit["_version"].as_i64().unwrap_or(0));
-        Ok(best.map(|hit| FoundDocument {
-            version: hit["_version"].as_i64().unwrap_or(0),
-            source: hit["_source"].clone(),
-        }))
+        // (same-instant writes on different nodes); the newest wins. The
+        // page leaves headroom for those duplicates within the result
+        // window.
+        const CHUNK: usize = 1_000;
+        let mut out: HashMap<String, FoundDocument> = HashMap::new();
+        for chunk in ids.chunks(CHUNK) {
+            let request = SearchRequest {
+                stream: stream.to_string(),
+                query: json!({"ids": {"values": chunk}}),
+                from: 0,
+                size: MAX_RESULT_WINDOW,
+                sort_desc: true,
+                aggs: None,
+                include_source: true,
+                track_total_hits: Some(0),
+            };
+            let response = self.search(request).await?;
+            for hit in response["hits"]["hits"].as_array().into_iter().flatten() {
+                let Some(id) = hit["_id"].as_str() else { continue };
+                let version = hit["_version"].as_i64().unwrap_or(0);
+                let newer = out.get(id).is_none_or(|cur| version > cur.version);
+                if newer {
+                    out.insert(
+                        id.to_string(),
+                        FoundDocument {
+                            version,
+                            source: hit["_source"].clone(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Execute a search and return the full ES-shaped response body.
@@ -470,6 +562,7 @@ impl SearchService {
                 let counted = counted.clone();
                 let split_id = split.split_id.clone();
                 let storage_key = split.storage_key.clone();
+                let applied_through = split.tombstone_seq_applied;
                 let doc_count = split.doc_count as usize;
                 // Only splits that carry ids (seq_min known) can hold a
                 // tombstoned version.
@@ -483,7 +576,7 @@ impl SearchService {
                     && t_start.map(|s| split.time_start_millis >= s).unwrap_or(true)
                     && t_end.map(|e| split.time_end_millis <= e).unwrap_or(true);
                 async move {
-                    let reader = this.reader(&split_id, &storage_key).await?;
+                    let reader = this.reader(&split_id, &storage_key, applied_through).await?;
                     let skip_count = match track {
                         Some(cap) => counted.load(Ordering::Relaxed) >= cap,
                         None => false,
@@ -641,7 +734,9 @@ impl SearchService {
                 let this = &*self;
                 let split = &splits[split_idx];
                 async move {
-                    let reader = this.reader(&split.split_id, &split.storage_key).await?;
+                    let reader = this
+                        .reader(&split.split_id, &split.storage_key, split.tombstone_seq_applied)
+                        .await?;
                     tokio::task::spawn_blocking(move || {
                         let searcher = reader.searcher()?;
                         let schema = reader.mapped_schema();

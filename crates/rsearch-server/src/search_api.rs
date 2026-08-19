@@ -279,8 +279,14 @@ pub async fn put_index(
             // Existing stream with a different mode: allowed only while it
             // is still empty (e.g. auto-created by a first _bulk).
             state.metastore.set_stream_mode(&index, mode).await?;
+            // This node's caches see the change now; other nodes within
+            // their 10s TTLs (a mode can only change while the stream is
+            // empty, so nothing written in that window is affected yet).
             if let Some(pipeline) = &state.pipeline {
                 pipeline.forget_stream(&index);
+            }
+            for service in [&state.search, &state.doc_lookup].into_iter().flatten() {
+                service.invalidate_stream(&index);
             }
         }
         if let Some(mapping) = &mapping {

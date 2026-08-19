@@ -97,7 +97,8 @@ compact_min_tombstones = 1000
 compact_max_age_secs = 3600
 compact_splits_per_tick = 8
 tombstone_purge_grace_secs = 3600  # keep tombstones at least this long after
-                                   # every split has applied them
+                                   # every split has applied them (covers docs
+                                   # still buffered/unreplayed on ingest nodes)
 
 # Network log inputs (disabled by default). Each routes to a stream and is
 # subject to routing rules.

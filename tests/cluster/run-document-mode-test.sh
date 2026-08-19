@@ -101,6 +101,14 @@ curl -s -XPOST "$U/logs/_bulk" -H "$ND" --data-binary $'{"index":{"_id":"x"}}\n{
 code=$(curl -s -o /dev/null -w '%{http_code}' -XDELETE "$U/logs/_doc/x")
 [ "$code" = 400 ] || fail "_doc delete on log stream -> 400 (got $code)"
 
+say "delete/update on a missing index are 404 (no implicit creation)"
+curl -s -XPOST "$U/_bulk" -H "$ND" --data-binary $'{"delete":{"_index":"nope","_id":"1"}}\n' | jq -e '.items[0].delete.status == 404' >/dev/null || fail "bulk delete on missing index -> 404"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XDELETE "$U/nope/_doc/1")
+[ "$code" = 404 ] || fail "DELETE _doc on missing index -> 404 (got $code)"
+[ "$(curl -s "$U/_cat/indices" | jq -r '[.[] | select(.index=="nope")] | length')" = 0 ] || fail "missing index was not created"
+curl -s -XPOST "$U/recs/_bulk?refresh=wait_for" -H "$ND" --data-binary $'{"index":{"_id":42}}\n{"title":"numeric"}\n' | jq -e '.items[0].index._id == "42"' >/dev/null || fail "numeric _id coerced"
+curl -s -XDELETE "$U/recs/_doc/42" >/dev/null
+
 say "delete_by_query"
 curl -s -XPOST "$U/recs/_delete_by_query" -H "$J" -d '{"query":{"term":{"title":"e1"}}}' | jq -e '.deleted == 1' >/dev/null || fail "delete_by_query"
 [ "$(ids recs)" = "a,buffered,c,d" ] || fail "ids after delete_by_query: $(ids recs)"

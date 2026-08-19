@@ -121,8 +121,12 @@ impl SplitReader {
     /// blocking context (term lookups may read from storage).
     pub fn apply_tombstones(&self, tombstones: &[Tombstone]) -> IndexResult<Arc<ExclusionSet>> {
         // Serialize appliers: concurrent queries on one split wait for the
-        // first rather than each repeating the term lookups.
-        let mut slot = self.exclusions.lock().unwrap();
+        // first rather than each repeating the term lookups. A poisoned
+        // lock (a panic mid-apply) just yields the last good set.
+        let mut slot = self
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = slot.clone();
         let start = tombstones.partition_point(|t| t.seq <= current.applied_through);
         let pending = &tombstones[start..];
@@ -174,9 +178,24 @@ impl SplitReader {
         Ok(next)
     }
 
-    /// The exclusion set as last computed (without applying anything).
-    pub fn current_exclusions(&self) -> Arc<ExclusionSet> {
-        self.exclusions.lock().unwrap().clone()
+    /// Start the exclusion bookkeeping at `applied_through`: tombstones at
+    /// or below it are known to hide nothing in this split (it was built —
+    /// by compaction or a merge — with them applied), so they are never
+    /// looked up. Only moves forward, and only while nothing has been
+    /// applied yet (the cached set would otherwise be incomplete).
+    pub fn seed_applied_through(&self, applied_through: i64) {
+        let mut slot = self
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.applied_through == 0 && slot.is_empty() && applied_through > 0 {
+            *slot = Arc::new(ExclusionSet {
+                applied_through,
+                per_segment: slot.per_segment.clone(),
+                ordinals: slot.ordinals.clone(),
+                total: 0,
+            });
+        }
     }
 }
 
@@ -321,7 +340,7 @@ mod tests {
             };
 
             // Nothing applied: everything visible.
-            let empty = r.current_exclusions();
+            let empty = r.apply_tombstones(&[]).unwrap();
             assert!(empty.is_empty());
             assert_eq!(count(&r, &empty, Box::new(AllQuery)), 4);
 
@@ -393,6 +412,37 @@ mod tests {
             assert_eq!(set.applied_through, 5);
             assert!(set.contains(0, 0));
             assert!(!set.contains(0, 3));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seeded_reader_skips_already_applied_tombstones() {
+        let (reader, _s, _c) = open_split().await;
+        tokio::task::spawn_blocking(move || {
+            // The split was (notionally) rebuilt with tombstones through
+            // seq 5 applied: those are never looked up, later ones are.
+            reader.seed_applied_through(5);
+            let set = reader
+                .apply_tombstones(&[
+                    Tombstone {
+                        seq: 3,
+                        doc_id: "alpha".into(),
+                        before_seq: 1_000,
+                    },
+                    Tombstone {
+                        seq: 7,
+                        doc_id: "beta".into(),
+                        before_seq: 1_000,
+                    },
+                ])
+                .unwrap();
+            assert_eq!(set.applied_through, 7);
+            assert_eq!(set.len(), 1, "only beta (seq 7) was applied");
+            // Seeding after application is a no-op.
+            reader.seed_applied_through(100);
+            assert_eq!(reader.apply_tombstones(&[]).unwrap().applied_through, 7);
         })
         .await
         .unwrap();

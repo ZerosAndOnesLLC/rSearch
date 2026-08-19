@@ -414,12 +414,21 @@ fn translate_term(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Q
     term_query_for(schema, name, value)
 }
 
+/// Cap on `ids.values` (ES's default `max_terms_count` is 65536; a bulk
+/// lookup chunks at 1000).
+const MAX_IDS_VALUES: usize = 10_000;
+
 /// `{"ids": {"values": ["a", "b"]}}` — documents whose `_id` is listed.
 fn translate_ids(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
     let values = body
         .get("values")
         .and_then(Value::as_array)
         .ok_or_else(|| SearchError::BadRequest("ids query needs a 'values' array".into()))?;
+    if values.len() > MAX_IDS_VALUES {
+        return Err(SearchError::BadRequest(format!(
+            "ids query accepts at most {MAX_IDS_VALUES} values"
+        )));
+    }
     let clauses: Vec<(Occur, Box<dyn Query>)> = values
         .iter()
         .map(|v| {

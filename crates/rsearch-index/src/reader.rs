@@ -133,10 +133,6 @@ impl SplitReader {
         &self.schema
     }
 
-    /// Whether documents in this split carry `_id`/`_seq`.
-    pub fn has_doc_ids(&self) -> bool {
-        self.schema.id.is_some()
-    }
 
     /// A searcher over this immutable split, reusing the reader built at
     /// open time (segment readers are pooled, not re-opened). Call from a
@@ -479,7 +475,7 @@ mod tests {
 
         let cache = Arc::new(SplitCache::new(cache_dir.path(), 1 << 30).unwrap());
         let reader = Arc::new(SplitReader::open(storage, &key, cache).await.unwrap());
-        assert!(reader.has_doc_ids());
+        assert!(reader.mapped_schema().id.is_some());
 
         let r = reader.clone();
         let (alpha_count, seen) = tokio::task::spawn_blocking(move || {

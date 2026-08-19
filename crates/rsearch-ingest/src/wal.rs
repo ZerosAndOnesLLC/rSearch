@@ -4,7 +4,11 @@
 //!
 //! Record layout: [len: u32 LE][crc32(payload): u32 LE][payload]
 //! where payload (v2) =
-//!   [0x8000 | stream_len: u16 LE][stream][id_len: u16 LE][id][seq: i64 LE][doc JSON bytes]
+//!   [0x8000 | stream_len: u16 LE][stream][flags | id_len: u16 LE][id][seq: i64 LE][doc JSON bytes]
+//! `flags` is bit 15 of the id length field: set when the write must be
+//! accompanied by a tombstone hiding older versions of `id` (document-mode
+//! replace) — replay re-issues it so a crash between the WAL append and
+//! the tombstone write can't leave the old version visible.
 //! Legacy (v1) payloads — written before documents carried an identity —
 //! are [stream_len: u16 LE][stream][doc JSON bytes] with the high bit of
 //! `stream_len` clear; they replay with a generated id at sequence 0.
@@ -30,6 +34,10 @@ pub struct WalItem {
     pub id: String,
     /// Write sequence stamp (`_seq`).
     pub seq: i64,
+    /// The write replaces older versions of `id` (document-mode stream):
+    /// a tombstone `before_seq = seq` accompanies it, and replay re-issues
+    /// that tombstone.
+    pub tombstone: bool,
     /// Raw document JSON (the client's original line).
     pub doc: std::sync::Arc<str>,
 }
@@ -43,6 +51,8 @@ pub struct WalRecord {
     pub id: String,
     /// Write sequence stamp; 0 for legacy records.
     pub seq: i64,
+    /// Whether a tombstone `before_seq = seq` must accompany the document.
+    pub tombstone: bool,
     /// Raw document JSON bytes as originally appended.
     pub doc: Vec<u8>,
     /// Position to confirm once the document is published.
@@ -51,6 +61,8 @@ pub struct WalRecord {
 
 /// High bit of the `stream_len` field marks a v2 payload (with identity).
 const V2_FLAG: u16 = 0x8000;
+/// High bit of the `id_len` field: the write carries a tombstone.
+const TOMBSTONE_FLAG: u16 = 0x8000;
 
 struct SegmentState {
     outstanding: u64,
@@ -194,7 +206,9 @@ impl Wal {
                 }
                 let stream_bytes = item.stream.as_bytes();
                 let id_bytes = item.id.as_bytes();
-                if stream_bytes.len() >= V2_FLAG as usize || id_bytes.len() > u16::MAX as usize {
+                if stream_bytes.len() >= V2_FLAG as usize
+                    || id_bytes.len() >= TOMBSTONE_FLAG as usize
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "stream name or document id too long for the WAL",
@@ -202,7 +216,8 @@ impl Wal {
                 }
                 let payload_len = 2 + stream_bytes.len() + 2 + id_bytes.len() + 8 + doc.len();
                 let len_field = stream_bytes.len() as u16 | V2_FLAG;
-                let id_len_field = id_bytes.len() as u16;
+                let id_len_field =
+                    id_bytes.len() as u16 | if item.tombstone { TOMBSTONE_FLAG } else { 0 };
                 let seq_bytes = item.seq.to_le_bytes();
                 // Stream the CRC over the payload slices; write them
                 // directly to the buffered writer (no intermediate Vec).
@@ -373,6 +388,7 @@ struct RecordLayout {
     /// `None` for a legacy (v1) record without identity.
     id: Option<(usize, usize)>,
     seq: i64,
+    tombstone: bool,
     doc_start: usize,
 }
 
@@ -425,7 +441,9 @@ impl SegmentCursor {
             if at + 2 > self.buf.len() {
                 return false;
             }
-            let id_len = u16::from_le_bytes(self.buf[at..at + 2].try_into().unwrap()) as usize;
+            let id_len_field = u16::from_le_bytes(self.buf[at..at + 2].try_into().unwrap());
+            let id_len = (id_len_field & !TOMBSTONE_FLAG) as usize;
+            layout.tombstone = id_len_field & TOMBSTONE_FLAG != 0;
             at += 2;
             if at + id_len + 8 > self.buf.len() {
                 return false;
@@ -449,6 +467,7 @@ impl SegmentCursor {
             stream: String::from_utf8_lossy(&self.buf[s0..s1]).to_string(),
             id,
             seq: self.layout.seq,
+            tombstone: self.layout.tombstone,
             doc: self.buf[self.layout.doc_start..].to_vec(),
             pos: WalPos { segment: self.seq },
         }
@@ -495,6 +514,7 @@ mod tests {
                 stream: stream.to_string(),
                 id: format!("id-{i}"),
                 seq: 1_000 + i as i64,
+                tombstone: i % 2 == 1,
                 doc: std::sync::Arc::from(format!("{{\"n\":{i}}}")),
             })
             .collect()
@@ -525,9 +545,12 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].id, "id-0");
         assert_eq!(records[0].seq, 1_000);
+        assert!(!records[0].tombstone);
         assert_eq!(records[1].doc, b"{\"n\":1}");
+        assert!(records[1].tombstone);
         assert_eq!(records[2].stream, "legacy");
         assert_eq!(records[2].seq, 0);
+        assert!(!records[2].tombstone);
         assert_eq!(records[2].id.len(), 32, "legacy records get a generated id");
         assert_eq!(records[2].doc, b"{\"old\":true}");
     }

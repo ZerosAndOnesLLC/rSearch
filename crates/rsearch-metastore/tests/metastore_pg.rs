@@ -318,7 +318,15 @@ async fn tombstones_upsert_and_page_by_seq() {
     assert!(newer[0].seq > a.seq);
     let all = ms.tombstones_since(stream.id, 0, 100).await.unwrap();
     assert_eq!(all.iter().find(|r| r.doc_id == "b").unwrap().before_seq, 20);
-    assert_eq!(ms.tombstone_count(stream.id).await.unwrap(), 2);
+    assert_eq!(all.len(), 2);
+
+    // Bounds lookup: what a new write must exceed.
+    let mut bounds = ms
+        .tombstone_bounds(&[(stream.id, "a".into()), (stream.id, "zzz".into())])
+        .await
+        .unwrap();
+    bounds.sort();
+    assert_eq!(bounds, vec![(stream.id, "a".to_string(), 30)]);
 
     // Paging honors the limit in seq order.
     let page = ms.tombstones_since(stream.id, 0, 1).await.unwrap();
@@ -326,5 +334,55 @@ async fn tombstones_upsert_and_page_by_seq() {
     assert_eq!(page[0].doc_id, "b");
 
     ms.delete_stream(&stream.name).await.unwrap();
-    assert_eq!(ms.tombstone_count(stream.id).await.unwrap(), 0, "cascade");
+    assert!(
+        ms.tombstones_since(stream.id, 0, 10).await.unwrap().is_empty(),
+        "cascade"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn tombstone_purge_respects_split_floor_and_grace() {
+    use rsearch_metastore::NewTombstone;
+    let Some(ms) = metastore().await else { return };
+    let stream = ms.ensure_stream(&unique("purge")).await.unwrap();
+    let t = |doc: &str, before: i64| NewTombstone {
+        stream_id: stream.id,
+        doc_id: doc.to_string(),
+        before_seq: before,
+    };
+    ms.upsert_tombstones(&[t("a", 10), t("b", 20)]).await.unwrap();
+    let rows = ms.tombstones_since(stream.id, 0, 10).await.unwrap();
+    let (seq_a, seq_b) = (rows[0].seq, rows[1].seq);
+    fn split<'a>(stream_id: i64, id: &'a str, applied: i64) -> NewSplit<'a> {
+        NewSplit {
+        split_id: id,
+        stream_id,
+        storage_key: "k",
+        doc_count: 1,
+        size_bytes: 1,
+        time_start_millis: 0,
+        time_end_millis: 0,
+        footer_len: 0,
+        created_by: None,
+        seq_min: Some(1),
+        seq_max: Some(2),
+        tombstone_seq_applied: applied,
+        }
+    }
+    let s1 = unique("s1");
+    ms.stage_split(&split(stream.id, &s1, seq_a)).await.unwrap();
+    ms.publish_split(&s1).await.unwrap();
+
+    // Grace not elapsed: nothing purged even though a is applied.
+    assert_eq!(ms.purge_tombstones(3600.0, 100).await.unwrap(), 0);
+    // Grace 0: only a (seq <= floor); b is above the floor.
+    assert_eq!(ms.purge_tombstones(0.0, 100).await.unwrap(), 1);
+    let left = ms.tombstones_since(stream.id, 0, 10).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].seq, seq_b);
+    // Raising the floor releases b.
+    ms.mark_tombstones_applied(&s1, seq_b).await.unwrap();
+    assert_eq!(ms.purge_tombstones(0.0, 100).await.unwrap(), 1);
+    ms.delete_stream(&stream.name).await.unwrap();
 }

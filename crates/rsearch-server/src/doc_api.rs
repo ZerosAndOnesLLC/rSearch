@@ -307,6 +307,10 @@ pub async fn delete_by_query(
         .unwrap_or_else(|| json!({"match_all": {}}));
     let mut deleted = 0usize;
     let mut rounds = 0usize;
+    // Progress guard: a round whose ids were all seen in the previous round
+    // means the tombstones are not taking effect (a node ahead in sequence,
+    // or ids this node cannot hide); stop rather than spin.
+    let mut previous: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         rounds += 1;
         if rounds > DELETE_BY_QUERY_MAX_ROUNDS {
@@ -335,6 +339,14 @@ pub async fn delete_by_query(
         if ids.is_empty() {
             break;
         }
+        if !ids.is_empty() && ids.iter().all(|id| previous.contains(id)) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "delete_by_query made no progress: the matched documents are not being hidden \
+                 (retry, or check cluster clock synchronization)",
+            );
+        }
+        previous = ids.iter().cloned().collect();
         let mut bulk = String::new();
         for id in &ids {
             bulk.push_str(&one_item_body("delete", &index, Some(id), None));

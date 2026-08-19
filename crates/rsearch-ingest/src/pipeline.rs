@@ -35,17 +35,24 @@ pub struct StreamInfo {
 /// its own entry immediately.
 const STREAM_INFO_TTL: Duration = Duration::from_secs(10);
 
-/// Node-local monotonic write-sequence source: micros since epoch, forced
-/// strictly increasing across calls so two writes to the same `_id` on
-/// one node always order, even within the same microsecond. Across nodes
-/// ordering relies on wall clocks (NTP) — the same assumption retention
-/// already makes.
+/// Write-sequence source: a hybrid logical clock. Stamps are micros
+/// since epoch, forced strictly increasing across calls on one node, and
+/// pushed past every sequence this node has *observed* from the cluster
+/// (tombstone bounds of the ids being written, the stream's highest
+/// published `_seq`) — so a replacement written on a node whose wall
+/// clock lags the previous writer's still orders after it. Wall clocks
+/// only set the pace; causality comes from the observations.
 #[derive(Default)]
 pub struct SeqClock {
     last: std::sync::atomic::AtomicI64,
 }
 
 impl SeqClock {
+    /// Fold a sequence seen elsewhere into the clock: later stamps exceed it.
+    pub fn observe(&self, seen: i64) {
+        self.last.fetch_max(seen, Ordering::AcqRel);
+    }
+
     /// Next sequence stamp.
     pub fn next(&self) -> i64 {
         let now = SystemTime::now()
@@ -260,6 +267,7 @@ impl IngestPipeline {
                     stream,
                     id: id.clone(),
                     seq,
+                    tombstone: false,
                     doc: source.clone(),
                 });
             }
@@ -320,6 +328,14 @@ impl IngestPipeline {
             id: record.id,
             mode: record.mode(),
         };
+        if info.mode == StreamMode::Document {
+            // Order this node's next writes after everything already
+            // published for the stream (cheap lower bound; the per-id
+            // tombstone bounds the bulk handler observes are exact).
+            if let Some(max) = self.inner.metastore.stream_max_seq(info.id).await? {
+                self.inner.seq.observe(max);
+            }
+        }
         let mut cache = self.inner.stream_info.write().unwrap();
         // Bounded: stream names are client-controlled.
         if cache.len() > 10_000 {
@@ -327,6 +343,21 @@ impl IngestPipeline {
         }
         cache.insert(name.to_string(), (info, std::time::Instant::now()));
         Ok(info)
+    }
+
+    /// Like [`IngestPipeline::stream_info`] but never creates the stream:
+    /// `Ok(None)` when it does not exist.
+    pub async fn stream_info_if_exists(&self, name: &str) -> IngestResult<Option<StreamInfo>> {
+        if let Some((info, at)) = self.inner.stream_info.read().unwrap().get(name)
+            && at.elapsed() < STREAM_INFO_TTL
+        {
+            return Ok(Some(*info));
+        }
+        match self.inner.metastore.get_stream(name).await {
+            Ok(_) => self.stream_info(name).await.map(Some),
+            Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Drop a cached [`StreamInfo`] (after this node changed the stream's
@@ -340,6 +371,12 @@ impl IngestPipeline {
     /// persisted and replayed.
     pub fn next_seq(&self) -> i64 {
         self.inner.seq.next()
+    }
+
+    /// Push the sequence clock past a sequence observed elsewhere (see
+    /// [`SeqClock::observe`]).
+    pub fn observe_seq(&self, seen: i64) {
+        self.inner.seq.observe(seen);
     }
 
     /// Enqueue a WAL-durable document for indexing. `source` is the exact
@@ -398,9 +435,29 @@ impl IngestPipeline {
     /// not be dropped for backpressure.
     pub async fn replay(&self, records: WalReplay) -> IngestResult<usize> {
         let mut count = 0usize;
+        // Records flagged as replacements re-issue their tombstone before
+        // the document is re-indexed (upserts only raise, so doing it
+        // twice is harmless; skipping it would resurrect the old version).
+        let mut pending_tombstones: Vec<rsearch_metastore::NewTombstone> = Vec::new();
         for record in records {
             let record = record.map_err(IngestError::Wal)?;
             count += 1;
+            if record.tombstone {
+                let info = self.stream_info(&record.stream).await?;
+                pending_tombstones.push(rsearch_metastore::NewTombstone {
+                    stream_id: info.id,
+                    doc_id: record.id.clone(),
+                    before_seq: record.seq,
+                });
+                self.inner.seq.observe(record.seq);
+                if pending_tombstones.len() >= 1_000 {
+                    self.inner
+                        .metastore
+                        .upsert_tombstones(&pending_tombstones)
+                        .await?;
+                    pending_tombstones.clear();
+                }
+            }
             // Validate the payload is parseable JSON; the WAL payload IS
             // the source bytes, so we don't keep the parsed value.
             if serde_json::from_slice::<serde::de::IgnoredAny>(&record.doc).is_err() {
@@ -432,6 +489,12 @@ impl IngestPipeline {
                 self.inner.wal.confirm(&[record.pos]);
                 warn!(stream = %record.stream, "worker gone during replay; record dropped");
             }
+        }
+        if !pending_tombstones.is_empty() {
+            self.inner
+                .metastore
+                .upsert_tombstones(&pending_tombstones)
+                .await?;
         }
         if count > 0 {
             info!(count, "replayed WAL records into pipeline");
@@ -796,4 +859,26 @@ async fn flush_inner(
         return Err((IngestError::Metastore(e), batch));
     }
     Ok(Some((packaged.meta.split_id, indexed)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeqClock;
+
+    #[test]
+    fn seq_clock_is_monotonic_and_observes() {
+        let clock = SeqClock::default();
+        let a = clock.next();
+        let b = clock.next();
+        assert!(b > a);
+        // Observing a sequence from the future (a peer whose clock is
+        // ahead) pushes the next stamp past it.
+        let far = a + 10_000_000_000;
+        clock.observe(far);
+        assert!(clock.next() > far);
+        // Observing the past changes nothing.
+        let c = clock.next();
+        clock.observe(a);
+        assert!(clock.next() > c);
+    }
 }

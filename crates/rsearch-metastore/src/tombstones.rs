@@ -5,6 +5,10 @@
 use crate::error::MetastoreResult;
 use crate::metastore::Metastore;
 
+/// Advisory-lock class for per-stream tombstone serialization (distinct
+/// from the control-leader lock).
+const TOMBSTONE_LOCK_CLASS: i32 = 0x7343_0002;
+
 /// One tombstone row.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
 pub struct TombstoneRecord {
@@ -29,10 +33,16 @@ pub struct NewTombstone {
 }
 
 impl Metastore {
-    /// Upsert a batch of tombstones in one statement. An existing row for
-    /// the same (stream, doc) is raised to a greater `before_seq` and
-    /// re-sequenced so readers paging by `seq` see the change; a lower or
-    /// equal bound leaves it untouched.
+    /// Upsert a batch of tombstones. An existing row for the same
+    /// (stream, doc) is raised to a greater `before_seq` and re-sequenced
+    /// so readers paging by `seq` see the change; a lower or equal bound
+    /// leaves it untouched.
+    ///
+    /// Runs in a transaction that takes a per-stream advisory lock before
+    /// drawing sequence numbers, so tombstones of one stream *commit* in
+    /// `seq` order: an incremental reader that saw `seq = N` has seen every
+    /// row below N, and a compaction stamping `applied_through = N` has
+    /// really applied them all.
     pub async fn upsert_tombstones(&self, items: &[NewTombstone]) -> MetastoreResult<()> {
         if items.is_empty() {
             return Ok(());
@@ -40,6 +50,19 @@ impl Metastore {
         let stream_ids: Vec<i64> = items.iter().map(|t| t.stream_id).collect();
         let doc_ids: Vec<String> = items.iter().map(|t| t.doc_id.clone()).collect();
         let before_seqs: Vec<i64> = items.iter().map(|t| t.before_seq).collect();
+        let mut locked: Vec<i64> = stream_ids.clone();
+        locked.sort_unstable();
+        locked.dedup();
+        let mut tx = self.pool().begin().await?;
+        // Sorted lock order across streams keeps concurrent batches
+        // deadlock-free.
+        for stream_id in &locked {
+            sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+                .bind(TOMBSTONE_LOCK_CLASS)
+                .bind((stream_id % i64::from(i32::MAX)) as i32)
+                .execute(&mut *tx)
+                .await?;
+        }
         // Within one statement the same (stream, doc) may appear twice
         // (two writes to one id in a batch); ON CONFLICT can't update a row
         // twice, so collapse duplicates to their max before_seq first.
@@ -57,9 +80,35 @@ impl Metastore {
         .bind(&stream_ids)
         .bind(&doc_ids)
         .bind(&before_seqs)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// The highest tombstone bound already recorded for each of the given
+    /// (stream, doc) pairs — what a new write to that id must exceed to
+    /// take effect. Pairs without a tombstone are absent from the result.
+    pub async fn tombstone_bounds(
+        &self,
+        pairs: &[(i64, String)],
+    ) -> MetastoreResult<Vec<(i64, String, i64)>> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stream_ids: Vec<i64> = pairs.iter().map(|(s, _)| *s).collect();
+        let doc_ids: Vec<String> = pairs.iter().map(|(_, d)| d.clone()).collect();
+        let rows = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT t.stream_id, t.doc_id, t.before_seq
+             FROM doc_tombstones t
+             JOIN UNNEST($1::bigint[], $2::text[]) AS p(stream_id, doc_id)
+               ON p.stream_id = t.stream_id AND p.doc_id = t.doc_id",
+        )
+        .bind(&stream_ids)
+        .bind(&doc_ids)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
     }
 
     /// Tombstones of a stream with `seq > after_seq`, ascending, up to
@@ -82,18 +131,6 @@ impl Metastore {
         .fetch_all(self.pool())
         .await?)
     }
-
-    /// Number of tombstone rows for a stream.
-    pub async fn tombstone_count(&self, stream_id: i64) -> MetastoreResult<i64> {
-        Ok(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM doc_tombstones WHERE stream_id = $1",
-            )
-            .bind(stream_id)
-            .fetch_one(self.pool())
-            .await?,
-        )
-    }
 }
 
 /// Per-stream tombstone rollup for the compaction job.
@@ -110,15 +147,31 @@ pub struct StreamTombstoneStats {
 }
 
 impl Metastore {
-    /// Tombstone rollups for every stream that has any, oldest first.
+    /// Highest `_seq` recorded in any staged/published split of a stream
+    /// (None when no split carries ids) — a lower bound a node's sequence
+    /// clock observes so its next write orders after every published one.
+    pub async fn stream_max_seq(&self, stream_id: i64) -> MetastoreResult<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(seq_max) FROM splits
+             WHERE stream_id = $1 AND state IN ('staged', 'published')",
+        )
+        .bind(stream_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    /// Tombstone rollups for every document-mode stream that has any,
+    /// oldest first. A full scan of the table — callers run it at a lower
+    /// cadence than the control tick.
     pub async fn tombstone_stats(&self) -> MetastoreResult<Vec<StreamTombstoneStats>> {
         Ok(sqlx::query_as::<_, StreamTombstoneStats>(
-            "SELECT stream_id, COUNT(*) AS count,
-                    EXTRACT(EPOCH FROM (now() - MIN(created_at)))::float8 AS oldest_age_secs,
-                    MAX(seq) AS max_seq
-             FROM doc_tombstones
-             GROUP BY stream_id
-             ORDER BY MIN(created_at)",
+            "SELECT t.stream_id, COUNT(*) AS count,
+                    EXTRACT(EPOCH FROM (now() - MIN(t.created_at)))::float8 AS oldest_age_secs,
+                    MAX(t.seq) AS max_seq
+             FROM doc_tombstones t
+             JOIN streams st ON st.id = t.stream_id AND st.mode = 'document'
+             GROUP BY t.stream_id
+             ORDER BY MIN(t.created_at)",
         )
         .fetch_all(self.pool())
         .await?)
@@ -170,22 +223,27 @@ impl Metastore {
         Ok(())
     }
 
-    /// Delete tombstones older than `grace_secs` that no staged/published
-    /// split can still hold a hidden version for. Returns rows removed.
+    /// Delete tombstones older than `grace_secs` that every staged/
+    /// published id-carrying split of their stream has already applied
+    /// (tombstone `seq` at or below the stream's lowest
+    /// `tombstone_seq_applied`). Streams with no such splits keep nothing.
+    /// Index-driven on both sides: O(rows purged), not O(tombstones ×
+    /// splits). Returns rows removed.
     pub async fn purge_tombstones(&self, grace_secs: f64, limit: i64) -> MetastoreResult<u64> {
         let result = sqlx::query(
-            "DELETE FROM doc_tombstones t
+            "WITH floor AS (
+                 SELECT stream_id, MIN(tombstone_seq_applied) AS min_applied
+                 FROM splits
+                 WHERE state IN ('staged', 'published') AND seq_min IS NOT NULL
+                 GROUP BY stream_id
+             )
+             DELETE FROM doc_tombstones t
              WHERE t.seq IN (
                  SELECT c.seq FROM doc_tombstones c
+                 LEFT JOIN floor f ON f.stream_id = c.stream_id
                  WHERE c.created_at < now() - make_interval(secs => $1)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM splits s
-                       WHERE s.stream_id = c.stream_id
-                         AND s.state IN ('staged', 'published')
-                         AND s.seq_min IS NOT NULL
-                         AND s.seq_min < c.before_seq
-                         AND s.tombstone_seq_applied < c.seq
-                   )
+                   AND (f.min_applied IS NULL OR c.seq <= f.min_applied)
+                 ORDER BY c.created_at
                  LIMIT $2
              )",
         )

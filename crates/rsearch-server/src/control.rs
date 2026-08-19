@@ -52,6 +52,7 @@ pub struct ControlPlane {
     /// Gates the O(object_locations) under-replication aggregation so
     /// healthy steady-state ticks don't pay a full-table scan every 15s.
     repair_scan: std::sync::Mutex<RepairScanState>,
+    compaction: std::sync::Mutex<CompactionState>,
 }
 
 #[derive(Default)]
@@ -62,6 +63,18 @@ struct RepairScanState {
     /// The previous scan found under-replicated keys — keep scanning every
     /// tick until a scan comes back clean.
     last_found_work: bool,
+}
+
+/// How often the compaction job re-scans the tombstone table for streams
+/// that are due (a full scan; between scans it drains the streams found).
+const COMPACTION_SCAN_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct CompactionState {
+    last_scan: Option<std::time::Instant>,
+    /// Streams found due by the last scan, not yet fully visited (popped
+    /// oldest-first).
+    due: Vec<rsearch_metastore::StreamTombstoneStats>,
 }
 
 struct ReplicationCtl {
@@ -106,6 +119,7 @@ impl ControlPlane {
             replication,
             metrics,
             repair_scan: std::sync::Mutex::new(RepairScanState::default()),
+            compaction: std::sync::Mutex::new(CompactionState::default()),
         })
     }
 
@@ -664,6 +678,9 @@ impl ControlPlane {
                 SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
                     .await?,
             );
+            // Tombstones this split already applied (an earlier rebuild)
+            // hide nothing in it; skip their lookups.
+            reader.seed_applied_through(split.tombstone_seq_applied);
             let tombstones = tombstones.to_vec();
             let (next_builder, skipped) = tokio::task::spawn_blocking(move || {
                 let exclusions = reader.apply_tombstones(&tombstones)?;
@@ -741,16 +758,46 @@ impl ControlPlane {
     /// rewritten without them. Bounded per tick so a big backlog drains
     /// over several ticks without starving the other jobs.
     async fn compaction_job(&self) -> anyhow::Result<()> {
-        let stats = self.metastore.tombstone_stats().await?;
+        // The rollup is a full scan of the tombstone table; it only needs
+        // to run every few ticks, and a tick that has nothing due after the
+        // last scan skips it. Streams found due are drained over the
+        // following ticks without re-scanning.
+        // Scan cadence: no finer than the age trigger needs, at most
+        // every COMPACTION_SCAN_EVERY.
+        let scan_every = Duration::from_secs_f64(self.config.compact_max_age_secs.max(1.0))
+            .min(COMPACTION_SCAN_EVERY);
+        let need_scan = {
+            let state = self.compaction.lock().unwrap();
+            state.due.is_empty()
+                && state
+                    .last_scan
+                    .is_none_or(|at| at.elapsed() >= scan_every)
+        };
+        if need_scan {
+            let stats = self.metastore.tombstone_stats().await?;
+            self.metrics.tombstones_pending.store(
+                stats.iter().map(|s| s.count as u64).sum(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let mut due: Vec<_> = stats
+                .into_iter()
+                .filter(|stat| {
+                    stat.count >= self.config.compact_min_tombstones
+                        || stat.oldest_age_secs >= self.config.compact_max_age_secs
+                })
+                .collect();
+            due.reverse(); // pop() yields oldest first
+            let mut state = self.compaction.lock().unwrap();
+            state.last_scan = Some(std::time::Instant::now());
+            state.due = due;
+        }
+        let mut stats = std::mem::take(&mut self.compaction.lock().unwrap().due);
         let mut budget = self.config.compact_splits_per_tick.max(1);
-        for stat in stats {
+        while let Some(stat) = stats.pop() {
             if budget <= 0 {
+                // Put it back for the next tick.
+                stats.push(stat);
                 break;
-            }
-            let due = stat.count >= self.config.compact_min_tombstones
-                || stat.oldest_age_secs >= self.config.compact_max_age_secs;
-            if !due {
-                continue;
             }
             let stream = match self.metastore.get_stream_by_id(stat.stream_id).await {
                 Ok(stream) => stream,
@@ -767,48 +814,71 @@ impl ControlPlane {
             if candidates.is_empty() {
                 continue;
             }
+            // More work may remain for this stream after the budget; it is
+            // re-evaluated on the next scan.
             let tombstones = self.stream_tombstones(&stream).await?;
             let applied_through = tombstones.last().map(|t| t.seq).unwrap_or(0);
             for split in &candidates {
                 budget -= 1;
-                // Cheap check first: does this split hold anything hidden?
-                let reader = Arc::new(
-                    SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
-                        .await?,
-                );
-                let list = tombstones.clone();
-                let hidden = tokio::task::spawn_blocking(move || {
-                    reader.apply_tombstones(&list).map(|set| set.len())
-                })
-                .await??;
-                if hidden == 0 {
-                    self.metastore
-                        .mark_tombstones_applied(&split.split_id, applied_through)
-                        .await?;
-                    continue;
-                }
-                info!(
-                    stream = %stream.name,
-                    split_id = %split.split_id,
-                    hidden,
-                    docs = split.doc_count,
-                    "compacting split"
-                );
-                match self.rebuild_splits(&stream, &[split], &tombstones).await {
-                    Ok(_) => {
-                        self.metrics
-                            .compactions
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        // Most likely the split was merged/deleted under us
-                        // (swap conflict); the next tick re-evaluates.
-                        warn!(split_id = %split.split_id, error = %e, "compaction of split failed");
-                    }
-                }
+                self.compact_split(&stream, split, &tombstones, applied_through).await;
+            }
+            if budget <= 0 {
+                // Budget exhausted on this stream: it stays due so the next
+                // tick continues where this one stopped.
+                stats.push(stat);
+                break;
             }
         }
+        self.compaction.lock().unwrap().due = stats;
         Ok(())
+    }
+
+    /// One split's compaction step: mark up to date when nothing is hidden,
+    /// otherwise rewrite without the hidden versions.
+    async fn compact_split(
+        &self,
+        stream: &rsearch_metastore::StreamRecord,
+        split: &SplitRecord,
+        tombstones: &[rsearch_index::Tombstone],
+        applied_through: i64,
+    ) {
+        let step = async {
+            // Cheap check first: does this split hold anything hidden by
+            // tombstones newer than the ones it already applied?
+            let reader = Arc::new(
+                SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
+                    .await?,
+            );
+            reader.seed_applied_through(split.tombstone_seq_applied);
+            let list = tombstones.to_vec();
+            let hidden = tokio::task::spawn_blocking(move || {
+                reader.apply_tombstones(&list).map(|set| set.len())
+            })
+            .await??;
+            if hidden == 0 {
+                self.metastore
+                    .mark_tombstones_applied(&split.split_id, applied_through)
+                    .await?;
+                return Ok(());
+            }
+            info!(
+                stream = %stream.name,
+                split_id = %split.split_id,
+                hidden,
+                docs = split.doc_count,
+                "compacting split"
+            );
+            self.rebuild_splits(stream, &[split], tombstones).await?;
+            self.metrics
+                .compactions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, anyhow::Error>(())
+        };
+        // A failure is most likely the split being merged/deleted under us
+        // (swap conflict); the next scan re-evaluates.
+        if let Err(e) = step.await {
+            warn!(split_id = %split.split_id, error = %e, "compaction step failed");
+        }
     }
 
     /// Purge tombstones no split can still need (see
