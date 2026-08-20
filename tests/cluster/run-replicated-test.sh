@@ -89,7 +89,8 @@ DATABASE_URL=${RSEARCH_TEST_DATABASE_URL:-$DATABASE_URL}
 rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 pkill -x rsearch 2>/dev/null || true; pause 0.5
 docker exec "$PG_CONTAINER" psql -U rsearch -qc \
-  "DELETE FROM object_locations; DELETE FROM splits; DELETE FROM streams; DELETE FROM nodes;" >/dev/null
+  "DELETE FROM object_locations; DELETE FROM splits; DELETE FROM streams; DELETE FROM nodes;
+   DELETE FROM users; DELETE FROM api_keys; DELETE FROM sessions;" >/dev/null
 
 say "starting 3 replicated all-role nodes"
 start_node node-1 9311
