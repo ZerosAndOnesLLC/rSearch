@@ -1,7 +1,8 @@
 //! Prometheus exposition: `GET /metrics` renders node-local ingest/WAL
 //! and bulk-handoff counters, cluster node gauges, and (on control
-//! nodes) repair/drain activity in text format 0.0.4. Hand-rolled — every value is already an
-//! atomic or one cheap metastore query, so no metrics crate is needed.
+//! nodes) repair/drain activity in text format 0.0.4. Hand-rolled —
+//! every value is already an atomic or one cheap metastore query, so no
+//! metrics crate is needed.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -189,7 +190,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         counter(
             &mut out,
             "rsearch_bulk_received_total",
-            "Bulk batches accepted from a peer handoff.",
+            "Bulk batches accepted from a peer handoff (counted at acceptance, before local indexing).",
             forwarder.received.load(Ordering::Relaxed),
         );
     }
