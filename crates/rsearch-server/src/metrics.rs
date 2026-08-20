@@ -1,6 +1,6 @@
 //! Prometheus exposition: `GET /metrics` renders node-local ingest/WAL
-//! counters, cluster node gauges, and (on control nodes) repair/drain
-//! activity in text format 0.0.4. Hand-rolled — every value is already an
+//! and bulk-handoff counters, cluster node gauges, and (on control
+//! nodes) repair/drain activity in text format 0.0.4. Hand-rolled — every value is already an
 //! atomic or one cheap metastore query, so no metrics crate is needed.
 
 use std::fmt::Write as _;
@@ -170,6 +170,27 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             "rsearch_tombstones_purged_total",
             "Tombstone rows purged once no split could still hold a hidden version.",
             control.tombstones_purged.load(Ordering::Relaxed),
+        );
+    }
+
+    if let Some(forwarder) = &state.bulk_forward {
+        counter(
+            &mut out,
+            "rsearch_bulk_forwarded_total",
+            "Bulk batches handed off to an ingest peer for balancing.",
+            forwarder.forwarded.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_bulk_forward_fallbacks_total",
+            "Bulk handoffs that fell back to local ingest.",
+            forwarder.forward_fallbacks.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_bulk_received_total",
+            "Bulk batches accepted from a peer handoff.",
+            forwarder.received.load(Ordering::Relaxed),
         );
     }
 
