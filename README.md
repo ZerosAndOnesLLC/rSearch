@@ -158,9 +158,14 @@ Operational notes:
 - With factor 2, the window between a node dying and repair completing
   is one further failure away from data loss; size
   `repair_stale_secs` and node count accordingly.
-- A node returning after its registry entry expired may hold orphaned
-  object files (repair already replaced its copies); these are inert
-  and can be cleaned by wiping the object root before restart.
+- An hourly reconcile sweep (plus one pass at startup) keeps each node's
+  disk and the placement table honest in both directions: local files
+  the table still knows are re-announced, orphaned files whose splits
+  were deleted while the node was unreachable are removed, and placement
+  rows whose file is gone from local disk — a node restarted onto a
+  replaced or wiped data volume — are dropped so repair sees the real
+  copy count and restores the factor
+  (`rsearch_reconcile_phantom_placements_removed_total` counts these).
 - The ingest WAL stays node-local: docs acked but not yet published when
   a node dies are recovered by WAL replay when that node (or its volume)
   returns — same recovery story as the fs backend.

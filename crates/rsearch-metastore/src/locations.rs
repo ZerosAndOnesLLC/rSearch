@@ -133,6 +133,35 @@ impl Metastore {
         Ok(rows.into_iter().map(|(key,)| key).collect())
     }
 
+    /// Storage keys recorded for `node_id` whose rows are older than
+    /// `min_age_secs`, keyset-paginated: pass the last key of the previous
+    /// page as `after_key` (empty string to start). Drives the
+    /// metastore->disk reconcile verify (#44), which checks each recorded
+    /// copy against the node's actual disk; the age floor keeps rows from
+    /// any in-flight write out of the scan.
+    pub async fn stale_locations_on_node(
+        &self,
+        node_id: &str,
+        min_age_secs: f64,
+        after_key: &str,
+        limit: i64,
+    ) -> MetastoreResult<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT storage_key FROM object_locations
+             WHERE node_id = $1
+               AND storage_key > $2
+               AND created_at < now() - make_interval(secs => $3)
+             ORDER BY storage_key LIMIT $4",
+        )
+        .bind(node_id)
+        .bind(after_key)
+        .bind(min_age_secs)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(key,)| key).collect())
+    }
+
     /// Refresh interval for the per-node held-bytes totals used to rank
     /// replication targets. A few seconds of staleness only skews
     /// placement slightly; the aggregation it avoids is a full scan of

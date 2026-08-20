@@ -110,6 +110,27 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         );
     }
 
+    if let Some(reconcile) = &state.reconcile {
+        counter(
+            &mut out,
+            "rsearch_reconcile_copies_announced_total",
+            "Local object copies re-announced to the placement table by the reconcile sweep.",
+            reconcile.copies_announced.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_reconcile_orphans_swept_total",
+            "Orphaned local object files deleted by the reconcile sweep.",
+            reconcile.orphans_swept.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_reconcile_phantom_placements_removed_total",
+            "Placement rows removed because the recorded file was missing from local disk.",
+            reconcile.phantom_rows_removed.load(Ordering::Relaxed),
+        );
+    }
+
     if let Some(control) = &state.control {
         gauge(
             &mut out,

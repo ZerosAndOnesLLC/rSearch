@@ -37,6 +37,9 @@ pub struct AppState {
     /// Repair/drain/leadership counters for /metrics, shared with the
     /// control loop. Present only on nodes running the control role.
     pub control: Option<Arc<crate::metrics::ControlMetrics>>,
+    /// Reconcile sweep counters for /metrics, shared with the reconcile
+    /// loop. Present only on replicated-backend nodes.
+    pub reconcile: Option<Arc<crate::reconcile::ReconcileMetrics>>,
     /// Short-TTL cache of all stream names for wildcard resolution — an
     /// `_msearch` refresh resolves `logs-*` once per TTL instead of one
     /// `list_streams` query per header/body pair per viewer.
@@ -75,6 +78,7 @@ impl AppState {
             bulk_forward: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control: None,
+            reconcile: None,
             stream_names: Arc::new(std::sync::Mutex::new(None)),
             label_fields: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
