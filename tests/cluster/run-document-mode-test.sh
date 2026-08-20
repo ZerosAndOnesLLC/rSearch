@@ -21,6 +21,9 @@ cleanup() { [ -n "$PID" ] && kill -9 "$PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
 set -a; source .env; set +a
+# Point the node at a dedicated test database when .env's DATABASE_URL
+# is a shared dev instance (the table wipe below is destructive).
+DATABASE_URL=${RSEARCH_TEST_DATABASE_URL:-$DATABASE_URL}
 rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 psql "$DATABASE_URL" -qc "DELETE FROM streams; DELETE FROM nodes; DELETE FROM users; DELETE FROM api_keys; DELETE FROM sessions;" >/dev/null
 

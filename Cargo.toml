@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -23,12 +23,12 @@ keywords = ["search", "logging", "opensearch", "loki", "fips"]
 categories = ["database-implementations", "text-processing"]
 
 [workspace.dependencies]
-rsearch-common = { path = "crates/rsearch-common", version = "0.3.1" }
-rsearch-storage = { path = "crates/rsearch-storage", version = "0.3.1" }
-rsearch-index = { path = "crates/rsearch-index", version = "0.3.1" }
-rsearch-metastore = { path = "crates/rsearch-metastore", version = "0.3.1" }
-rsearch-ingest = { path = "crates/rsearch-ingest", version = "0.3.1" }
-rsearch-search = { path = "crates/rsearch-search", version = "0.3.1" }
+rsearch-common = { path = "crates/rsearch-common", version = "0.3.2" }
+rsearch-storage = { path = "crates/rsearch-storage", version = "0.3.2" }
+rsearch-index = { path = "crates/rsearch-index", version = "0.3.2" }
+rsearch-metastore = { path = "crates/rsearch-metastore", version = "0.3.2" }
+rsearch-ingest = { path = "crates/rsearch-ingest", version = "0.3.2" }
+rsearch-search = { path = "crates/rsearch-search", version = "0.3.2" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }

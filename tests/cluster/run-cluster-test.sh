@@ -69,9 +69,13 @@ published_splits() { # index
 
 # ---------- setup ----------
 set -a; source .env; set +a
+# Point the cluster at a dedicated test database (must be the one inside
+# the rsearch-pg container) when .env's DATABASE_URL is a shared dev
+# instance.
+DATABASE_URL=${RSEARCH_TEST_DATABASE_URL:-$DATABASE_URL}
 rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 pkill -x rsearch 2>/dev/null || true; pause 0.5
-docker exec rsearch-pg psql -U rsearch -qc "DELETE FROM splits; DELETE FROM streams; DELETE FROM nodes;" >/dev/null
+docker exec rsearch-pg psql -U rsearch -qc "DELETE FROM splits; DELETE FROM streams; DELETE FROM nodes; DELETE FROM users; DELETE FROM api_keys; DELETE FROM sessions;" >/dev/null
 docker run --rm --network host --entrypoint sh minio/mc:latest -c \
   "mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null && mc rb --force m/rsearch-cluster >/dev/null 2>&1; mc mb -p m/rsearch-cluster >/dev/null" \
   || fail "minio bucket setup"
