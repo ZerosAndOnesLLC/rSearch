@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+    let mut reconcile_metrics: Option<std::sync::Arc<reconcile::ReconcileMetrics>> = None;
     let storage: std::sync::Arc<dyn rsearch_storage::Storage> =
         if config.storage.backend == "replicated" {
             if config.cluster.internal_token.is_empty() {
@@ -122,13 +123,19 @@ async fn main() -> anyhow::Result<()> {
             // Reconcile local files with the metastore, at startup and
             // periodically: re-announce copies the placement table still
             // knows (a node rejoining after registry expiry has real
-            // copies on disk but may have lost its rows) and delete
-            // orphaned files whose splits were GC'd while this node was
-            // unreachable (#16).
+            // copies on disk but may have lost its rows), delete orphaned
+            // files whose splits were GC'd while this node was
+            // unreachable (#16), and drop placement rows whose file is
+            // gone from local disk — a replaced data volume otherwise
+            // leaves phantom rows that hide under-replication from
+            // repair (#44).
+            let rm = std::sync::Arc::new(reconcile::ReconcileMetrics::default());
+            reconcile_metrics = Some(rm.clone());
             reconcile::spawn(
                 rsearch_storage::FsStorage::new(config.storage.root.clone()),
                 metastore.clone(),
                 config.node_id(),
+                rm,
             );
             std::sync::Arc::new(rsearch_storage::ReplicatedStorage::new(
                 rsearch_storage::FsStorage::new(config.storage.root.clone()),
@@ -294,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
     state.doc_lookup = lookup;
     state.draining = draining_flag;
     state.control = control_metrics;
+    state.reconcile = reconcile_metrics;
     // Bulk handoff between ingest peers needs the cluster token both to
     // authenticate outbound handoffs and to verify inbound ones; without
     // a token the node simply indexes everything it receives itself.

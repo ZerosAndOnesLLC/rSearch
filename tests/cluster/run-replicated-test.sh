@@ -83,6 +83,9 @@ under_held() {
 
 # ---------- setup ----------
 set -a; source .env; set +a
+# Point the cluster at a dedicated test database (must be the one inside
+# $PG_CONTAINER) when .env's DATABASE_URL is a shared dev instance.
+DATABASE_URL=${RSEARCH_TEST_DATABASE_URL:-$DATABASE_URL}
 rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 pkill -x rsearch 2>/dev/null || true; pause 0.5
 docker exec "$PG_CONTAINER" psql -U rsearch -qc \
@@ -135,6 +138,49 @@ done
 grep -qh "repair: copy restored" "$LOGDIR"/node-*.log || fail "no repair logged"
 [ "$(count_docs 9313 rlogs)" = "200" ] || fail "docs lost after repair"
 say "PASS: all splits back at factor 2 on live nodes"
+
+# ---------- phantom placement rows (#44) ----------
+say "TEST: placement row for a file lost from a node's volume is removed and repaired"
+PHANTOM_KEY=$(psql_t "SELECT storage_key FROM object_locations WHERE node_id='node-3' LIMIT 1")
+[ -n "$PHANTOM_KEY" ] || fail "no placement row on node-3 to test with"
+# Simulate a replaced data volume: delete the file behind the cluster's
+# back and restart the node — the startup reconcile verify must drop the
+# now-phantom row. Rows younger than the verify age floor are skipped,
+# so backdate them (this cluster is seconds old).
+kill -9 "${PIDS[node-3]}"
+rm "$LOGDIR/node-3/objects/$PHANTOM_KEY" || fail "could not delete $PHANTOM_KEY from node-3"
+docker exec "$PG_CONTAINER" psql -U rsearch -qc \
+  "UPDATE object_locations SET created_at = created_at - interval '2 hours' WHERE node_id='node-3'" >/dev/null
+start_node node-3 9313
+wait_health 9313 || fail "node-3 did not come back"
+for i in $(seq 1 60); do
+  ROWS=$(psql_t "SELECT count(*) FROM object_locations WHERE node_id='node-3' AND storage_key='$PHANTOM_KEY'")
+  [ "$ROWS" = "0" ] && break; pause 1
+done
+[ "$ROWS" = "0" ] || fail "phantom placement row for $PHANTOM_KEY survived reconcile"
+say "phantom row removed; bouncing node-3 so the leader rescans membership"
+# The repair scan triggers on live-set changes (or a slow deadline); a
+# bounce past the 10s staleness window forces one promptly. The leader
+# only notices on a 3s control tick, so stay down long enough that a
+# tick is guaranteed to sample node-3 as stale (10s window + one tick
+# interval + margin), or the scan waits for the 300s deadline.
+kill -9 "${PIDS[node-3]}"
+pause 16
+start_node node-3 9313
+wait_health 9313 || fail "node-3 did not come back from bounce"
+# Poll the placement row, not the file: the replicate handler records
+# the row only after the file rename, so a file-based break could race
+# the under_held check below. Row implies file (file lands first).
+for i in $(seq 1 60); do
+  ROWS=$(psql_t "SELECT count(*) FROM object_locations WHERE node_id='node-3' AND storage_key='$PHANTOM_KEY'")
+  [ "$ROWS" = "1" ] && break; pause 1
+done
+[ "$ROWS" = "1" ] || fail "repair did not restore the lost copy to node-3"
+[ -f "$LOGDIR/node-3/objects/$PHANTOM_KEY" ] || fail "placement row restored but file missing on node-3"
+UNDER=$(under_held rlogs 2 "'node-2','node-3'")
+[ "$UNDER" = "0" ] || fail "$UNDER splits under-held after phantom repair"
+[ "$(count_docs 9313 rlogs)" = "200" ] || fail "docs lost after phantom repair"
+say "PASS: phantom placement row dropped and real copy restored"
 
 # ---------- graceful drain ----------
 say "TEST: drain node-2 — copies move off, reads keep working, bulk refused"

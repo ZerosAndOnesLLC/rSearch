@@ -30,26 +30,54 @@ impl Metastore {
     /// transfers — a replicate pull that outlives the leader's timeout,
     /// or a rejoining node re-announcing local files — so they can never
     /// resurrect placement for an object that was deleted cluster-wide.
-    /// Returns whether the row was recorded.
+    ///
+    /// Returns `None` when the object is unknown (nothing recorded),
+    /// `Some(true)` when a missing row was inserted, and `Some(false)`
+    /// when an existing row was merely refreshed — callers gating on
+    /// "still known" treat any `Some`, while the reconcile sweep counts
+    /// only real inserts (`xmax = 0` distinguishes an inserted row from
+    /// one rewritten by the conflict update).
     pub async fn record_object_location_if_known(
         &self,
         storage_key: &str,
         node_id: &str,
         size_bytes: i64,
-    ) -> MetastoreResult<bool> {
-        let result = sqlx::query(
+    ) -> MetastoreResult<Option<bool>> {
+        let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO object_locations (storage_key, node_id, size_bytes)
              SELECT $1, $2, $3
              WHERE EXISTS (SELECT 1 FROM object_locations WHERE storage_key = $1)
              ON CONFLICT (storage_key, node_id)
-             DO UPDATE SET size_bytes = EXCLUDED.size_bytes",
+             DO UPDATE SET size_bytes = EXCLUDED.size_bytes
+             RETURNING (xmax = 0)",
         )
         .bind(storage_key)
         .bind(node_id)
         .bind(size_bytes)
-        .execute(self.pool())
+        .fetch_optional(self.pool())
         .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(row.map(|(inserted,)| inserted))
+    }
+
+    /// Whether any node other than `node_id` has a copy record for the
+    /// object. The reconcile verify checks this before deleting a
+    /// phantom row: removing the last record means no copy is known
+    /// anywhere and the object may be lost — worth a louder signal than
+    /// an ordinary phantom cleanup.
+    pub async fn other_holders_exist(
+        &self,
+        storage_key: &str,
+        node_id: &str,
+    ) -> MetastoreResult<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM object_locations
+                            WHERE storage_key = $1 AND node_id <> $2)",
+        )
+        .bind(storage_key)
+        .bind(node_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(exists)
     }
 
     /// Whether the cluster still tracks `storage_key` at all — any
@@ -127,6 +155,35 @@ impl Metastore {
              WHERE node_id = $1 ORDER BY created_at LIMIT $2",
         )
         .bind(node_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(key,)| key).collect())
+    }
+
+    /// Storage keys recorded for `node_id` whose rows are older than
+    /// `min_age_secs`, keyset-paginated: pass the last key of the previous
+    /// page as `after_key` (empty string to start). Drives the
+    /// metastore->disk reconcile verify (#44), which checks each recorded
+    /// copy against the node's actual disk; the age floor keeps rows from
+    /// any in-flight write out of the scan.
+    pub async fn stale_locations_on_node(
+        &self,
+        node_id: &str,
+        min_age_secs: f64,
+        after_key: &str,
+        limit: i64,
+    ) -> MetastoreResult<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT storage_key FROM object_locations
+             WHERE node_id = $1
+               AND storage_key > $2
+               AND created_at < now() - make_interval(secs => $3)
+             ORDER BY storage_key LIMIT $4",
+        )
+        .bind(node_id)
+        .bind(after_key)
+        .bind(min_age_secs)
         .bind(limit)
         .fetch_all(self.pool())
         .await?;
