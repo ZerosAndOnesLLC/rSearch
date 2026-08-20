@@ -238,8 +238,8 @@ async fn replicate(
         .record_object_location_if_known(&key, &internal.node_id, size as i64)
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             let _ = internal.fs.delete(&key).await;
             warn!(key, "replicate finished for a deleted object; copy discarded");
             return (StatusCode::CONFLICT, "object no longer exists").into_response();

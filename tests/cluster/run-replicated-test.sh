@@ -150,7 +150,7 @@ PHANTOM_KEY=$(psql_t "SELECT storage_key FROM object_locations WHERE node_id='no
 kill -9 "${PIDS[node-3]}"
 rm "$LOGDIR/node-3/objects/$PHANTOM_KEY" || fail "could not delete $PHANTOM_KEY from node-3"
 docker exec "$PG_CONTAINER" psql -U rsearch -qc \
-  "UPDATE object_locations SET created_at = created_at - interval '2 hours'" >/dev/null
+  "UPDATE object_locations SET created_at = created_at - interval '2 hours' WHERE node_id='node-3'" >/dev/null
 start_node node-3 9313
 wait_health 9313 || fail "node-3 did not come back"
 for i in $(seq 1 60); do
@@ -160,15 +160,23 @@ done
 [ "$ROWS" = "0" ] || fail "phantom placement row for $PHANTOM_KEY survived reconcile"
 say "phantom row removed; bouncing node-3 so the leader rescans membership"
 # The repair scan triggers on live-set changes (or a slow deadline); a
-# quick bounce past the 10s staleness window forces one promptly.
+# bounce past the 10s staleness window forces one promptly. The leader
+# only notices on a 3s control tick, so stay down long enough that a
+# tick is guaranteed to sample node-3 as stale (10s window + one tick
+# interval + margin), or the scan waits for the 300s deadline.
 kill -9 "${PIDS[node-3]}"
-pause 12
+pause 16
 start_node node-3 9313
 wait_health 9313 || fail "node-3 did not come back from bounce"
+# Poll the placement row, not the file: the replicate handler records
+# the row only after the file rename, so a file-based break could race
+# the under_held check below. Row implies file (file lands first).
 for i in $(seq 1 60); do
-  [ -f "$LOGDIR/node-3/objects/$PHANTOM_KEY" ] && break; pause 1
+  ROWS=$(psql_t "SELECT count(*) FROM object_locations WHERE node_id='node-3' AND storage_key='$PHANTOM_KEY'")
+  [ "$ROWS" = "1" ] && break; pause 1
 done
-[ -f "$LOGDIR/node-3/objects/$PHANTOM_KEY" ] || fail "repair did not restore the lost copy to node-3"
+[ "$ROWS" = "1" ] || fail "repair did not restore the lost copy to node-3"
+[ -f "$LOGDIR/node-3/objects/$PHANTOM_KEY" ] || fail "placement row restored but file missing on node-3"
 UNDER=$(under_held rlogs 2 "'node-2','node-3'")
 [ "$UNDER" = "0" ] || fail "$UNDER splits under-held after phantom repair"
 [ "$(count_docs 9313 rlogs)" = "200" ] || fail "docs lost after phantom repair"

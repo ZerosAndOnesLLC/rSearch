@@ -36,19 +36,32 @@ use std::time::Duration;
 
 use rsearch_metastore::Metastore;
 use rsearch_storage::{FsStorage, Storage};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Reconcile activity counters for `/metrics`, present on
 /// replicated-backend nodes.
 #[derive(Default)]
 pub struct ReconcileMetrics {
-    /// Local copies re-announced to the placement table (#16).
+    /// Placement rows inserted for local files the table had lost track
+    /// of (#16). Counts real inserts only — the sweep's refresh of rows
+    /// that already exist is not an announce.
     pub copies_announced: AtomicU64,
     /// Orphaned local object files deleted (#16).
     pub orphans_swept: AtomicU64,
     /// Placement rows removed because the recorded file was gone (#44).
     pub phantom_rows_removed: AtomicU64,
+    /// Phantom rows removed that were the object's last recorded copy:
+    /// no node holds it any more and the object may be lost. Deleting
+    /// the row is still right — it was a lie — but where the row's mere
+    /// disappearance would silence the repair job's recurring "no live
+    /// holder" alarm, this counter keeps the loss visible.
+    pub last_copy_rows_removed: AtomicU64,
 }
+
+/// Per-key log lines emitted at warn before a verify pass drops to
+/// debug: a replaced multi-TB volume removes rows by the million, and a
+/// sick disk can fail every stat call — the summary carries the totals.
+const VERIFY_LOG_CAP: u64 = 20;
 
 /// Never sweep a file younger than this: a freshly transferred object's
 /// placement row lands moments after the file, and peer transfers time
@@ -74,26 +87,32 @@ pub fn spawn(
 ) {
     tokio::spawn(async move {
         loop {
-            reconcile(&fs, &metastore, &node_id, &metrics).await;
-            verify_placements(&fs, &metastore, &node_id, &metrics).await;
+            if let Some(files_on_disk) = reconcile(&fs, &metastore, &node_id, &metrics).await {
+                verify_placements(&fs, &metastore, &node_id, &metrics, files_on_disk).await;
+            }
             tokio::time::sleep(RECONCILE_INTERVAL).await;
         }
     });
 }
 
+/// Disk->metastore direction. Returns the number of local object files
+/// seen, or `None` when the root could not be listed — the verify pass
+/// is skipped in that case, since an unreadable root says nothing about
+/// which files are truly gone.
 async fn reconcile(
     fs: &FsStorage,
     metastore: &Metastore,
     node_id: &str,
     metrics: &ReconcileMetrics,
-) {
+) -> Option<u64> {
     let keys = match fs.list("").await {
         Ok(keys) => keys,
         Err(e) => {
             warn!(error = %e, "reconcile: listing local objects failed");
-            return;
+            return None;
         }
     };
+    let files_on_disk = keys.len() as u64;
     let mut announced = 0u64;
     let mut swept = 0u64;
     let mut swept_bytes = 0u64;
@@ -103,8 +122,10 @@ async fn reconcile(
             .record_object_location_if_known(&key, node_id, size as i64)
             .await
         {
-            Ok(true) => announced += 1,
-            Ok(false) => {
+            Ok(Some(true)) => announced += 1,
+            // Row already existed; the refresh is not an announce.
+            Ok(Some(false)) => {}
+            Ok(None) => {
                 if sweep_orphan(fs, metastore, node_id, &key, size).await {
                     swept += 1;
                     swept_bytes += size;
@@ -121,6 +142,7 @@ async fn reconcile(
     if swept > 0 {
         info!(swept, swept_bytes, "reconcile: deleted orphaned local objects");
     }
+    Some(files_on_disk)
 }
 
 /// Metastore->disk direction (#44): delete this node's placement rows
@@ -134,9 +156,13 @@ async fn verify_placements(
     metastore: &Metastore,
     node_id: &str,
     metrics: &ReconcileMetrics,
+    files_on_disk: u64,
 ) {
     let mut after = String::new();
     let mut removed = 0u64;
+    let mut last_copies = 0u64;
+    let mut kept_sole = 0u64;
+    let mut check_errors = 0u64;
     loop {
         let keys = match metastore
             .stale_locations_on_node(
@@ -158,14 +184,59 @@ async fn verify_placements(
         for key in &keys {
             match fs.exists(key).await {
                 Ok(true) => {}
-                Ok(false) => match metastore.remove_object_location(key, node_id).await {
-                    Ok(()) => {
-                        removed += 1;
-                        warn!(key, "reconcile: removed phantom placement row (file not on disk)");
+                Ok(false) => {
+                    // The row is a lie either way, but losing the last
+                    // record means no copy is known anywhere — say so
+                    // loudly, because deleting the row also retires the
+                    // repair job's recurring "no live holder" alarm.
+                    let sole = !metastore
+                        .other_holders_exist(key, node_id)
+                        .await
+                        .unwrap_or(true);
+                    // A sole row on an *empty* object root is ambiguous:
+                    // a replaced volume (the row is phantom, the object
+                    // lost) looks identical to one that hasn't mounted
+                    // yet (the row is the last true record, deliberately
+                    // preserved by dead-node expiry so a returning
+                    // volume can revive placement). Keep it and keep
+                    // shouting; rows with other holders are safe to
+                    // clean either way — repair re-copies them.
+                    if sole && files_on_disk == 0 {
+                        kept_sole += 1;
+                        error!(
+                            key,
+                            "reconcile: sole placement row for a missing file on an \
+                             empty object root — volume may be unmounted; keeping row"
+                        );
+                        continue;
                     }
-                    Err(e) => warn!(key, error = %e, "reconcile: phantom row delete failed"),
-                },
-                Err(e) => warn!(key, error = %e, "reconcile: disk check failed; keeping row"),
+                    match metastore.remove_object_location(key, node_id).await {
+                        Ok(()) => {
+                            removed += 1;
+                            if sole {
+                                last_copies += 1;
+                                error!(
+                                    key,
+                                    "reconcile: removed last placement row for an object \
+                                     with no file on disk — object may be lost"
+                                );
+                            } else if removed <= VERIFY_LOG_CAP {
+                                warn!(key, "reconcile: removed phantom placement row (file not on disk)");
+                            } else {
+                                debug!(key, "reconcile: removed phantom placement row (file not on disk)");
+                            }
+                        }
+                        Err(e) => warn!(key, error = %e, "reconcile: phantom row delete failed"),
+                    }
+                }
+                Err(e) => {
+                    check_errors += 1;
+                    if check_errors <= VERIFY_LOG_CAP {
+                        warn!(key, error = %e, "reconcile: disk check failed; keeping row");
+                    } else {
+                        debug!(key, error = %e, "reconcile: disk check failed; keeping row");
+                    }
+                }
             }
         }
         if keys.len() < VERIFY_BATCH as usize {
@@ -173,10 +244,14 @@ async fn verify_placements(
         }
     }
     metrics.phantom_rows_removed.fetch_add(removed, Ordering::Relaxed);
-    if removed > 0 {
+    metrics.last_copy_rows_removed.fetch_add(last_copies, Ordering::Relaxed);
+    if removed > 0 || kept_sole > 0 || check_errors > 0 {
         info!(
             removed,
-            "reconcile: removed placement rows for files missing from local disk"
+            last_copies,
+            kept_sole,
+            check_errors,
+            "reconcile: placement verify pass finished"
         );
     }
 }

@@ -166,6 +166,16 @@ Operational notes:
   replaced or wiped data volume — are dropped so repair sees the real
   copy count and restores the factor
   (`rsearch_reconcile_phantom_placements_removed_total` counts these).
+  Alert on `rsearch_reconcile_last_copy_placements_removed_total`: it
+  counts phantom rows that were an object's *last* recorded copy, i.e.
+  data that is likely lost — once the row is gone the repair job has
+  nothing left to warn about, so this counter (and a per-key error log)
+  is the durable signal. One deliberate exception: a sole-copy row on a
+  node whose object root is *empty* is kept, not deleted — an unmounted
+  volume looks identical to a replaced one, and that row may be the last
+  true record (dead-node expiry preserves it for the same reason); it is
+  error-logged every sweep until the volume returns or an operator
+  intervenes.
 - The ingest WAL stays node-local: docs acked but not yet published when
   a node dies are recovered by WAL replay when that node (or its volume)
   returns — same recovery story as the fs backend.
