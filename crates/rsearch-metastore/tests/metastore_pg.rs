@@ -390,3 +390,51 @@ async fn tombstones_upsert_and_page_by_seq() {
     assert!(remaining(&ms, stream.id).await.is_empty());
     ms.delete_stream(&stream.name).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn stray_object_keys_finds_placements_without_split_rows() {
+    let Some(ms) = metastore().await else { return };
+    let stream = ms.ensure_stream(&unique("stray")).await.unwrap();
+
+    // Tracked: placement rows plus a split row (any state protects it).
+    let tracked_key = format!("streams/test/{}.split", unique("tracked"));
+    let split_id = unique("split");
+    ms.stage_split(&NewSplit {
+        split_id: &split_id,
+        stream_id: stream.id,
+        storage_key: &tracked_key,
+        doc_count: 1,
+        size_bytes: 10,
+        time_start_millis: 0,
+        time_end_millis: 0,
+        footer_len: 0,
+        created_by: None,
+        seq_min: None,
+        seq_max: None,
+        tombstone_seq_applied: 0,
+    })
+    .await
+    .unwrap();
+    ms.record_object_location(&tracked_key, "stray-node-a", 10).await.unwrap();
+
+    // Stray: placement rows on two nodes, no split row — the crash
+    // window between the storage put and the split-row insert (#50).
+    let stray_key = format!("streams/test/{}.split", unique("stray"));
+    ms.record_object_location(&stray_key, "stray-node-a", 10).await.unwrap();
+    ms.record_object_location(&stray_key, "stray-node-b", 10).await.unwrap();
+
+    let strays = ms.stray_object_keys(0.0, 10_000).await.unwrap();
+    assert!(strays.contains(&stray_key));
+    assert!(!strays.contains(&tracked_key));
+    // Distinct keys: two placement rows surface the key once.
+    assert_eq!(strays.iter().filter(|k| *k == &stray_key).count(), 1);
+
+    // The age floor keeps fresh put->stage windows out of the sweep.
+    let fresh = ms.stray_object_keys(3600.0, 10_000).await.unwrap();
+    assert!(!fresh.contains(&stray_key));
+
+    ms.remove_object_locations(&stray_key).await.unwrap();
+    ms.remove_object_locations(&tracked_key).await.unwrap();
+    ms.delete_stream(&stream.name).await.unwrap();
+}

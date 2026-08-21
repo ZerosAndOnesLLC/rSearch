@@ -185,6 +185,12 @@ impl ControlPlane {
         if let Err(e) = self.staged_orphan_job().await {
             error!(error = %e, "staged-orphan sweep failed");
         }
+        // Needs the settled membership view: with peers' heartbeat rows
+        // still stale, every remote copy would be skipped and needlessly
+        // orphaned on its node.
+        if settled && let Err(e) = self.stray_object_job().await {
+            error!(error = %e, "stray-object sweep failed");
+        }
         if let Err(e) = self.gc_job().await {
             error!(error = %e, "gc job failed");
         }
@@ -570,12 +576,14 @@ impl ControlPlane {
         }
     }
 
-    /// Combine the first group of >= 2 small published splits in one
-    /// stream into a single split. One merge per tick bounds the work.
+    /// Combine the first group of >= 2 published splits below the merge
+    /// target in one stream into a single split. One merge per tick
+    /// bounds the work.
     async fn merge_job(&self) -> anyhow::Result<()> {
+        let target_bytes = self.merge_target_bytes();
         let small = self
             .metastore
-            .small_published_splits(self.config.merge_min_mb << 20, 200)
+            .small_published_splits(target_bytes, 200)
             .await?;
         let mut by_stream: BTreeMap<i64, Vec<&SplitRecord>> = BTreeMap::new();
         for split in &small {
@@ -585,10 +593,8 @@ impl ControlPlane {
             .into_iter()
             .find_map(|(id, group)| {
                 let group = merge_candidates(group);
-                (group.len() >= 2).then(|| {
-                    let take = group.len().min(self.config.merge_max_group);
-                    (id, group[..take].to_vec())
-                })
+                let take = merge_take(&group, target_bytes, self.config.merge_max_group);
+                (take >= 2).then(|| (id, group[..take].to_vec()))
             })
         else {
             return Ok(());
@@ -938,6 +944,47 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Merged splits aim for this size; splits at or above it are never
+    /// merge candidates (#49). `merge_min_mb` is the deprecated older
+    /// name for the ceiling — the max keeps configs that raised it
+    /// behaving as before.
+    fn merge_target_bytes(&self) -> i64 {
+        self.config.merge_target_mb.max(self.config.merge_min_mb) << 20
+    }
+
+    /// Delete objects whose placement rows outlived their split row
+    /// (#50). A crash between the storage put and the split-row insert —
+    /// or a partial cluster delete — leaves `object_locations` rows and
+    /// real files that nothing else collects: GC walks `splits`, and the
+    /// node-local reconcile sweep skips any key that still has a
+    /// placement row, so the row pins the file and the file pins the
+    /// row. The storage delete drops peer copies, the local file, and
+    /// every placement row; copies on currently-dead nodes become plain
+    /// orphans their own reconcile sweep removes after its grace.
+    /// Replicated backend only; `staged_orphan_secs` doubles as the age
+    /// floor since it already bounds the same crashed-flush window.
+    async fn stray_object_job(&self) -> anyhow::Result<()> {
+        if self.replication.is_none() {
+            return Ok(());
+        }
+        let strays = self
+            .metastore
+            .stray_object_keys(self.config.staged_orphan_secs, 50)
+            .await?;
+        for key in strays {
+            match self.storage.delete(&key).await {
+                Ok(()) => {
+                    self.metrics
+                        .stray_objects_deleted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!(key, "stray sweep: deleted object whose placement rows had no split row");
+                }
+                Err(e) => warn!(key, error = %e, "stray sweep: delete failed"),
+            }
+        }
+        Ok(())
+    }
+
     async fn gc_job(&self) -> anyhow::Result<()> {
         let candidates = self
             .metastore
@@ -962,9 +1009,9 @@ const MERGE_SKEW_FACTOR: i64 = 10;
 
 /// Drop dominant splits from a stream's merge group (#15). Merging is a
 /// full rewrite of every source, so folding a trickle of tiny splits into
-/// one dominant under-threshold split re-wrote its bytes every tick —
+/// one dominant under-target split re-wrote its bytes every tick —
 /// quadratic write amplification (plus re-replication, GC churn, and
-/// cache pressure) until it finally crossed `merge_min_mb`. Excluding a
+/// cache pressure) until it finally crossed the merge target. Excluding a
 /// split that is more than [`MERGE_SKEW_FACTOR`]× the sum of its smaller
 /// peers lets the small splits merge among themselves; the dominant one
 /// rejoins once they have accumulated to comparable size, so each byte is
@@ -997,6 +1044,24 @@ fn merge_candidates(group: Vec<&SplitRecord>) -> Vec<&SplitRecord> {
         .into_iter()
         .filter(|s| s.size_bytes < threshold)
         .collect()
+}
+
+/// How many leading (time-ordered) splits of a stream's merge group to
+/// combine: enough for the output to reach `target_bytes` — the crossing
+/// split is included, so the result lands at or above the target and is
+/// immediately ineligible for further merging (#49) — capped at
+/// `max_group`. A group that can't reach the target merges whole; the
+/// skew filter above already keeps such prompt merges from re-writing a
+/// dominant split every tick.
+fn merge_take(group: &[&SplitRecord], target_bytes: i64, max_group: usize) -> usize {
+    let mut sum = 0i64;
+    for (i, split) in group.iter().take(max_group).enumerate() {
+        sum = sum.saturating_add(split.size_bytes);
+        if sum >= target_bytes {
+            return i + 1;
+        }
+    }
+    group.len().min(max_group)
 }
 
 #[cfg(test)]
@@ -1076,5 +1141,42 @@ mod tests {
         // check is what keeps it from merging with itself.
         let splits = [split(1, 1 << 20)];
         assert_eq!(candidate_ids(&splits), vec![1]);
+    }
+
+    fn take_of(splits: &[SplitRecord], target_mb: i64, max_group: usize) -> usize {
+        let group: Vec<&SplitRecord> = splits.iter().collect();
+        merge_take(&group, target_mb << 20, max_group)
+    }
+
+    #[test]
+    fn take_stops_at_the_split_that_crosses_the_target() {
+        // The #49 shape: flushes born just under the target keep merging.
+        // 60 + 60 + 60 crosses 150 at the third split; the fourth waits.
+        let splits: Vec<SplitRecord> =
+            (1..=4).map(|id| split(id, 60 << 20)).collect();
+        assert_eq!(take_of(&splits, 150, 8), 3);
+    }
+
+    #[test]
+    fn take_is_capped_at_max_group() {
+        let splits: Vec<SplitRecord> =
+            (1..=20).map(|id| split(id, 1 << 20)).collect();
+        assert_eq!(take_of(&splits, 512, 8), 8);
+    }
+
+    #[test]
+    fn group_below_target_merges_whole() {
+        // Tiny trickle streams still merge promptly instead of waiting to
+        // accumulate a full target's worth.
+        let splits = [split(1, 2 << 20), split(2, 3 << 20)];
+        assert_eq!(take_of(&splits, 512, 8), 2);
+    }
+
+    #[test]
+    fn lone_crossing_split_is_not_a_group() {
+        // A single split at the target is take=1; the caller's >= 2 check
+        // leaves it alone.
+        let splits = [split(1, 600 << 20)];
+        assert_eq!(take_of(&splits, 512, 8), 1);
     }
 }

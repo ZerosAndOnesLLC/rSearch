@@ -134,7 +134,15 @@ impl Default for GelfInputConfig {
 pub struct ControlConfig {
     /// Seconds between control-job ticks on the leader.
     pub interval_secs: u64,
-    /// Published splits smaller than this are merge candidates (MB).
+    /// Merged splits aim for this size (MB): published splits smaller
+    /// than this are merge candidates, and a merge group is cut once its
+    /// combined size crosses it, so the output is immediately ineligible
+    /// for further merging (#49). Splits at or above it are left alone.
+    pub merge_target_mb: i64,
+    /// Deprecated older name for the merge-candidate ceiling. The
+    /// effective target is `max(merge_target_mb, merge_min_mb)`, so a
+    /// config that raised this keeps its behavior; prefer
+    /// `merge_target_mb`.
     pub merge_min_mb: i64,
     /// Max splits combined per merge operation.
     pub merge_max_group: usize,
@@ -179,6 +187,7 @@ impl Default for ControlConfig {
     fn default() -> Self {
         Self {
             interval_secs: 15,
+            merge_target_mb: 512,
             merge_min_mb: 100,
             merge_max_group: 8,
             gc_grace_secs: 600.0,

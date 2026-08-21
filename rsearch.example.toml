@@ -83,7 +83,7 @@ cache_max_mb = 4096      # local split-fragment cache budget
 
 [control]
 interval_secs = 15          # background-job tick on the elected leader
-merge_min_mb = 100          # published splits smaller than this get merged
+merge_target_mb = 512       # splits below this keep merging until the output reaches it
 merge_max_group = 8         # max splits combined per merge
 gc_grace_secs = 600         # delay before deleting marked-for-delete splits
 staged_orphan_secs = 3600   # sweep splits stuck in 'staged' after a crash
