@@ -97,6 +97,35 @@ impl Metastore {
         Ok(known)
     }
 
+    /// Distinct keys that have placement rows but no `splits` row of any
+    /// state (#50): a crash between the storage put and the split-row
+    /// insert — or a partial cluster delete — leaves rows and files that
+    /// no other collector visits. GC walks `splits`, and the node-local
+    /// reconcile sweep skips any key that still has a placement row, so
+    /// the row keeps the file alive and the file keeps the row alive.
+    /// Keys whose newest row is younger than `min_age_secs` are skipped:
+    /// a fresh flush lands its placement rows moments before staging the
+    /// split row.
+    pub async fn stray_object_keys(
+        &self,
+        min_age_secs: f64,
+        limit: i64,
+    ) -> MetastoreResult<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT ol.storage_key FROM object_locations ol
+             WHERE NOT EXISTS (SELECT 1 FROM splits s WHERE s.storage_key = ol.storage_key)
+             GROUP BY ol.storage_key
+             HAVING MAX(ol.created_at) < now() - make_interval(secs => $1)
+             ORDER BY ol.storage_key
+             LIMIT $2",
+        )
+        .bind(min_age_secs)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(key,)| key).collect())
+    }
+
     /// Remove one node's copy record for an object.
     pub async fn remove_object_location(
         &self,

@@ -35,6 +35,8 @@ pub struct ControlMetrics {
     pub tombstones_purged: AtomicU64,
     /// Tombstone rows pending (as of the last compaction scan).
     pub tombstones_pending: AtomicU64,
+    /// Objects deleted because their placement rows had no split row (#50).
+    pub stray_objects_deleted: AtomicU64,
 }
 
 fn counter(out: &mut String, name: &str, help: &str, value: u64) {
@@ -198,6 +200,12 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             "rsearch_tombstones_purged_total",
             "Tombstone rows purged once no split could still hold a hidden version.",
             control.tombstones_purged.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_stray_objects_deleted_total",
+            "Objects deleted by the stray sweep: placement rows with no split row.",
+            control.stray_objects_deleted.load(Ordering::Relaxed),
         );
     }
 
