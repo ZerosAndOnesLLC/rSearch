@@ -283,6 +283,7 @@ pub fn translate_query(
         "ids" => translate_ids(schema, body),
         "range" => translate_range(schema, body),
         "prefix" => translate_prefix(schema, body),
+        "wildcard" => translate_wildcard(schema, body),
         "exists" => translate_exists(schema, body),
         "match" => translate_match(index, schema, body, false),
         "match_phrase" => translate_match(index, schema, body, true),
@@ -293,7 +294,7 @@ pub fn translate_query(
         "simple_query_string" => translate_query_string(index, schema, body, dynamic_paths),
         other => Err(SearchError::BadRequest(format!(
             "unsupported query type '{other}' (supported: match_all, bool, term, terms, \
-             ids, range, prefix, exists, match, match_phrase, query_string, \
+             ids, range, prefix, wildcard, exists, match, match_phrase, query_string, \
              simple_query_string)"
         ))),
     }
@@ -622,6 +623,99 @@ fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn
     Ok(Box::new(FuzzyTermQuery::new_prefix(term, 0, false)))
 }
 
+/// Append `c` to a regex pattern as a literal, escaping regex metachars.
+fn push_regex_literal(out: &mut String, c: char) {
+    if matches!(
+        c,
+        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+    ) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// An ES wildcard value as an (anchored) regex body: `*` matches any run
+/// of characters, `?` exactly one, everything else literally.
+fn wildcard_regex_body(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    for c in value.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            c => push_regex_literal(&mut out, c),
+        }
+    }
+    out
+}
+
+/// `{"wildcard": {"field": {"value": "*ab*"}}}` (or the `{"field": "*ab*"}`
+/// shorthand) — documents with an indexed term matching the pattern:
+/// `*` any run of characters, `?` exactly one (issue #53). Executed the
+/// way Elasticsearch/OpenSearch executes it: a regex automaton
+/// intersected with the term dictionary. A trailing-only wildcard prunes
+/// its walk via the literal prefix; a leading wildcard (the iWorldreg
+/// `contains` operators) has no prefix to anchor on, so its cost is a
+/// walk of the field's term dictionary per split — the same cost profile
+/// as ES. As with `prefix`, the value is not analyzed: on `text` fields
+/// and `_dynamic` paths it must match the indexed (lowercased) tokens.
+fn translate_wildcard(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| SearchError::BadRequest("wildcard body must be an object".into()))?;
+    let (name, spec) = obj
+        .iter()
+        .find(|(k, _)| *k != "boost")
+        .ok_or_else(|| SearchError::BadRequest("wildcard query needs a field".into()))?;
+    if spec
+        .get("case_insensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(SearchError::BadRequest(
+            "wildcard 'case_insensitive' is not supported".into(),
+        ));
+    }
+    // `value` is current ES; `wildcard` is the pre-7.x spelling. `boost`
+    // and the execution hint `rewrite` are accepted and ignored, as with
+    // the other term-level queries.
+    let value = spec.get("value").or_else(|| spec.get("wildcard")).unwrap_or(spec);
+    let text = value
+        .as_str()
+        .ok_or_else(|| SearchError::BadRequest("wildcard value must be a string".into()))?;
+
+    // `(?s)` so `*`/`?` cross newlines inside keyword terms, as in ES;
+    // the fst regex is anchored to the whole term dictionary key.
+    let mut pattern = String::from("(?s)");
+    let field = match resolve(schema, name) {
+        Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => field,
+        Resolved::Typed(..) | Resolved::Timestamp(_) => {
+            return Err(SearchError::BadRequest(format!(
+                "wildcard query requires a string field, '{name}' is not"
+            )));
+        }
+        // Unmapped fields: `_dynamic` term-dictionary keys are the JSON
+        // path, an end-of-path marker, a type byte, then the value — the
+        // same layout Tantivy's own fuzzy query matches against — so the
+        // pattern carries that prefix literally and only this path's
+        // string terms can match.
+        Resolved::Dynamic(field, path) => {
+            let mut term = Term::from_field_json_path(field, &path, false);
+            term.append_type_and_str("");
+            let prefix = std::str::from_utf8(term.serialized_value_bytes()).map_err(|_| {
+                SearchError::BadRequest(format!("field '{name}' is not valid UTF-8"))
+            })?;
+            for c in prefix.chars() {
+                push_regex_literal(&mut pattern, c);
+            }
+            field
+        }
+    };
+    pattern.push_str(&wildcard_regex_body(text));
+    let query = RegexQuery::from_pattern(&pattern, field)
+        .map_err(|e| SearchError::BadRequest(format!("invalid wildcard pattern: {e}")))?;
+    Ok(Box::new(query))
+}
+
 fn translate_exists(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
     let name = body
         .get("field")
@@ -913,6 +1007,8 @@ mod tests {
             serde_json::json!({"range": {"@timestamp": {"gte": "2026-07-24T00:00:00Z", "lte": "now"}}}),
             serde_json::json!({"prefix": {"service": {"value": "ap"}}}),
             serde_json::json!({"prefix": {"service": "ap"}}),
+            serde_json::json!({"wildcard": {"service": {"value": "*p*"}}}),
+            serde_json::json!({"wildcard": {"service": "a?i"}}),
             serde_json::json!({"exists": {"field": "service"}}),
             serde_json::json!({"match": {"message": "user login"}}),
             serde_json::json!({"match": {"message": {"query": "user login", "operator": "and"}}}),
@@ -1136,6 +1232,92 @@ mod tests {
             hits(&serde_json::json!({"bool": {"must_not": [{"prefix": {"service": "ap"}}]}})),
             1
         );
+    }
+
+    /// Issue #53: `wildcard` implements the six iWorldreg "contains"
+    /// operators — `*value*` shapes on keyword, text, and dynamic fields.
+    #[test]
+    fn wildcard_query_matches_terms() {
+        // Keyword field: "api" ×2, "worker" ×1.
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": {"value": "*ork*"}}})), 1);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "a*i"}})), 2);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "?pi"}})), 2);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "w?rker"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "*"}})), 3);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "*xyz*"}})), 0);
+        // A plain value with no wildcard is an exact term match.
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "api"}})), 2);
+        // Pre-7.x spelling; boost tolerated.
+        assert_eq!(
+            hits(&serde_json::json!({"wildcard": {"service": {"wildcard": "*ork*", "boost": 2.0}}})),
+            1
+        );
+        // Text field: matches indexed (lowercased) tokens.
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"message": "*ovel*"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"message": "*abbag*"}})), 1);
+        // Unmapped (dynamic) field.
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"name": "*ovel*"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"name": "*obod*"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"name": "*zz*"}})), 0);
+        // Regex metachars in the value are literal, not regex syntax.
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "a.i"}})), 0);
+        assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "*(api)*"}})), 0);
+        // The must_not shape (the iWorldreg "not_contain" operator).
+        assert_eq!(
+            hits(&serde_json::json!({"bool": {"must_not": [{"wildcard": {"service": "*p*"}}]}})),
+            1
+        );
+    }
+
+    /// A wildcard on one `_dynamic` path must not leak matches from a
+    /// sibling path sharing the same Tantivy field.
+    #[test]
+    fn wildcard_dynamic_path_is_isolated() {
+        use rsearch_index::DocumentConverter;
+        use tantivy::collector::Count;
+        let s = MappedSchema::build(rsearch_index::IndexMapping::default());
+        let idx = index(&s);
+        let converter = DocumentConverter::new(s.clone());
+        let mut writer = idx.writer_with_num_threads(1, 20 << 20).unwrap();
+        for doc in [
+            serde_json::json!({"tag": "alpha", "note": "gamma"}),
+            serde_json::json!({"tag": "beta", "note": "alphabet"}),
+        ] {
+            let (doc, _) = converter
+                .convert(doc, tantivy::DateTime::from_timestamp_millis(0))
+                .unwrap();
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = idx.reader().unwrap().searcher();
+        let count = |query: &serde_json::Value| {
+            let q = translate_query(&idx, &s, query, &paths_of(&idx, &s))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            searcher.search(&q, &Count).unwrap()
+        };
+        // "alph" appears under tag in doc 1 and under note in doc 2 —
+        // each path only sees its own terms.
+        assert_eq!(count(&serde_json::json!({"wildcard": {"tag": "*alph*"}})), 1);
+        assert_eq!(count(&serde_json::json!({"wildcard": {"note": "*alph*"}})), 1);
+        assert_eq!(count(&serde_json::json!({"wildcard": {"note": "*amm*"}})), 1);
+        assert_eq!(count(&serde_json::json!({"wildcard": {"tag": "*amm*"}})), 0);
+        // A path no document has matches nothing.
+        assert_eq!(count(&serde_json::json!({"wildcard": {"missing": "*a*"}})), 0);
+    }
+
+    #[test]
+    fn wildcard_query_rejects_non_string_fields_and_case_insensitive() {
+        let s = schema();
+        let idx = index(&s);
+        for query in [
+            serde_json::json!({"wildcard": {"status": "*4*"}}),
+            serde_json::json!({"wildcard": {"@timestamp": "*2026*"}}),
+            serde_json::json!({"wildcard": {"service": 5}}),
+            serde_json::json!({"wildcard": {"service": {"value": "*a*", "case_insensitive": true}}}),
+        ] {
+            let err = translate_query(&idx, &s, &query, &paths_of(&idx, &s)).unwrap_err();
+            assert!(matches!(err, SearchError::BadRequest(_)), "query {query}: {err}");
+        }
     }
 
     #[test]
