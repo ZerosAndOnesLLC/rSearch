@@ -219,7 +219,7 @@ and IMDS are never touched.
 | Observability | `GET /metrics` (Prometheus), `GET /_rsearch/stats` (JSON) |
 
 Query DSL subset: `match_all`, `bool`, `term`, `terms`, `ids`, `range`,
-`exists`, `match`, `match_phrase`, `query_string`, `simple_query_string`
+`prefix`, `exists`, `match`, `match_phrase`, `query_string`, `simple_query_string`
 (the same lenient parser — a typo never 400s; `fields` with `^boost`,
 `default_field`, and `default_operator` are honored — OR by default as in
 Elasticsearch/OpenSearch, `"and"` to require every term; `flags` is

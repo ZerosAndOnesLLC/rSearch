@@ -9,8 +9,8 @@ use std::ops::Bound;
 
 use serde_json::Value;
 use tantivy::query::{
-    AllQuery, BooleanQuery, ExistsQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery,
-    TermQuery,
+    AllQuery, BooleanQuery, ExistsQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
+    RangeQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Term};
 use tantivy::time::OffsetDateTime;
@@ -282,6 +282,7 @@ pub fn translate_query(
         "terms" => translate_terms(schema, body),
         "ids" => translate_ids(schema, body),
         "range" => translate_range(schema, body),
+        "prefix" => translate_prefix(schema, body),
         "exists" => translate_exists(schema, body),
         "match" => translate_match(index, schema, body, false),
         "match_phrase" => translate_match(index, schema, body, true),
@@ -292,7 +293,8 @@ pub fn translate_query(
         "simple_query_string" => translate_query_string(index, schema, body, dynamic_paths),
         other => Err(SearchError::BadRequest(format!(
             "unsupported query type '{other}' (supported: match_all, bool, term, terms, \
-             ids, range, exists, match, match_phrase, query_string, simple_query_string)"
+             ids, range, prefix, exists, match, match_phrase, query_string, \
+             simple_query_string)"
         ))),
     }
 }
@@ -512,6 +514,52 @@ fn translate_range(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn 
         }
     }
     Ok(Box::new(RangeQuery::new(lower, upper)))
+}
+
+/// `{"prefix": {"field": {"value": "ab"}}}` (or the `{"field": "ab"}`
+/// shorthand) — documents with an indexed term starting with the value.
+/// Runs a distance-0 prefix DFA against the term dictionary, so only the
+/// dictionary range sharing the prefix is visited (issue #54). As in ES,
+/// the value is not analyzed: on `text` fields (and `_dynamic` paths) it
+/// must match the indexed tokens, which the default tokenizer lowercases.
+fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| SearchError::BadRequest("prefix body must be an object".into()))?;
+    let (name, spec) = obj
+        .iter()
+        .find(|(k, _)| *k != "boost")
+        .ok_or_else(|| SearchError::BadRequest("prefix query needs a field".into()))?;
+    if spec
+        .get("case_insensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(SearchError::BadRequest(
+            "prefix 'case_insensitive' is not supported".into(),
+        ));
+    }
+    // `value` is current ES; `prefix` is the pre-7.x spelling.
+    let value = spec.get("value").or_else(|| spec.get("prefix")).unwrap_or(spec);
+    let text = value
+        .as_str()
+        .ok_or_else(|| SearchError::BadRequest("prefix value must be a string".into()))?;
+    let term = match resolve(schema, name) {
+        Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => {
+            Term::from_field_text(field, text)
+        }
+        Resolved::Typed(..) | Resolved::Timestamp(_) => {
+            return Err(SearchError::BadRequest(format!(
+                "prefix query requires a string field, '{name}' is not"
+            )));
+        }
+        Resolved::Dynamic(field, path) => {
+            let mut term = Term::from_field_json_path(field, &path, false);
+            term.append_type_and_str(text);
+            term
+        }
+    };
+    Ok(Box::new(FuzzyTermQuery::new_prefix(term, 0, false)))
 }
 
 fn translate_exists(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
@@ -803,6 +851,8 @@ mod tests {
             serde_json::json!({"terms": {"status": [200, 500]}}),
             serde_json::json!({"range": {"status": {"gte": 400}}}),
             serde_json::json!({"range": {"@timestamp": {"gte": "2026-07-24T00:00:00Z", "lte": "now"}}}),
+            serde_json::json!({"prefix": {"service": {"value": "ap"}}}),
+            serde_json::json!({"prefix": {"service": "ap"}}),
             serde_json::json!({"exists": {"field": "service"}}),
             serde_json::json!({"match": {"message": "user login"}}),
             serde_json::json!({"match": {"message": {"query": "user login", "operator": "and"}}}),
@@ -976,6 +1026,53 @@ mod tests {
             count(&serde_json::json!({"simple_query_string": {"query": "jobs"}})),
             1
         );
+    }
+
+    /// Issue #54: `prefix` maps the iWorldreg "starts with" operator onto
+    /// the term dictionary — keyword, text, and unmapped (dynamic) fields.
+    #[test]
+    fn prefix_query_matches_term_starts() {
+        // Keyword field ("api" ×2, "worker" ×1): raw terms, case kept.
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": {"value": "ap"}}})), 2);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": "work"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": "api"}})), 2);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": "apix"}})), 0);
+        // Pre-7.x spelling.
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": {"prefix": "ap"}}})), 2);
+        // Text field: matches against the indexed (lowercased) tokens.
+        assert_eq!(hits(&serde_json::json!({"prefix": {"message": "babb"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"message": "lovel"}})), 1);
+        // Unmapped field ("Ada"/"Lovelace"/"Nobody" in _dynamic, tokenized
+        // lowercase by the default analyzer).
+        assert_eq!(hits(&serde_json::json!({"prefix": {"name": "lovel"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"name": "nob"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"name": "zz"}})), 0);
+        // Empty prefix: every doc with a term in the field (ES parity).
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": ""}})), 3);
+        // Inside a bool must_not (the iWorldreg "not_contain" shape).
+        assert_eq!(
+            hits(&serde_json::json!({"bool": {"must_not": [{"prefix": {"service": "ap"}}]}})),
+            1
+        );
+    }
+
+    #[test]
+    fn prefix_query_rejects_non_string_fields_and_case_insensitive() {
+        let s = schema();
+        let idx = index(&s);
+        for query in [
+            // Numeric mapped field.
+            serde_json::json!({"prefix": {"status": "4"}}),
+            // Timestamp.
+            serde_json::json!({"prefix": {"@timestamp": "2026"}}),
+            // Non-string value.
+            serde_json::json!({"prefix": {"service": 5}}),
+            // Unsupported param must fail loudly, not silently differ.
+            serde_json::json!({"prefix": {"service": {"value": "a", "case_insensitive": true}}}),
+        ] {
+            let err = translate_query(&idx, &s, &query, &paths_of(&idx, &s)).unwrap_err();
+            assert!(matches!(err, SearchError::BadRequest(_)), "query {query}: {err}");
+        }
     }
 
     #[test]
