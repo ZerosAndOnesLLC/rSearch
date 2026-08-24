@@ -228,6 +228,15 @@ fields by `name:term` or via `fields`). Aggregations pass
 through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 
+Deep pagination uses `search_after`: every hit's `sort` values are
+`[timestamp_millis, _seq]` — pass the last hit's values back as
+`search_after` to page strictly past it (with `from` = 0). Each page
+costs only `size` per split, so it pages past `max_result_window`,
+which caps plain `from`/`size` at 10k. Totals and aggregations reflect
+the full query, as in Elasticsearch. Hits from legacy (pre-`_seq`)
+splits report `-1` as the tiebreak and page by timestamp only there;
+merging them to the current split format restores exact paging.
+
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
 

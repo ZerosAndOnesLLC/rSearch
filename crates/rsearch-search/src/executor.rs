@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -14,8 +15,8 @@ use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query};
-use tantivy::schema::Value as _;
+use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery};
+use tantivy::schema::{Term, Value as _};
 use tantivy::{DocAddress, Order, TantivyDocument};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -75,7 +76,22 @@ pub struct FoundDocument {
     pub source: Value,
 }
 
+/// A `search_after` cursor: the `sort` values of the previous page's
+/// last hit, i.e. `[timestamp_millis, _seq]` (issue #52). Paging resumes
+/// strictly past this position in (timestamp, `_seq`) order.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchAfter {
+    /// Timestamp sort value, epoch millis.
+    pub timestamp_millis: i64,
+    /// `_seq` tiebreak. `None` when the caller passed a bare `[ts]`
+    /// cursor — paging is then strictly by timestamp, so equal-timestamp
+    /// documents at the page boundary are skipped. `-1` is the sentinel
+    /// legacy (pre-`_seq`) hits report in their `sort` values.
+    pub seq: Option<i64>,
+}
+
 /// A parsed `_search` request body.
+#[derive(Debug)]
 pub struct SearchRequest {
     /// Stream (index) the search runs against.
     pub stream: String,
@@ -93,6 +109,11 @@ pub struct SearchRequest {
     pub include_source: bool,
     /// Exact-count ceiling; None = unbounded (always exact).
     pub track_total_hits: Option<usize>,
+    /// Resume paging strictly past this cursor (requires `from` = 0).
+    /// Unlike `from`/`size`, each page costs only `size` per split, so it
+    /// pages past `max_result_window` (issue #52). Totals and
+    /// aggregations still reflect the full query, as in ES.
+    pub search_after: Option<SearchAfter>,
 }
 
 impl SearchRequest {
@@ -149,6 +170,44 @@ impl SearchRequest {
                 }
             }
         }
+        // search_after: the previous page's last `sort` values. The
+        // timestamp is taken verbatim as epoch millis (it is what our own
+        // `sort` emitted — no unit heuristic, which would rescale small
+        // values).
+        let search_after = match body.get("search_after") {
+            None => None,
+            Some(Value::Array(vals)) if (1..=2).contains(&vals.len()) => {
+                let as_i64 = |v: &Value| {
+                    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                };
+                let timestamp_millis = as_i64(&vals[0]).ok_or_else(|| {
+                    SearchError::BadRequest(
+                        "search_after[0] must be the timestamp sort value (epoch millis)".into(),
+                    )
+                })?;
+                let seq = vals
+                    .get(1)
+                    .map(|v| {
+                        as_i64(v).ok_or_else(|| {
+                            SearchError::BadRequest(
+                                "search_after[1] must be the _seq sort value (integer)".into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                Some(SearchAfter { timestamp_millis, seq })
+            }
+            Some(_) => {
+                return Err(SearchError::BadRequest(
+                    "search_after must be an array of 1-2 sort values ([timestamp, _seq])".into(),
+                ));
+            }
+        };
+        if search_after.is_some() && from != 0 {
+            return Err(SearchError::BadRequest(
+                "[from] parameter must be set to 0 when [search_after] is used".into(),
+            ));
+        }
         let aggs = body
             .get("aggs")
             .or_else(|| body.get("aggregations"))
@@ -166,6 +225,7 @@ impl SearchRequest {
             aggs,
             include_source,
             track_total_hits,
+            search_after,
         })
     }
 }
@@ -179,6 +239,10 @@ type FetchedDoc = (usize, Option<String>, Option<i64>, Option<String>);
 #[derive(Clone)]
 struct SplitHit {
     timestamp_millis: i64,
+    /// `_seq` tiebreak (None on legacy splits without the column). Part
+    /// of the global sort order so `search_after` cursors page
+    /// deterministically across splits (issue #52).
+    seq: Option<i64>,
     split_idx: usize,
     doc: DocAddress,
 }
@@ -471,6 +535,7 @@ impl SearchService {
                 aggs: None,
                 include_source: true,
                 track_total_hits: Some(0),
+                search_after: None,
             };
             let response = self.search(request).await?;
             for hit in response["hits"]["hits"].as_array().into_iter().flatten() {
@@ -547,6 +612,7 @@ impl SearchService {
         // split order so split_idx stays meaningful.
         let track = request.track_total_hits;
         let sort_desc = request.sort_desc;
+        let cursor = request.search_after;
         // Running total of counted matches across splits. Once it passes
         // track_total_hits, later splits skip their Count collector and the
         // response reports `"relation": "gte"` — the default 10k cap stops
@@ -593,6 +659,7 @@ impl SearchService {
                             aggregations,
                             fetch_limit,
                             sort_desc,
+                            cursor,
                             skip_count,
                             idx,
                             doc_count,
@@ -628,15 +695,24 @@ impl SearchService {
             .iter_mut()
             .flat_map(|o| o.hits.drain(..))
             .collect();
-        // Stable order: timestamp, then split index, then doc — so equal
-        // timestamps page deterministically (L8).
+        // Stable order: timestamp, then `_seq` (the search_after tiebreak
+        // — legacy docs without one sort as -1), then split index and doc
+        // for determinism — so equal timestamps page deterministically
+        // (L8) and cursors resume at the same global position (issue #52).
         let cmp = |a: &SplitHit, b: &SplitHit| {
-            let ts = if request.sort_desc {
-                b.timestamp_millis.cmp(&a.timestamp_millis)
+            let (ts, seq) = if request.sort_desc {
+                (
+                    b.timestamp_millis.cmp(&a.timestamp_millis),
+                    b.seq.unwrap_or(-1).cmp(&a.seq.unwrap_or(-1)),
+                )
             } else {
-                a.timestamp_millis.cmp(&b.timestamp_millis)
+                (
+                    a.timestamp_millis.cmp(&b.timestamp_millis),
+                    a.seq.unwrap_or(-1).cmp(&b.seq.unwrap_or(-1)),
+                )
             };
-            ts.then(a.split_idx.cmp(&b.split_idx))
+            ts.then(seq)
+                .then(a.split_idx.cmp(&b.split_idx))
                 .then(a.doc.segment_ord.cmp(&b.doc.segment_ord))
                 .then(a.doc.doc_id.cmp(&b.doc.doc_id))
         };
@@ -814,11 +890,13 @@ fn hit_envelope(
     let id = id.unwrap_or_else(|| {
         format!("{}:{}:{}", split_id, hit.doc.segment_ord, hit.doc.doc_id)
     });
+    // `sort` is the search_after cursor: [timestamp, _seq]. Legacy docs
+    // without a `_seq` report the -1 sentinel (issue #52).
     let mut entry = json!({
         "_index": stream,
         "_id": id,
         "_score": Value::Null,
-        "sort": [hit.timestamp_millis],
+        "sort": [hit.timestamp_millis, seq.unwrap_or(-1)],
     });
     // `_version` is the write sequence: what the bulk/_doc responses
     // reported for this version of the document.
@@ -836,6 +914,57 @@ fn default_limits() -> AggregationLimitsGuard {
     AggregationLimitsGuard::new(Some(500 << 20), Some(65_000))
 }
 
+/// The query clause keeping only documents strictly past a `search_after`
+/// cursor in (timestamp, `_seq`) order — every leg is a fast-field range
+/// scan (issue #52). Built per split: schemas differ, and a legacy split
+/// has no `_seq` column. Legacy docs sort as seq -1 — after every real
+/// doc at the same timestamp in desc order, before them in asc — so a
+/// desc cursor with a real `_seq` must still include the boundary
+/// timestamp on a legacy split; every other legacy case pages strictly by
+/// timestamp, skipping equal-timestamp boundary docs (merging old splits
+/// to the current format restores exact paging).
+fn cursor_clause(schema: &MappedSchema, cursor: SearchAfter, sort_desc: bool) -> Box<dyn Query> {
+    let ts_term = |ms: i64| {
+        Term::from_field_date(schema.timestamp, tantivy::DateTime::from_timestamp_millis(ms))
+    };
+    let past_ts: Box<dyn Query> = Box::new(if sort_desc {
+        RangeQuery::new(Bound::Unbounded, Bound::Excluded(ts_term(cursor.timestamp_millis)))
+    } else {
+        RangeQuery::new(Bound::Excluded(ts_term(cursor.timestamp_millis)), Bound::Unbounded)
+    });
+    let Some(cursor_seq) = cursor.seq else {
+        // Bare [ts] cursor: strictly past the timestamp.
+        return past_ts;
+    };
+    match schema.seq {
+        Some(seq_field) => {
+            let seq_term = |s: i64| Term::from_field_i64(seq_field, s);
+            let past_seq: Box<dyn Query> = Box::new(if sort_desc {
+                RangeQuery::new(Bound::Unbounded, Bound::Excluded(seq_term(cursor_seq)))
+            } else {
+                RangeQuery::new(Bound::Excluded(seq_term(cursor_seq)), Bound::Unbounded)
+            });
+            let at_ts: Box<dyn Query> = Box::new(RangeQuery::new(
+                Bound::Included(ts_term(cursor.timestamp_millis)),
+                Bound::Included(ts_term(cursor.timestamp_millis)),
+            ));
+            let tie: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+                (Occur::Must, at_ts),
+                (Occur::Must, past_seq),
+            ]));
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Should, past_ts),
+                (Occur::Should, tie),
+            ]))
+        }
+        None if sort_desc && cursor_seq >= 0 => Box::new(RangeQuery::new(
+            Bound::Unbounded,
+            Bound::Included(ts_term(cursor.timestamp_millis)),
+        )),
+        None => past_ts,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search_one_split(
     reader: &SplitReader,
@@ -843,6 +972,7 @@ fn search_one_split(
     aggregations: Option<Aggregations>,
     fetch_limit: usize,
     sort_desc: bool,
+    cursor: Option<SearchAfter>,
     skip_count: bool,
     split_idx: usize,
     doc_count: usize,
@@ -873,23 +1003,64 @@ fn search_one_split(
     let top_collector = TopDocs::with_limit(fetch_limit.max(1))
         .order_by_fast_field::<tantivy::DateTime>("_timestamp", order);
 
+    // Resolve top-k pairs into hits, reading each one's `_seq` from its
+    // segment's fast column (None on legacy splits) — the tiebreak the
+    // global merge and search_after cursors sort by.
+    let has_seq = reader.mapped_schema().seq.is_some();
+    let make_hits = |top: Vec<(Option<tantivy::DateTime>, DocAddress)>| -> Vec<SplitHit> {
+        let mut seq_cols: HashMap<u32, Option<tantivy::columnar::Column<i64>>> = HashMap::new();
+        top.into_iter()
+            .map(|(timestamp, doc)| {
+                let seq = has_seq
+                    .then(|| {
+                        seq_cols
+                            .entry(doc.segment_ord)
+                            .or_insert_with(|| {
+                                searcher
+                                    .segment_reader(doc.segment_ord)
+                                    .fast_fields()
+                                    .i64(rsearch_index::SEQ_FIELD)
+                                    .ok()
+                            })
+                            .as_ref()
+                            .and_then(|col| col.first(doc.doc_id))
+                    })
+                    .flatten();
+                SplitHit {
+                    timestamp_millis: timestamp
+                        .map(|t| t.into_timestamp_millis())
+                        .unwrap_or_default(),
+                    seq,
+                    split_idx,
+                    doc,
+                }
+            })
+            .collect()
+    };
+    // The cursor narrows only the page's top-k query — totals and
+    // aggregations keep reflecting the full query, as in ES. Builds its
+    // own collector so the combined-collector arms below can consume the
+    // shared one.
+    let page_search = |base: Box<dyn Query>| -> SearchResult<Vec<(Option<tantivy::DateTime>, DocAddress)>> {
+        let collector = TopDocs::with_limit(fetch_limit.max(1))
+            .order_by_fast_field::<tantivy::DateTime>("_timestamp", order);
+        let page_query: Box<dyn Query> = match cursor {
+            Some(c) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, base),
+                (Occur::Must, cursor_clause(reader.mapped_schema(), c, sort_desc)),
+            ])),
+            None => base,
+        };
+        searcher
+            .search(&page_query, &collector)
+            .map_err(SearchError::Tantivy)
+    };
+
     // match_all over a fully-covered split: the count is the split's
     // doc_count; skip the Count collector entirely (H3). Still runs the
     // top-k collector for the page.
     if fully_covered && aggregations.is_none() {
-        let top = searcher
-            .search(&query, &top_collector)
-            .map_err(SearchError::Tantivy)?;
-        let hits = top
-            .into_iter()
-            .map(|(timestamp, doc)| SplitHit {
-                timestamp_millis: timestamp
-                    .map(|t| t.into_timestamp_millis())
-                    .unwrap_or_default(),
-                split_idx,
-                doc,
-            })
-            .collect();
+        let hits = make_hits(page_search(query)?);
         return Ok(SplitOutcome {
             count: doc_count,
             count_is_lower_bound: false,
@@ -902,8 +1073,10 @@ fn search_one_split(
     // passed the cap) → don't run the Count collector at all; the total
     // becomes a lower bound (the page length). Aggregations still need
     // their collector, and counting is free alongside their full scan.
-    let (count, count_is_lower_bound, top, agg_result) = match (aggregations, skip_count) {
-        (Some(aggs), _) => {
+    // With a search_after cursor the page runs as its own search, so the
+    // count/agg pass over the full query stays separate.
+    let (count, count_is_lower_bound, top, agg_result) = match (aggregations, skip_count, cursor) {
+        (Some(aggs), _, cursor) => {
             let agg_collector = tantivy::aggregation::DistributedAggregationCollector::from_aggs(
                 aggs,
                 tantivy::aggregation::AggContextParams::new(
@@ -911,42 +1084,168 @@ fn search_one_split(
                     index.tokenizers().clone(),
                 ),
             );
-            let (count, top, aggs) = searcher
-                .search(&query, &(Count, top_collector, agg_collector))
-                .map_err(SearchError::Tantivy)?;
-            (count, false, top, Some(aggs))
+            match cursor {
+                None => {
+                    let (count, top, aggs) = searcher
+                        .search(&query, &(Count, top_collector, agg_collector))
+                        .map_err(SearchError::Tantivy)?;
+                    (count, false, top, Some(aggs))
+                }
+                Some(_) => {
+                    let (count, aggs) = searcher
+                        .search(&query, &(Count, agg_collector))
+                        .map_err(SearchError::Tantivy)?;
+                    let top = page_search(query)?;
+                    (count, false, top, Some(aggs))
+                }
+            }
         }
-        (None, true) => {
-            let top = searcher
-                .search(&query, &top_collector)
-                .map_err(SearchError::Tantivy)?;
+        (None, true, _) => {
+            let top = page_search(query)?;
             // Lower bound: at least the number of hits we returned.
             (top.len(), true, top, None)
         }
-        (None, false) => {
+        (None, false, None) => {
             let (count, top) = searcher
                 .search(&query, &(Count, top_collector))
                 .map_err(SearchError::Tantivy)?;
+            (count, false, top, None)
+        }
+        (None, false, Some(_)) => {
+            let count = searcher.search(&query, &Count).map_err(SearchError::Tantivy)?;
+            let top = page_search(query)?;
             (count, false, top, None)
         }
     };
 
     // Source is fetched later, only for the merged final page — here we
     // just record references (H4).
-    let hits = top
-        .into_iter()
-        .map(|(timestamp, doc)| SplitHit {
-            timestamp_millis: timestamp
-                .map(|t| t.into_timestamp_millis())
-                .unwrap_or_default(),
-            split_idx,
-            doc,
-        })
-        .collect();
+    let hits = make_hits(top);
     Ok(SplitOutcome {
         count,
         count_is_lower_bound,
         hits,
         aggs: agg_result,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsearch_index::{DocIdentity, DocumentConverter, IndexMapping};
+
+    #[test]
+    fn parses_search_after() {
+        let parsed = SearchRequest::parse(
+            "logs",
+            &json!({"size": 5, "search_after": [2000, 5]}),
+        )
+        .unwrap();
+        let cursor = parsed.search_after.unwrap();
+        assert_eq!(cursor.timestamp_millis, 2000);
+        assert_eq!(cursor.seq, Some(5));
+
+        // Bare [ts] cursor; numeric strings (JSON bigint safety) accepted.
+        let parsed = SearchRequest::parse("logs", &json!({"search_after": ["2000"]})).unwrap();
+        let cursor = parsed.search_after.unwrap();
+        assert_eq!(cursor.timestamp_millis, 2000);
+        assert_eq!(cursor.seq, None);
+
+        // The timestamp is NOT unit-heuristic rescaled: small sort values
+        // page as-is.
+        let parsed = SearchRequest::parse("logs", &json!({"search_after": [1000, -1]})).unwrap();
+        assert_eq!(parsed.search_after.unwrap().timestamp_millis, 1000);
+        assert_eq!(parsed.search_after.unwrap().seq, Some(-1));
+    }
+
+    #[test]
+    fn search_after_rejects_bad_shapes() {
+        for body in [
+            json!({"from": 5, "search_after": [1000]}),
+            json!({"search_after": []}),
+            json!({"search_after": [1, 2, 3]}),
+            json!({"search_after": {"ts": 1}}),
+            json!({"search_after": ["not-a-number"]}),
+            json!({"search_after": [1000, "x"]}),
+        ] {
+            let err = SearchRequest::parse("logs", &body).unwrap_err();
+            assert!(matches!(err, SearchError::BadRequest(_)), "{body}");
+        }
+    }
+
+    /// Docs as (timestamp_millis, seq) at the given schema version →
+    /// how many pass the cursor clause.
+    fn count_past(
+        schema_version: u32,
+        docs: &[(i64, i64)],
+        cursor: SearchAfter,
+        sort_desc: bool,
+    ) -> usize {
+        let schema = MappedSchema::build_versioned(IndexMapping::default(), schema_version);
+        let index = tantivy::Index::create_in_ram(schema.schema.clone());
+        let converter = DocumentConverter::new(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 20 << 20).unwrap();
+        for (i, (ts, seq)) in docs.iter().enumerate() {
+            let identity = DocIdentity::new(format!("d{i}"), *seq);
+            let (doc, _) = converter
+                .convert_with_source(
+                    json!({"n": i}),
+                    None,
+                    &identity,
+                    tantivy::DateTime::from_timestamp_millis(*ts),
+                )
+                .unwrap();
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let clause = cursor_clause(&schema, cursor, sort_desc);
+        searcher.search(&clause, &Count).unwrap()
+    }
+
+    /// (ts, seq): a=(1000,10) b=(1000,20) c=(2000,5) d=(3000,1).
+    /// desc order: d, c, b, a — asc order: a, b, c, d.
+    const DOCS: [(i64, i64); 4] = [(1000, 10), (1000, 20), (2000, 5), (3000, 1)];
+
+    fn after(ts: i64, seq: Option<i64>) -> SearchAfter {
+        SearchAfter { timestamp_millis: ts, seq }
+    }
+
+    #[test]
+    fn cursor_pages_strictly_past_ts_and_seq() {
+        // desc, cursor at c=(2000,5): b and a remain.
+        assert_eq!(count_past(1, &DOCS, after(2000, Some(5)), true), 2);
+        // desc, cursor at b=(1000,20): the equal-timestamp tie resolves by
+        // seq — only a remains.
+        assert_eq!(count_past(1, &DOCS, after(1000, Some(20)), true), 1);
+        // desc, cursor at a: page exhausted.
+        assert_eq!(count_past(1, &DOCS, after(1000, Some(10)), true), 0);
+        // asc, cursor at a=(1000,10): b, c, d remain (tie kept).
+        assert_eq!(count_past(1, &DOCS, after(1000, Some(10)), false), 3);
+        // asc, cursor at d: exhausted.
+        assert_eq!(count_past(1, &DOCS, after(3000, Some(1)), false), 0);
+    }
+
+    #[test]
+    fn bare_ts_cursor_pages_strictly_by_timestamp() {
+        // desc past ts=2000: only the two 1000s remain (equal-ts skipped
+        // by design for a 1-element cursor).
+        assert_eq!(count_past(1, &DOCS, after(2000, None), true), 2);
+        assert_eq!(count_past(1, &DOCS, after(1000, None), true), 0);
+        // asc past ts=2000: only d.
+        assert_eq!(count_past(1, &DOCS, after(2000, None), false), 1);
+    }
+
+    #[test]
+    fn legacy_split_cursor_degrades_by_timestamp() {
+        // Version-0 splits have no _seq column; docs sort as seq -1.
+        // desc + a real-seq cursor: legacy docs at the boundary timestamp
+        // sort after every real doc there, so they are still included.
+        assert_eq!(count_past(0, &DOCS, after(2000, Some(5)), true), 3);
+        // desc + a legacy (-1) cursor: strictly past the timestamp.
+        assert_eq!(count_past(0, &DOCS, after(2000, Some(-1)), true), 2);
+        // asc + a real-seq cursor: legacy docs at the boundary already
+        // sorted before it — strictly past.
+        assert_eq!(count_past(0, &DOCS, after(2000, Some(5)), false), 1);
+    }
 }

@@ -325,6 +325,7 @@ pub async fn delete_by_query(
             aggs: None,
             include_source: false,
             track_total_hits: Some(0),
+            search_after: None,
         };
         let response = match lookup.search(request).await {
             Ok(response) => response,
