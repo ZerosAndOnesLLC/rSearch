@@ -17,7 +17,9 @@ pub use dynamic_paths::dynamic_string_paths;
 pub use tantivy::DateTime;
 pub use cache::SplitCache;
 pub use reader::{ReadDoc, SplitReader};
-pub use document::{DocIdentity, DocumentConverter, epoch_to_millis, extract_timestamp};
+pub use document::{
+    DocIdentity, DocumentConverter, MAX_SAFE_MILLIS, epoch_to_millis, extract_timestamp,
+};
 pub use error::{IndexError, IndexResult};
 pub use exclusions::{ExcludeDocsQuery, ExclusionSet, Tombstone};
 pub use mapping::{

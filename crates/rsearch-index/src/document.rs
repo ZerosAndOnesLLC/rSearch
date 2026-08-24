@@ -40,7 +40,7 @@ pub fn extract_timestamp(doc: &serde_json::Value) -> Option<tantivy::DateTime> {
 
 /// Widest epoch-millis range tantivy's nanosecond representation holds
 /// (~year 1677 to ~2262). Out-of-range inputs clamp instead of panicking.
-const MAX_SAFE_MILLIS: i64 = i64::MAX / 1_000_000;
+pub const MAX_SAFE_MILLIS: i64 = i64::MAX / 1_000_000;
 
 /// Normalize an epoch number of unknown unit (secs, millis, micros, or
 /// nanos — shippers send all four) to clamped epoch milliseconds.

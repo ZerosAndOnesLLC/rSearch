@@ -35,36 +35,75 @@ pub struct StreamInfo {
 /// its own entry immediately.
 const STREAM_INFO_TTL: Duration = Duration::from_secs(10);
 
+/// Bits every stamp reserves for a per-node salt: `search_after` cursors
+/// use `(timestamp, _seq)` as their paging position, so two nodes must
+/// not be able to mint the same `_seq` in the same microsecond.
+const SEQ_SALT_BITS: u32 = 10;
+const SEQ_SALT_MASK: i64 = (1 << SEQ_SALT_BITS) - 1;
+
 /// Write-sequence source: a hybrid logical clock. Stamps are micros
-/// since epoch, forced strictly increasing across calls on one node, and
+/// since epoch shifted left by [`SEQ_SALT_BITS`] with a node salt in the
+/// low bits, forced strictly increasing across calls on one node, and
 /// pushed past every sequence this node has *observed* from the cluster
 /// (tombstone bounds of the ids being written, the stream's highest
 /// published `_seq`) — so a replacement written on a node whose wall
 /// clock lags the previous writer's still orders after it. Wall clocks
-/// only set the pace; causality comes from the observations.
+/// only set the pace; causality comes from the observations. The salt
+/// (a hash of the node id) keeps stamps distinct across nodes even at
+/// the same microsecond, and every stamp — including the increment
+/// fallback — carries it, so cross-node collisions need a salt collision
+/// too. Pre-salt stamps (plain micros) are ~1000× smaller, so all new
+/// writes order after all old ones and `observe` folds them in as
+/// before.
 #[derive(Default)]
 pub struct SeqClock {
     last: std::sync::atomic::AtomicI64,
+    salt: i64,
 }
 
 impl SeqClock {
+    /// A clock whose stamps carry a salt derived from `node_id` in their
+    /// low bits. (Non-cryptographic hash: disambiguation, not security.)
+    pub fn new(node_id: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        node_id.hash(&mut hasher);
+        Self {
+            last: std::sync::atomic::AtomicI64::new(0),
+            salt: (hasher.finish() as i64) & SEQ_SALT_MASK,
+        }
+    }
+
     /// Fold a sequence seen elsewhere into the clock: later stamps exceed it.
     pub fn observe(&self, seen: i64) {
         self.last.fetch_max(seen, Ordering::AcqRel);
     }
 
+    /// The lowest stamp carrying this clock's salt that is strictly
+    /// greater than `last` (saturating at the top of the range).
+    fn stamp_after(&self, last: i64) -> i64 {
+        let slot = (last >> SEQ_SALT_BITS).saturating_add(1);
+        if slot > (i64::MAX >> SEQ_SALT_BITS) {
+            i64::MAX
+        } else {
+            (slot << SEQ_SALT_BITS) | self.salt
+        }
+    }
+
     /// Next sequence stamp.
     pub fn next(&self) -> i64 {
-        let now = SystemTime::now()
+        let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
-        // fetch_update: `last = max(last + 1, now)` atomically.
+        let now = (micros.clamp(0, i64::MAX >> SEQ_SALT_BITS) << SEQ_SALT_BITS) | self.salt;
+        // fetch_update: `last = max(first salted stamp past last, now)`
+        // atomically.
         self.last
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
-                Some(now.max(last.saturating_add(1)))
+                Some(now.max(self.stamp_after(last)))
             })
-            .map(|prev| now.max(prev.saturating_add(1)))
+            .map(|prev| now.max(self.stamp_after(prev)))
             .unwrap_or(now)
     }
 }
@@ -171,6 +210,7 @@ impl IngestPipeline {
         metastore: Metastore,
         wal: Arc<Wal>,
     ) -> Self {
+        let seq = SeqClock::new(&config.node_id);
         let pipeline = Self {
             inner: Arc::new(PipelineInner {
                 config,
@@ -181,7 +221,7 @@ impl IngestPipeline {
                 worker_create: tokio::sync::Mutex::new(()),
                 metrics: IngestMetrics::default(),
                 rules: std::sync::RwLock::new(Arc::new(Vec::new())),
-                seq: SeqClock::default(),
+                seq,
                 stream_info: std::sync::RwLock::new(HashMap::new()),
             }),
         };
@@ -880,5 +920,38 @@ mod tests {
         let c = clock.next();
         clock.observe(a);
         assert!(clock.next() > c);
+    }
+
+    /// Two nodes minting stamps at the same wall-clock instant must never
+    /// collide: `search_after` cursors rely on `(timestamp, _seq)` being
+    /// unique cluster-wide, and each node's salt rides in the low bits of
+    /// every stamp — including increment-fallback stamps minted while a
+    /// clock is pushed ahead of wall time by an observation.
+    #[test]
+    fn seq_clock_salts_keep_nodes_distinct() {
+        let a = SeqClock::new("node-a");
+        let b = SeqClock::new("node-b");
+        let salt = |s: i64| s & super::SEQ_SALT_MASK;
+        let first_a = a.next();
+        let first_b = b.next();
+        assert_ne!(salt(first_a), salt(first_b), "test node ids must hash apart");
+        // Drive both clocks into the increment fallback from the same
+        // observed stamp (a peer far in the future) — the classic
+        // collision path for an unsalted hybrid clock.
+        let far = first_a.max(first_b) + (10_000_000_000 << super::SEQ_SALT_BITS);
+        a.observe(far);
+        b.observe(far);
+        let mut seen = std::collections::HashSet::new();
+        let mut last_a = 0;
+        let mut last_b = 0;
+        for _ in 0..1000 {
+            let sa = a.next();
+            let sb = b.next();
+            assert!(sa > last_a && sb > last_b, "stamps must stay monotonic");
+            (last_a, last_b) = (sa, sb);
+            assert_eq!(salt(sa), salt(first_a));
+            assert_eq!(salt(sb), salt(first_b));
+            assert!(seen.insert(sa) && seen.insert(sb), "cross-node stamp collision");
+        }
     }
 }

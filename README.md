@@ -229,13 +229,21 @@ through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 
 Deep pagination uses `search_after`: every hit's `sort` values are
-`[timestamp_millis, _seq]` — pass the last hit's values back as
-`search_after` to page strictly past it (with `from` = 0). Each page
-costs only `size` per split, so it pages past `max_result_window`,
-which caps plain `from`/`size` at 10k. Totals and aggregations reflect
-the full query, as in Elasticsearch. Hits from legacy (pre-`_seq`)
-splits report `-1` as the tiebreak and page by timestamp only there;
-merging them to the current split format restores exact paging.
+`[timestamp_millis, _seq]` — the `_seq` element is an implicit unique
+tiebreak appended to the timestamp sort, the way Elasticsearch's
+point-in-time search appends `_shard_doc` — and passing the last hit's
+values back as `search_after` (with `from` = 0) pages strictly past it.
+Each page costs only `size` per split, so it pages past
+`max_result_window`, which caps plain `from`/`size` at 10k. Totals and
+aggregations reflect the full query on every page, as in Elasticsearch;
+send `track_total_hits: false` on follow-up pages to skip recounting,
+which also lets splits wholly behind the cursor be skipped entirely.
+Always pass both sort values back: a one-element `[timestamp]` cursor
+pages strictly by timestamp and skips equal-timestamp documents at the
+page boundary (the classic ES footgun with a non-unique sort). Hits
+from legacy (pre-`_seq`) splits report `-1` as the tiebreak and page by
+timestamp only there; merging them to the current split format restores
+exact paging.
 
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.
