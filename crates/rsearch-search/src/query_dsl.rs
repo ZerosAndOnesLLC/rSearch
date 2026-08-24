@@ -10,7 +10,7 @@ use std::ops::Bound;
 use serde_json::Value;
 use tantivy::query::{
     AllQuery, BooleanQuery, ExistsQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
-    RangeQuery, TermQuery,
+    RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Term};
 use tantivy::time::OffsetDateTime;
@@ -516,43 +516,103 @@ fn translate_range(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn 
     Ok(Box::new(RangeQuery::new(lower, upper)))
 }
 
+/// The single `(field, spec)` pair of a term-level query body. A second
+/// non-boost field is an error, matching ES ("[prefix] query doesn't
+/// support multiple fields").
+fn single_field<'a>(body: &'a Value, kind: &str) -> SearchResult<(&'a String, &'a Value)> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| SearchError::BadRequest(format!("{kind} body must be an object")))?;
+    let mut fields = obj.iter().filter(|(k, _)| *k != "boost");
+    let first = fields
+        .next()
+        .ok_or_else(|| SearchError::BadRequest(format!("{kind} query needs a field")))?;
+    if fields.next().is_some() {
+        return Err(SearchError::BadRequest(format!(
+            "[{kind}] query doesn't support multiple fields"
+        )));
+    }
+    Ok(first)
+}
+
+/// Append `c` to a regex pattern as a literal, escaping regex metachars.
+fn push_regex_literal(out: &mut String, c: char) {
+    if matches!(
+        c,
+        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+    ) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Append a whole string to a regex pattern as literals.
+fn push_regex_literal_str(out: &mut String, s: &str) {
+    for c in s.chars() {
+        push_regex_literal(out, c);
+    }
+}
+
+/// Append the `_dynamic` term-dictionary key prefix for `path` (path
+/// bytes, end-of-path marker, str type byte) to a regex pattern as
+/// literals — anchoring the pattern to that path's string terms only,
+/// the same key layout Tantivy's own fuzzy query matches against.
+fn push_dynamic_path_prefix(out: &mut String, field: Field, path: &str) -> SearchResult<()> {
+    let mut term = Term::from_field_json_path(field, path, false);
+    term.append_type_and_str("");
+    let prefix = std::str::from_utf8(term.serialized_value_bytes()).map_err(|_| {
+        SearchError::BadRequest(format!("field path '{path}' is not valid UTF-8"))
+    })?;
+    push_regex_literal_str(out, prefix);
+    Ok(())
+}
+
 /// `{"prefix": {"field": {"value": "ab"}}}` (or the `{"field": "ab"}`
 /// shorthand) — documents with an indexed term starting with the value.
 /// Runs a distance-0 prefix DFA against the term dictionary, so only the
 /// dictionary range sharing the prefix is visited (issue #54). As in ES,
 /// the value is not analyzed: on `text` fields (and `_dynamic` paths) it
 /// must match the indexed tokens, which the default tokenizer lowercases.
+/// `case_insensitive: true` (ES 7.10+) routes through an anchored regex
+/// whose literal part folds case; the walk stays automaton-bounded.
 fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
-    let obj = body
-        .as_object()
-        .ok_or_else(|| SearchError::BadRequest("prefix body must be an object".into()))?;
-    let (name, spec) = obj
-        .iter()
-        .find(|(k, _)| *k != "boost")
-        .ok_or_else(|| SearchError::BadRequest("prefix query needs a field".into()))?;
-    if spec
+    let (name, spec) = single_field(body, "prefix")?;
+    let case_insensitive = spec
         .get("case_insensitive")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(SearchError::BadRequest(
-            "prefix 'case_insensitive' is not supported".into(),
-        ));
-    }
+        .unwrap_or(false);
     // `value` is current ES; `prefix` is the pre-7.x spelling.
     let value = spec.get("value").or_else(|| spec.get("prefix")).unwrap_or(spec);
     let text = value
         .as_str()
         .ok_or_else(|| SearchError::BadRequest("prefix value must be a string".into()))?;
+
+    let not_string_field = || {
+        SearchError::BadRequest(format!("prefix query requires a string field, '{name}' is not"))
+    };
+    if case_insensitive {
+        let mut pattern = String::from("(?s)");
+        let field = match resolve(schema, name) {
+            Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => field,
+            Resolved::Typed(..) | Resolved::Timestamp(_) => return Err(not_string_field()),
+            Resolved::Dynamic(field, path) => {
+                push_dynamic_path_prefix(&mut pattern, field, &path)?;
+                field
+            }
+        };
+        pattern.push_str("(?i:");
+        push_regex_literal_str(&mut pattern, text);
+        pattern.push_str(").*");
+        let query = RegexQuery::from_pattern(&pattern, field)
+            .map_err(|e| SearchError::BadRequest(format!("invalid prefix value: {e}")))?;
+        return Ok(Box::new(query));
+    }
+
     let term = match resolve(schema, name) {
         Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => {
             Term::from_field_text(field, text)
         }
-        Resolved::Typed(..) | Resolved::Timestamp(_) => {
-            return Err(SearchError::BadRequest(format!(
-                "prefix query requires a string field, '{name}' is not"
-            )));
-        }
+        Resolved::Typed(..) | Resolved::Timestamp(_) => return Err(not_string_field()),
         Resolved::Dynamic(field, path) => {
             let mut term = Term::from_field_json_path(field, &path, false);
             term.append_type_and_str(text);
@@ -1049,6 +1109,28 @@ mod tests {
         assert_eq!(hits(&serde_json::json!({"prefix": {"name": "zz"}})), 0);
         // Empty prefix: every doc with a term in the field (ES parity).
         assert_eq!(hits(&serde_json::json!({"prefix": {"service": ""}})), 3);
+        // case_insensitive (ES 7.10+): folds case on keyword, text, and
+        // dynamic fields; false (the default) stays exact.
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"service": {"value": "AP", "case_insensitive": true}}})),
+            2
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"message": {"value": "LOVEL", "case_insensitive": true}}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"name": {"value": "lOvEl", "case_insensitive": true}}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"name": {"value": "zz", "case_insensitive": true}}})),
+            0
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"service": {"value": "AP", "case_insensitive": false}}})),
+            0
+        );
         // Inside a bool must_not (the iWorldreg "not_contain" shape).
         assert_eq!(
             hits(&serde_json::json!({"bool": {"must_not": [{"prefix": {"service": "ap"}}]}})),
@@ -1057,18 +1139,20 @@ mod tests {
     }
 
     #[test]
-    fn prefix_query_rejects_non_string_fields_and_case_insensitive() {
+    fn prefix_query_rejects_bad_shapes() {
         let s = schema();
         let idx = index(&s);
         for query in [
             // Numeric mapped field.
             serde_json::json!({"prefix": {"status": "4"}}),
+            // ... also under case_insensitive's regex path.
+            serde_json::json!({"prefix": {"status": {"value": "4", "case_insensitive": true}}}),
             // Timestamp.
             serde_json::json!({"prefix": {"@timestamp": "2026"}}),
             // Non-string value.
             serde_json::json!({"prefix": {"service": 5}}),
-            // Unsupported param must fail loudly, not silently differ.
-            serde_json::json!({"prefix": {"service": {"value": "a", "case_insensitive": true}}}),
+            // Multiple fields: ES 400s rather than picking one.
+            serde_json::json!({"prefix": {"service": "a", "message": "b"}}),
         ] {
             let err = translate_query(&idx, &s, &query, &paths_of(&idx, &s)).unwrap_err();
             assert!(matches!(err, SearchError::BadRequest(_)), "query {query}: {err}");
