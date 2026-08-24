@@ -623,17 +623,6 @@ fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn
     Ok(Box::new(FuzzyTermQuery::new_prefix(term, 0, false)))
 }
 
-/// Append `c` to a regex pattern as a literal, escaping regex metachars.
-fn push_regex_literal(out: &mut String, c: char) {
-    if matches!(
-        c,
-        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
-    ) {
-        out.push('\\');
-    }
-    out.push(c);
-}
-
 /// An ES wildcard value as an (anchored) regex body: `*` matches any run
 /// of characters, `?` exactly one, everything else literally.
 fn wildcard_regex_body(value: &str) -> String {
@@ -658,23 +647,14 @@ fn wildcard_regex_body(value: &str) -> String {
 /// walk of the field's term dictionary per split — the same cost profile
 /// as ES. As with `prefix`, the value is not analyzed: on `text` fields
 /// and `_dynamic` paths it must match the indexed (lowercased) tokens.
+/// `case_insensitive: true` (ES 7.10+) folds case in the value while the
+/// path/anchor bytes stay exact.
 fn translate_wildcard(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
-    let obj = body
-        .as_object()
-        .ok_or_else(|| SearchError::BadRequest("wildcard body must be an object".into()))?;
-    let (name, spec) = obj
-        .iter()
-        .find(|(k, _)| *k != "boost")
-        .ok_or_else(|| SearchError::BadRequest("wildcard query needs a field".into()))?;
-    if spec
+    let (name, spec) = single_field(body, "wildcard")?;
+    let case_insensitive = spec
         .get("case_insensitive")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(SearchError::BadRequest(
-            "wildcard 'case_insensitive' is not supported".into(),
-        ));
-    }
+        .unwrap_or(false);
     // `value` is current ES; `wildcard` is the pre-7.x spelling. `boost`
     // and the execution hint `rewrite` are accepted and ignored, as with
     // the other term-level queries.
@@ -693,24 +673,20 @@ fn translate_wildcard(schema: &MappedSchema, body: &Value) -> SearchResult<Box<d
                 "wildcard query requires a string field, '{name}' is not"
             )));
         }
-        // Unmapped fields: `_dynamic` term-dictionary keys are the JSON
-        // path, an end-of-path marker, a type byte, then the value — the
-        // same layout Tantivy's own fuzzy query matches against — so the
-        // pattern carries that prefix literally and only this path's
-        // string terms can match.
+        // Unmapped fields: the pattern carries the `_dynamic` path key
+        // prefix literally, so only this path's string terms can match.
         Resolved::Dynamic(field, path) => {
-            let mut term = Term::from_field_json_path(field, &path, false);
-            term.append_type_and_str("");
-            let prefix = std::str::from_utf8(term.serialized_value_bytes()).map_err(|_| {
-                SearchError::BadRequest(format!("field '{name}' is not valid UTF-8"))
-            })?;
-            for c in prefix.chars() {
-                push_regex_literal(&mut pattern, c);
-            }
+            push_dynamic_path_prefix(&mut pattern, field, &path)?;
             field
         }
     };
-    pattern.push_str(&wildcard_regex_body(text));
+    if case_insensitive {
+        pattern.push_str("(?i:");
+        pattern.push_str(&wildcard_regex_body(text));
+        pattern.push(')');
+    } else {
+        pattern.push_str(&wildcard_regex_body(text));
+    }
     let query = RegexQuery::from_pattern(&pattern, field)
         .map_err(|e| SearchError::BadRequest(format!("invalid wildcard pattern: {e}")))?;
     Ok(Box::new(query))
@@ -1262,6 +1238,20 @@ mod tests {
         // Regex metachars in the value are literal, not regex syntax.
         assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "a.i"}})), 0);
         assert_eq!(hits(&serde_json::json!({"wildcard": {"service": "*(api)*"}})), 0);
+        // case_insensitive (ES 7.10+) folds the value; the default stays
+        // exact.
+        assert_eq!(
+            hits(&serde_json::json!({"wildcard": {"service": {"value": "*ORK*", "case_insensitive": true}}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"wildcard": {"name": {"value": "*OVEL*", "case_insensitive": true}}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"wildcard": {"service": {"value": "*ORK*", "case_insensitive": false}}})),
+            0
+        );
         // The must_not shape (the iWorldreg "not_contain" operator).
         assert_eq!(
             hits(&serde_json::json!({"bool": {"must_not": [{"wildcard": {"service": "*p*"}}]}})),
@@ -1306,14 +1296,15 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_query_rejects_non_string_fields_and_case_insensitive() {
+    fn wildcard_query_rejects_bad_shapes() {
         let s = schema();
         let idx = index(&s);
         for query in [
             serde_json::json!({"wildcard": {"status": "*4*"}}),
             serde_json::json!({"wildcard": {"@timestamp": "*2026*"}}),
             serde_json::json!({"wildcard": {"service": 5}}),
-            serde_json::json!({"wildcard": {"service": {"value": "*a*", "case_insensitive": true}}}),
+            // Multiple fields: ES 400s rather than picking one.
+            serde_json::json!({"wildcard": {"service": "*a*", "message": "*b*"}}),
         ] {
             let err = translate_query(&idx, &s, &query, &paths_of(&idx, &s)).unwrap_err();
             assert!(matches!(err, SearchError::BadRequest(_)), "query {query}: {err}");
