@@ -9,8 +9,8 @@ use std::ops::Bound;
 
 use serde_json::Value;
 use tantivy::query::{
-    AllQuery, BooleanQuery, ExistsQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery,
-    TermQuery,
+    AllQuery, BooleanQuery, ExistsQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
+    RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Term};
 use tantivy::time::OffsetDateTime;
@@ -282,6 +282,7 @@ pub fn translate_query(
         "terms" => translate_terms(schema, body),
         "ids" => translate_ids(schema, body),
         "range" => translate_range(schema, body),
+        "prefix" => translate_prefix(schema, body),
         "exists" => translate_exists(schema, body),
         "match" => translate_match(index, schema, body, false),
         "match_phrase" => translate_match(index, schema, body, true),
@@ -292,7 +293,8 @@ pub fn translate_query(
         "simple_query_string" => translate_query_string(index, schema, body, dynamic_paths),
         other => Err(SearchError::BadRequest(format!(
             "unsupported query type '{other}' (supported: match_all, bool, term, terms, \
-             ids, range, exists, match, match_phrase, query_string, simple_query_string)"
+             ids, range, prefix, exists, match, match_phrase, query_string, \
+             simple_query_string)"
         ))),
     }
 }
@@ -512,6 +514,112 @@ fn translate_range(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn 
         }
     }
     Ok(Box::new(RangeQuery::new(lower, upper)))
+}
+
+/// The single `(field, spec)` pair of a term-level query body. A second
+/// non-boost field is an error, matching ES ("[prefix] query doesn't
+/// support multiple fields").
+fn single_field<'a>(body: &'a Value, kind: &str) -> SearchResult<(&'a String, &'a Value)> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| SearchError::BadRequest(format!("{kind} body must be an object")))?;
+    let mut fields = obj.iter().filter(|(k, _)| *k != "boost");
+    let first = fields
+        .next()
+        .ok_or_else(|| SearchError::BadRequest(format!("{kind} query needs a field")))?;
+    if fields.next().is_some() {
+        return Err(SearchError::BadRequest(format!(
+            "[{kind}] query doesn't support multiple fields"
+        )));
+    }
+    Ok(first)
+}
+
+/// Append `c` to a regex pattern as a literal, escaping regex metachars.
+fn push_regex_literal(out: &mut String, c: char) {
+    if matches!(
+        c,
+        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+    ) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Append a whole string to a regex pattern as literals.
+fn push_regex_literal_str(out: &mut String, s: &str) {
+    for c in s.chars() {
+        push_regex_literal(out, c);
+    }
+}
+
+/// Append the `_dynamic` term-dictionary key prefix for `path` (path
+/// bytes, end-of-path marker, str type byte) to a regex pattern as
+/// literals — anchoring the pattern to that path's string terms only,
+/// the same key layout Tantivy's own fuzzy query matches against.
+fn push_dynamic_path_prefix(out: &mut String, field: Field, path: &str) -> SearchResult<()> {
+    let mut term = Term::from_field_json_path(field, path, false);
+    term.append_type_and_str("");
+    let prefix = std::str::from_utf8(term.serialized_value_bytes()).map_err(|_| {
+        SearchError::BadRequest(format!("field path '{path}' is not valid UTF-8"))
+    })?;
+    push_regex_literal_str(out, prefix);
+    Ok(())
+}
+
+/// `{"prefix": {"field": {"value": "ab"}}}` (or the `{"field": "ab"}`
+/// shorthand) — documents with an indexed term starting with the value.
+/// Runs a distance-0 prefix DFA against the term dictionary, so only the
+/// dictionary range sharing the prefix is visited (issue #54). As in ES,
+/// the value is not analyzed: on `text` fields (and `_dynamic` paths) it
+/// must match the indexed tokens, which the default tokenizer lowercases.
+/// `case_insensitive: true` (ES 7.10+) routes through an anchored regex
+/// whose literal part folds case; the walk stays automaton-bounded.
+fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
+    let (name, spec) = single_field(body, "prefix")?;
+    let case_insensitive = spec
+        .get("case_insensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `value` is current ES; `prefix` is the pre-7.x spelling.
+    let value = spec.get("value").or_else(|| spec.get("prefix")).unwrap_or(spec);
+    let text = value
+        .as_str()
+        .ok_or_else(|| SearchError::BadRequest("prefix value must be a string".into()))?;
+
+    let not_string_field = || {
+        SearchError::BadRequest(format!("prefix query requires a string field, '{name}' is not"))
+    };
+    if case_insensitive {
+        let mut pattern = String::from("(?s)");
+        let field = match resolve(schema, name) {
+            Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => field,
+            Resolved::Typed(..) | Resolved::Timestamp(_) => return Err(not_string_field()),
+            Resolved::Dynamic(field, path) => {
+                push_dynamic_path_prefix(&mut pattern, field, &path)?;
+                field
+            }
+        };
+        pattern.push_str("(?i:");
+        push_regex_literal_str(&mut pattern, text);
+        pattern.push_str(").*");
+        let query = RegexQuery::from_pattern(&pattern, field)
+            .map_err(|e| SearchError::BadRequest(format!("invalid prefix value: {e}")))?;
+        return Ok(Box::new(query));
+    }
+
+    let term = match resolve(schema, name) {
+        Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => {
+            Term::from_field_text(field, text)
+        }
+        Resolved::Typed(..) | Resolved::Timestamp(_) => return Err(not_string_field()),
+        Resolved::Dynamic(field, path) => {
+            let mut term = Term::from_field_json_path(field, &path, false);
+            term.append_type_and_str(text);
+            term
+        }
+    };
+    Ok(Box::new(FuzzyTermQuery::new_prefix(term, 0, false)))
 }
 
 fn translate_exists(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
@@ -803,6 +911,8 @@ mod tests {
             serde_json::json!({"terms": {"status": [200, 500]}}),
             serde_json::json!({"range": {"status": {"gte": 400}}}),
             serde_json::json!({"range": {"@timestamp": {"gte": "2026-07-24T00:00:00Z", "lte": "now"}}}),
+            serde_json::json!({"prefix": {"service": {"value": "ap"}}}),
+            serde_json::json!({"prefix": {"service": "ap"}}),
             serde_json::json!({"exists": {"field": "service"}}),
             serde_json::json!({"match": {"message": "user login"}}),
             serde_json::json!({"match": {"message": {"query": "user login", "operator": "and"}}}),
@@ -976,6 +1086,77 @@ mod tests {
             count(&serde_json::json!({"simple_query_string": {"query": "jobs"}})),
             1
         );
+    }
+
+    /// Issue #54: `prefix` maps the iWorldreg "starts with" operator onto
+    /// the term dictionary — keyword, text, and unmapped (dynamic) fields.
+    #[test]
+    fn prefix_query_matches_term_starts() {
+        // Keyword field ("api" ×2, "worker" ×1): raw terms, case kept.
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": {"value": "ap"}}})), 2);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": "work"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": "api"}})), 2);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": "apix"}})), 0);
+        // Pre-7.x spelling.
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": {"prefix": "ap"}}})), 2);
+        // Text field: matches against the indexed (lowercased) tokens.
+        assert_eq!(hits(&serde_json::json!({"prefix": {"message": "babb"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"message": "lovel"}})), 1);
+        // Unmapped field ("Ada"/"Lovelace"/"Nobody" in _dynamic, tokenized
+        // lowercase by the default analyzer).
+        assert_eq!(hits(&serde_json::json!({"prefix": {"name": "lovel"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"name": "nob"}})), 1);
+        assert_eq!(hits(&serde_json::json!({"prefix": {"name": "zz"}})), 0);
+        // Empty prefix: every doc with a term in the field (ES parity).
+        assert_eq!(hits(&serde_json::json!({"prefix": {"service": ""}})), 3);
+        // case_insensitive (ES 7.10+): folds case on keyword, text, and
+        // dynamic fields; false (the default) stays exact.
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"service": {"value": "AP", "case_insensitive": true}}})),
+            2
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"message": {"value": "LOVEL", "case_insensitive": true}}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"name": {"value": "lOvEl", "case_insensitive": true}}})),
+            1
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"name": {"value": "zz", "case_insensitive": true}}})),
+            0
+        );
+        assert_eq!(
+            hits(&serde_json::json!({"prefix": {"service": {"value": "AP", "case_insensitive": false}}})),
+            0
+        );
+        // Inside a bool must_not (the iWorldreg "not_contain" shape).
+        assert_eq!(
+            hits(&serde_json::json!({"bool": {"must_not": [{"prefix": {"service": "ap"}}]}})),
+            1
+        );
+    }
+
+    #[test]
+    fn prefix_query_rejects_bad_shapes() {
+        let s = schema();
+        let idx = index(&s);
+        for query in [
+            // Numeric mapped field.
+            serde_json::json!({"prefix": {"status": "4"}}),
+            // ... also under case_insensitive's regex path.
+            serde_json::json!({"prefix": {"status": {"value": "4", "case_insensitive": true}}}),
+            // Timestamp.
+            serde_json::json!({"prefix": {"@timestamp": "2026"}}),
+            // Non-string value.
+            serde_json::json!({"prefix": {"service": 5}}),
+            // Multiple fields: ES 400s rather than picking one.
+            serde_json::json!({"prefix": {"service": "a", "message": "b"}}),
+        ] {
+            let err = translate_query(&idx, &s, &query, &paths_of(&idx, &s)).unwrap_err();
+            assert!(matches!(err, SearchError::BadRequest(_)), "query {query}: {err}");
+        }
     }
 
     #[test]
