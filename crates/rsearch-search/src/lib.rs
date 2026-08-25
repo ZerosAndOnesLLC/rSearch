@@ -8,5 +8,5 @@ pub mod logql;
 mod query_dsl;
 
 pub use error::{SearchError, SearchResult};
-pub use executor::{FoundDocument, SearchRequest, SearchService};
+pub use executor::{FoundDocument, SearchAfter, SearchRequest, SearchService};
 pub use query_dsl::{extract_time_bounds, rewrite_agg_fields, translate_query};
