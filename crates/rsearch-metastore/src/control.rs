@@ -83,26 +83,31 @@ impl Metastore {
     /// Published splits smaller than `max_size_bytes`, grouped by stream,
     /// ordered by time — merge candidates. The window is per stream — each
     /// stream's `per_stream_limit` oldest candidates — so one backlogged
-    /// stream can't fill the whole result and starve the rest (#60).
+    /// stream can't fill the whole result and starve the rest (#60). The
+    /// LATERAL join makes each stream a bounded range scan of the
+    /// `(stream_id, state, time_start_millis)` index instead of sorting
+    /// every under-target split in the table; `id` breaks timestamp ties
+    /// so the window edge is deterministic.
     pub async fn small_published_splits(
         &self,
         max_size_bytes: i64,
         per_stream_limit: i64,
     ) -> MetastoreResult<Vec<SplitRecord>> {
         Ok(sqlx::query_as::<_, SplitRecord>(
-            "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
-                    time_start_millis, time_end_millis, footer_len, created_by,
-                    seq_min, seq_max, tombstone_seq_applied
-             FROM (SELECT id, split_id, stream_id, state, storage_key, doc_count,
-                          size_bytes, time_start_millis, time_end_millis, footer_len,
-                          created_by, seq_min, seq_max, tombstone_seq_applied,
-                          ROW_NUMBER() OVER (
-                              PARTITION BY stream_id ORDER BY time_start_millis
-                          ) AS rn
-                   FROM splits
-                   WHERE state = 'published' AND size_bytes < $1) ranked
-             WHERE rn <= $2
-             ORDER BY stream_id, time_start_millis",
+            "SELECT c.id, c.split_id, c.stream_id, c.state, c.storage_key, c.doc_count,
+                    c.size_bytes, c.time_start_millis, c.time_end_millis, c.footer_len,
+                    c.created_by, c.seq_min, c.seq_max, c.tombstone_seq_applied
+             FROM streams st
+             CROSS JOIN LATERAL (
+                 SELECT id, split_id, stream_id, state, storage_key, doc_count,
+                        size_bytes, time_start_millis, time_end_millis, footer_len,
+                        created_by, seq_min, seq_max, tombstone_seq_applied
+                 FROM splits
+                 WHERE stream_id = st.id AND state = 'published' AND size_bytes < $1
+                 ORDER BY time_start_millis, id
+                 LIMIT $2
+             ) c
+             ORDER BY c.stream_id, c.time_start_millis, c.id",
         )
         .bind(max_size_bytes)
         .bind(per_stream_limit)
