@@ -146,6 +146,14 @@ pub struct ControlConfig {
     pub merge_min_mb: i64,
     /// Max splits combined per merge operation.
     pub merge_max_group: usize,
+    /// Max merge operations run (serially) per control tick. Merge
+    /// capacity must exceed cluster-wide split creation or split count —
+    /// and with it query cost — grows without bound (#61); one merge per
+    /// tick was break-even on a 4-stream cluster. Raising this drains
+    /// backlogs faster at the cost of a longer tick, which delays the
+    /// tick's other jobs. Merges stay serial so peak memory stays one
+    /// writer budget regardless of this setting.
+    pub merges_per_tick: usize,
     /// Seconds a split stays marked_for_delete before storage deletion,
     /// letting in-flight searches finish.
     pub gc_grace_secs: f64,
@@ -190,6 +198,7 @@ impl Default for ControlConfig {
             merge_target_mb: 512,
             merge_min_mb: 100,
             merge_max_group: 8,
+            merges_per_tick: 4,
             gc_grace_secs: 600.0,
             allow_insecure_webhooks: false,
             staged_orphan_secs: 3600.0,
