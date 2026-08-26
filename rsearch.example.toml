@@ -85,6 +85,7 @@ cache_max_mb = 4096      # local split-fragment cache budget
 interval_secs = 15          # background-job tick on the elected leader
 merge_target_mb = 512       # splits below this keep merging until the output reaches it
 merge_max_group = 8         # max splits combined per merge
+merges_per_tick = 4         # max merges (serial) per tick; must outpace split creation
 gc_grace_secs = 600         # delay before deleting marked-for-delete splits
 staged_orphan_secs = 3600   # sweep splits stuck in 'staged' after a crash
 repair_stale_secs = 300     # replicated backend: holder silence before re-replication
