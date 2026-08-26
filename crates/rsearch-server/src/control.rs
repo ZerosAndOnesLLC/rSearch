@@ -576,26 +576,17 @@ impl ControlPlane {
         }
     }
 
-    /// Combine the first group of >= 2 published splits below the merge
-    /// target in one stream into a single split. One merge per tick
-    /// bounds the work.
+    /// Combine one group of >= 2 published splits below the merge target
+    /// into a single split, servicing the stream whose eligible
+    /// candidates are oldest (#60). One merge per tick bounds the work.
     async fn merge_job(&self) -> anyhow::Result<()> {
         let target_bytes = self.merge_target_bytes();
         let small = self
             .metastore
-            .small_published_splits(target_bytes, 200)
+            .small_published_splits(target_bytes, MERGE_WINDOW_PER_STREAM)
             .await?;
-        let mut by_stream: BTreeMap<i64, Vec<&SplitRecord>> = BTreeMap::new();
-        for split in &small {
-            by_stream.entry(split.stream_id).or_default().push(split);
-        }
-        let Some((stream_id, group)) = by_stream
-            .into_iter()
-            .find_map(|(id, group)| {
-                let group = merge_candidates(group);
-                let take = merge_take(&group, target_bytes, self.config.merge_max_group);
-                (take >= 2).then(|| (id, group[..take].to_vec()))
-            })
+        let Some((stream_id, group)) =
+            select_merge_group(&small, target_bytes, self.config.merge_max_group)
         else {
             return Ok(());
         };
@@ -1007,6 +998,40 @@ impl ControlPlane {
 /// smaller merge candidate in its stream is left out of the merge group.
 const MERGE_SKEW_FACTOR: i64 = 10;
 
+/// Oldest under-target candidates fetched per stream each merge tick.
+/// The window used to be 200 rows across all streams, which the busiest
+/// stream could occupy entirely, starving the rest (#60); per stream it
+/// only needs to cover `merge_max_group` with headroom for splits the
+/// skew filter excludes.
+const MERGE_WINDOW_PER_STREAM: i64 = 64;
+
+/// Choose which stream to merge this tick: group the candidate window by
+/// stream, run each group through the skew and take rules, and pick the
+/// eligible group that starts earliest in time (#60). Oldest-first is a
+/// least-recently-serviced approximation — merging advances a stream's
+/// oldest candidate forward, so a stream being drained yields to the
+/// next-oldest once it catches up, instead of the lowest stream_id
+/// monopolizing every tick. Candidates must arrive time-ordered within
+/// each stream, as `small_published_splits` returns them.
+fn select_merge_group(
+    small: &[SplitRecord],
+    target_bytes: i64,
+    max_group: usize,
+) -> Option<(i64, Vec<&SplitRecord>)> {
+    let mut by_stream: BTreeMap<i64, Vec<&SplitRecord>> = BTreeMap::new();
+    for split in small {
+        by_stream.entry(split.stream_id).or_default().push(split);
+    }
+    by_stream
+        .into_iter()
+        .filter_map(|(id, group)| {
+            let group = merge_candidates(group);
+            let take = merge_take(&group, target_bytes, max_group);
+            (take >= 2).then(|| (id, group[..take].to_vec()))
+        })
+        .min_by_key(|(_, group)| group[0].time_start_millis)
+}
+
 /// Drop dominant splits from a stream's merge group (#15). Merging is a
 /// full rewrite of every source, so folding a trickle of tiny splits into
 /// one dominant under-target split re-wrote its bytes every tick —
@@ -1178,5 +1203,76 @@ mod tests {
         // leaves it alone.
         let splits = [split(1, 600 << 20)];
         assert_eq!(take_of(&splits, 512, 8), 1);
+    }
+
+    fn stream_split(stream_id: i64, id: i64, size_bytes: i64) -> SplitRecord {
+        SplitRecord {
+            stream_id,
+            ..split(id, size_bytes)
+        }
+    }
+
+    fn selected(
+        splits: &[SplitRecord],
+        target_mb: i64,
+    ) -> Option<(i64, Vec<i64>)> {
+        select_merge_group(splits, target_mb << 20, 8)
+            .map(|(id, group)| (id, group.iter().map(|s| s.id).collect()))
+    }
+
+    #[test]
+    fn oldest_stream_wins_regardless_of_stream_id() {
+        // The #60 shape: the lowest stream_id has plenty of fresh
+        // candidates, but another stream's backlog is older.
+        let splits = [
+            stream_split(2, 10, 1 << 20),
+            stream_split(2, 11, 1 << 20),
+            stream_split(4, 1, 1 << 20),
+            stream_split(4, 2, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512), Some((4, vec![1, 2])));
+    }
+
+    #[test]
+    fn stream_with_one_candidate_is_skipped() {
+        let splits = [
+            stream_split(2, 1, 1 << 20),
+            stream_split(3, 5, 1 << 20),
+            stream_split(3, 6, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512), Some((3, vec![5, 6])));
+    }
+
+    #[test]
+    fn skew_filtered_stream_yields_to_the_next() {
+        // Stream 2's oldest group collapses to one survivor after the
+        // dominant split is excluded, so stream 3 is serviced instead.
+        let splits = [
+            stream_split(2, 1, 52 << 20),
+            stream_split(2, 2, 4 << 10),
+            stream_split(3, 5, 1 << 20),
+            stream_split(3, 6, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512), Some((3, vec![5, 6])));
+    }
+
+    #[test]
+    fn group_is_capped_by_take() {
+        // Only the leading splits up to the target-crossing one merge.
+        let splits = [
+            stream_split(2, 1, 300 << 20),
+            stream_split(2, 2, 300 << 20),
+            stream_split(2, 3, 300 << 20),
+        ];
+        assert_eq!(selected(&splits, 512), Some((2, vec![1, 2])));
+    }
+
+    #[test]
+    fn no_eligible_group_selects_nothing() {
+        let splits = [
+            stream_split(2, 1, 1 << 20),
+            stream_split(3, 2, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512), None);
     }
 }

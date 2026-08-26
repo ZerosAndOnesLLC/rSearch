@@ -81,23 +81,31 @@ impl Metastore {
     }
 
     /// Published splits smaller than `max_size_bytes`, grouped by stream,
-    /// ordered by time — merge candidates.
+    /// ordered by time — merge candidates. The window is per stream — each
+    /// stream's `per_stream_limit` oldest candidates — so one backlogged
+    /// stream can't fill the whole result and starve the rest (#60).
     pub async fn small_published_splits(
         &self,
         max_size_bytes: i64,
-        limit: i64,
+        per_stream_limit: i64,
     ) -> MetastoreResult<Vec<SplitRecord>> {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
                     time_start_millis, time_end_millis, footer_len, created_by,
                     seq_min, seq_max, tombstone_seq_applied
-             FROM splits
-             WHERE state = 'published' AND size_bytes < $1
-             ORDER BY stream_id, time_start_millis
-             LIMIT $2",
+             FROM (SELECT id, split_id, stream_id, state, storage_key, doc_count,
+                          size_bytes, time_start_millis, time_end_millis, footer_len,
+                          created_by, seq_min, seq_max, tombstone_seq_applied,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY stream_id ORDER BY time_start_millis
+                          ) AS rn
+                   FROM splits
+                   WHERE state = 'published' AND size_bytes < $1) ranked
+             WHERE rn <= $2
+             ORDER BY stream_id, time_start_millis",
         )
         .bind(max_size_bytes)
-        .bind(limit)
+        .bind(per_stream_limit)
         .fetch_all(self.pool())
         .await?)
     }
