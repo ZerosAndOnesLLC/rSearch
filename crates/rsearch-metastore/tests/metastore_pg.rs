@@ -172,6 +172,86 @@ async fn split_state_machine() {
 
 #[tokio::test]
 #[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn small_published_splits_windows_per_stream() {
+    let Some(ms) = metastore().await else { return };
+    let busy = ms.ensure_stream(&unique("merge-busy")).await.unwrap();
+    let starved = ms.ensure_stream(&unique("merge-starved")).await.unwrap();
+
+    // The busy stream has more small splits than the window, all newer
+    // than the starved stream's; a global LIMIT would return only busy
+    // rows (#60). The starved stream's two oldest tie on time_start so
+    // the window edge exercises the id tiebreak.
+    let mut created: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for (stream, times) in [
+        (&busy, vec![2_000_000i64, 2_001_000, 2_002_000, 2_003_000]),
+        (&starved, vec![1_000_000, 1_000_000, 1_001_000]),
+    ] {
+        for start in times {
+            let split_id = unique("split");
+            ms.stage_split(&NewSplit {
+                split_id: &split_id,
+                stream_id: stream.id,
+                storage_key: &format!("streams/{}/{split_id}.split", stream.name),
+                doc_count: 100,
+                size_bytes: 4096,
+                time_start_millis: start,
+                time_end_millis: start + 999,
+                footer_len: 512,
+                created_by: None,
+                seq_min: None,
+                seq_max: None,
+                tombstone_seq_applied: 0,
+            })
+            .await
+            .unwrap();
+            ms.publish_split(&split_id).await.unwrap();
+            created.entry(stream.id).or_default().push(split_id);
+        }
+    }
+
+    // The shared dev database may hold other streams' splits; assert only
+    // on rows belonging to the two streams created here.
+    let ours: Vec<_> = ms
+        .small_published_splits(1 << 20, 2)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.stream_id == busy.id || s.stream_id == starved.id)
+        .collect();
+
+    // Each stream contributes exactly its two oldest candidates,
+    // time-ordered within the stream, regardless of how many the busier
+    // stream holds. The starved stream's timestamp tie resolves to
+    // insertion (id) order.
+    let busy_ids: Vec<&str> = ours
+        .iter()
+        .filter(|s| s.stream_id == busy.id)
+        .map(|s| s.split_id.as_str())
+        .collect();
+    let starved_ids: Vec<&str> = ours
+        .iter()
+        .filter(|s| s.stream_id == starved.id)
+        .map(|s| s.split_id.as_str())
+        .collect();
+    let expect = |stream_id: i64| -> Vec<&str> {
+        created[&stream_id][..2].iter().map(String::as_str).collect()
+    };
+    assert_eq!(busy_ids, expect(busy.id));
+    assert_eq!(starved_ids, expect(starved.id));
+    assert!(
+        ours.windows(2).all(|w| w[0].stream_id != w[1].stream_id
+            || w[0].time_start_millis <= w[1].time_start_millis),
+        "rows must be time-ordered within each stream"
+    );
+
+    for stream in [&busy, &starved] {
+        ms.delete_stream(&stream.name).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
 async fn node_heartbeats() {
     let Some(ms) = metastore().await else { return };
     let node_id = unique("node");

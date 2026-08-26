@@ -53,6 +53,11 @@ pub struct ControlPlane {
     /// healthy steady-state ticks don't pay a full-table scan every 15s.
     repair_scan: std::sync::Mutex<RepairScanState>,
     compaction: std::sync::Mutex<CompactionState>,
+    /// Round-robin cursor for the merge job (#60): the stream_id last
+    /// selected for a merge, so the next tick starts past it. In-memory
+    /// only — fairness only needs to hold across one leader's consecutive
+    /// ticks; a new leader restarts the rotation from the lowest id.
+    merge_cursor: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Default)]
@@ -120,6 +125,7 @@ impl ControlPlane {
             metrics,
             repair_scan: std::sync::Mutex::new(RepairScanState::default()),
             compaction: std::sync::Mutex::new(CompactionState::default()),
+            merge_cursor: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -576,29 +582,27 @@ impl ControlPlane {
         }
     }
 
-    /// Combine the first group of >= 2 published splits below the merge
-    /// target in one stream into a single split. One merge per tick
-    /// bounds the work.
+    /// Combine one group of >= 2 published splits below the merge target
+    /// into a single split. Streams are serviced round-robin (#60): the
+    /// first eligible stream past the last one selected, wrapping around,
+    /// so every backlogged stream gets a turn regardless of its stream_id
+    /// or how old its data is. One merge per tick bounds the work.
     async fn merge_job(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
         let target_bytes = self.merge_target_bytes();
         let small = self
             .metastore
-            .small_published_splits(target_bytes, 200)
+            .small_published_splits(target_bytes, MERGE_WINDOW_PER_STREAM)
             .await?;
-        let mut by_stream: BTreeMap<i64, Vec<&SplitRecord>> = BTreeMap::new();
-        for split in &small {
-            by_stream.entry(split.stream_id).or_default().push(split);
-        }
-        let Some((stream_id, group)) = by_stream
-            .into_iter()
-            .find_map(|(id, group)| {
-                let group = merge_candidates(group);
-                let take = merge_take(&group, target_bytes, self.config.merge_max_group);
-                (take >= 2).then(|| (id, group[..take].to_vec()))
-            })
+        let cursor = self.merge_cursor.load(Ordering::Relaxed);
+        let Some((stream_id, group)) =
+            select_merge_group(&small, target_bytes, self.config.merge_max_group, cursor)
         else {
             return Ok(());
         };
+        // Advance before merging, so a stream whose merges keep failing
+        // can't wedge the rotation on itself.
+        self.merge_cursor.store(stream_id, Ordering::Relaxed);
 
         let stream = self.metastore.get_stream_by_id(stream_id).await?;
         info!(
@@ -1007,6 +1011,50 @@ impl ControlPlane {
 /// smaller merge candidate in its stream is left out of the merge group.
 const MERGE_SKEW_FACTOR: i64 = 10;
 
+/// Oldest under-target candidates fetched per stream each merge tick.
+/// The window used to be 200 rows across all streams, which the busiest
+/// stream could occupy entirely, starving the rest (#60); per stream it
+/// only needs to cover `merge_max_group` with headroom for splits the
+/// skew filter excludes.
+const MERGE_WINDOW_PER_STREAM: i64 = 64;
+
+/// Choose which stream to merge this tick: group the candidate window by
+/// stream, run each group through the skew and take rules, and pick the
+/// first eligible stream with id strictly greater than `after_stream`,
+/// wrapping to the lowest when none is (#60). Round-robin keys fairness
+/// on service order, not on the data's timestamps: a merged output that
+/// stays under target re-enters with its sources' ancient time range, so
+/// any data-age priority would hand a tiny-split backlog (or a
+/// historical backfill) the merge slot every tick. Candidates must
+/// arrive time-ordered within each stream, as `small_published_splits`
+/// returns them.
+fn select_merge_group(
+    small: &[SplitRecord],
+    target_bytes: i64,
+    max_group: usize,
+    after_stream: i64,
+) -> Option<(i64, Vec<&SplitRecord>)> {
+    let mut by_stream: BTreeMap<i64, Vec<&SplitRecord>> = BTreeMap::new();
+    for split in small {
+        by_stream.entry(split.stream_id).or_default().push(split);
+    }
+    // Ascending by stream_id (BTreeMap order), so position() finds the
+    // first eligible stream past the cursor and index 0 is the wrap.
+    let mut eligible: Vec<(i64, Vec<&SplitRecord>)> = by_stream
+        .into_iter()
+        .filter_map(|(id, group)| {
+            let group = merge_candidates(group);
+            let take = merge_take(&group, target_bytes, max_group);
+            (take >= 2).then(|| (id, group[..take].to_vec()))
+        })
+        .collect();
+    let pick = eligible
+        .iter()
+        .position(|(id, _)| *id > after_stream)
+        .unwrap_or(0);
+    (!eligible.is_empty()).then(|| eligible.swap_remove(pick))
+}
+
 /// Drop dominant splits from a stream's merge group (#15). Merging is a
 /// full rewrite of every source, so folding a trickle of tiny splits into
 /// one dominant under-target split re-wrote its bytes every tick —
@@ -1178,5 +1226,114 @@ mod tests {
         // leaves it alone.
         let splits = [split(1, 600 << 20)];
         assert_eq!(take_of(&splits, 512, 8), 1);
+    }
+
+    fn stream_split(stream_id: i64, id: i64, size_bytes: i64) -> SplitRecord {
+        SplitRecord {
+            stream_id,
+            ..split(id, size_bytes)
+        }
+    }
+
+    fn selected(
+        splits: &[SplitRecord],
+        target_mb: i64,
+        after_stream: i64,
+    ) -> Option<(i64, Vec<i64>)> {
+        select_merge_group(splits, target_mb << 20, 8, after_stream)
+            .map(|(id, group)| (id, group.iter().map(|s| s.id).collect()))
+    }
+
+    #[test]
+    fn round_robin_advances_past_the_cursor_and_wraps() {
+        let splits = [
+            stream_split(2, 1, 1 << 20),
+            stream_split(2, 2, 1 << 20),
+            stream_split(3, 5, 1 << 20),
+            stream_split(3, 6, 1 << 20),
+            stream_split(4, 8, 1 << 20),
+            stream_split(4, 9, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512, 0), Some((2, vec![1, 2])));
+        assert_eq!(selected(&splits, 512, 2), Some((3, vec![5, 6])));
+        assert_eq!(selected(&splits, 512, 3), Some((4, vec![8, 9])));
+        // Past the highest id: wrap to the lowest.
+        assert_eq!(selected(&splits, 512, 4), Some((2, vec![1, 2])));
+    }
+
+    #[test]
+    fn re_entrant_backlog_does_not_monopolize() {
+        // The residual #60 hazard: stream 2's merged output re-enters
+        // under target with its sources' ancient time range. Data age
+        // must not matter — after servicing stream 2, stream 4 is next.
+        let splits = [
+            stream_split(2, 1, 3 << 20), // merged output, oldest data
+            stream_split(2, 2, 1 << 10),
+            stream_split(4, 10, 1 << 20),
+            stream_split(4, 11, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512, 2), Some((4, vec![10, 11])));
+    }
+
+    #[test]
+    fn rotation_alternates_over_successive_ticks() {
+        // Two perpetually backlogged streams split the merge slots evenly.
+        let splits = [
+            stream_split(2, 1, 1 << 20),
+            stream_split(2, 2, 1 << 20),
+            stream_split(4, 8, 1 << 20),
+            stream_split(4, 9, 1 << 20),
+        ];
+        let mut cursor = 0;
+        let mut serviced = Vec::new();
+        for _ in 0..4 {
+            let (stream_id, _) = selected(&splits, 512, cursor).unwrap();
+            serviced.push(stream_id);
+            cursor = stream_id;
+        }
+        assert_eq!(serviced, vec![2, 4, 2, 4]);
+    }
+
+    #[test]
+    fn stream_with_one_candidate_is_skipped() {
+        let splits = [
+            stream_split(2, 1, 1 << 20),
+            stream_split(3, 5, 1 << 20),
+            stream_split(3, 6, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512, 0), Some((3, vec![5, 6])));
+    }
+
+    #[test]
+    fn skew_filtered_stream_yields_to_the_next() {
+        // Stream 2's oldest group collapses to one survivor after the
+        // dominant split is excluded, so stream 3 is serviced instead.
+        let splits = [
+            stream_split(2, 1, 52 << 20),
+            stream_split(2, 2, 4 << 10),
+            stream_split(3, 5, 1 << 20),
+            stream_split(3, 6, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512, 0), Some((3, vec![5, 6])));
+    }
+
+    #[test]
+    fn group_is_capped_by_take() {
+        // Only the leading splits up to the target-crossing one merge.
+        let splits = [
+            stream_split(2, 1, 300 << 20),
+            stream_split(2, 2, 300 << 20),
+            stream_split(2, 3, 300 << 20),
+        ];
+        assert_eq!(selected(&splits, 512, 0), Some((2, vec![1, 2])));
+    }
+
+    #[test]
+    fn no_eligible_group_selects_nothing() {
+        let splits = [
+            stream_split(2, 1, 1 << 20),
+            stream_split(3, 2, 1 << 20),
+        ];
+        assert_eq!(selected(&splits, 512, 0), None);
     }
 }
