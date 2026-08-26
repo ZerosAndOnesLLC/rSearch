@@ -582,47 +582,52 @@ impl ControlPlane {
         }
     }
 
-    /// Combine one group of >= 2 published splits below the merge target
-    /// into a single split. Streams are serviced round-robin (#60): the
+    /// Combine groups of >= 2 published splits below the merge target
+    /// into single splits, up to `merges_per_tick` per tick (#61).
+    /// Streams are serviced round-robin (#60): each merge goes to the
     /// first eligible stream past the last one selected, wrapping around,
     /// so every backlogged stream gets a turn regardless of its stream_id
-    /// or how old its data is. One merge per tick bounds the work.
+    /// or how old its data is. Merges run serially — peak memory stays
+    /// one writer budget — and candidates are re-fetched between merges,
+    /// since each one changes the published set.
     async fn merge_job(&self) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
         let target_bytes = self.merge_target_bytes();
-        let small = self
-            .metastore
-            .small_published_splits(target_bytes, MERGE_WINDOW_PER_STREAM)
-            .await?;
-        let cursor = self.merge_cursor.load(Ordering::Relaxed);
-        let Some((stream_id, group)) =
-            select_merge_group(&small, target_bytes, self.config.merge_max_group, cursor)
-        else {
-            return Ok(());
-        };
-        // Advance before merging, so a stream whose merges keep failing
-        // can't wedge the rotation on itself.
-        self.merge_cursor.store(stream_id, Ordering::Relaxed);
+        for _ in 0..self.config.merges_per_tick.max(1) {
+            let small = self
+                .metastore
+                .small_published_splits(target_bytes, MERGE_WINDOW_PER_STREAM)
+                .await?;
+            let cursor = self.merge_cursor.load(Ordering::Relaxed);
+            let Some((stream_id, group)) =
+                select_merge_group(&small, target_bytes, self.config.merge_max_group, cursor)
+            else {
+                break;
+            };
+            // Advance before merging, so a stream whose merges keep
+            // failing can't wedge the rotation on itself.
+            self.merge_cursor.store(stream_id, Ordering::Relaxed);
 
-        let stream = self.metastore.get_stream_by_id(stream_id).await?;
-        info!(
-            stream = %stream.name,
-            splits = group.len(),
-            docs = group.iter().map(|s| s.doc_count).sum::<i64>(),
-            "merging small splits"
-        );
-        // A merge is also a compaction: document-mode streams drop their
-        // tombstoned versions on the way through.
-        let tombstones = self.stream_tombstones(&stream).await?;
-        let group_refs: Vec<&SplitRecord> = group.to_vec();
-        let rebuilt = self.rebuild_splits(&stream, &group_refs, &tombstones).await?;
-        match rebuilt {
-            Some(new_split_id) => info!(
-                merged_into = %new_split_id,
-                sources = group.len(),
-                "merge complete"
-            ),
-            None => info!(sources = group.len(), "merge: every document was tombstoned; sources dropped"),
+            let stream = self.metastore.get_stream_by_id(stream_id).await?;
+            info!(
+                stream = %stream.name,
+                splits = group.len(),
+                docs = group.iter().map(|s| s.doc_count).sum::<i64>(),
+                "merging small splits"
+            );
+            // A merge is also a compaction: document-mode streams drop
+            // their tombstoned versions on the way through.
+            let tombstones = self.stream_tombstones(&stream).await?;
+            let group_refs: Vec<&SplitRecord> = group.to_vec();
+            let rebuilt = self.rebuild_splits(&stream, &group_refs, &tombstones).await?;
+            match rebuilt {
+                Some(new_split_id) => info!(
+                    merged_into = %new_split_id,
+                    sources = group.len(),
+                    "merge complete"
+                ),
+                None => info!(sources = group.len(), "merge: every document was tombstoned; sources dropped"),
+            }
         }
         Ok(())
     }
