@@ -8,7 +8,7 @@ use crate::types::{NewSplit, SplitRecord, SplitState, StreamMode, StreamRecord, 
 
 pub(crate) const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
      size_bytes, time_start_millis, time_end_millis, footer_len, created_by, \
-     seq_min, seq_max, tombstone_seq_applied";
+     seq_min, seq_max, tombstone_seq_applied, schema_version";
 
 /// Postgres-backed metadata store shared by every node role: streams,
 /// splits, nodes, placement, auth, routing rules, and alerts. Cloning
@@ -213,8 +213,8 @@ impl Metastore {
         sqlx::query(
             "INSERT INTO splits (split_id, stream_id, storage_key, doc_count, size_bytes,
                                  time_start_millis, time_end_millis, footer_len, created_by,
-                                 seq_min, seq_max, tombstone_seq_applied)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                                 seq_min, seq_max, tombstone_seq_applied, schema_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(split.split_id)
         .bind(split.stream_id)
@@ -228,9 +228,31 @@ impl Metastore {
         .bind(split.seq_min)
         .bind(split.seq_max)
         .bind(split.tombstone_seq_applied)
+        .bind(split.schema_version)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Published splits built under a layout older than `version`, newest
+    /// data first (it is queried most); at most `limit`. The control
+    /// node's schema-upgrade job rewrites them (issue #66).
+    pub async fn splits_below_schema_version(
+        &self,
+        version: i32,
+        limit: i64,
+    ) -> MetastoreResult<Vec<SplitRecord>> {
+        let query = format!(
+            "SELECT {SPLIT_COLUMNS} FROM splits
+             WHERE state = 'published' AND schema_version < $1
+             ORDER BY time_end_millis DESC
+             LIMIT $2"
+        );
+        Ok(sqlx::query_as::<_, SplitRecord>(sqlx::AssertSqlSafe(query))
+            .bind(version)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// staged → published. Fails if the split is missing or already moved.

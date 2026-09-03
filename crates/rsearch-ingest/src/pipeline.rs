@@ -890,6 +890,7 @@ async fn flush_inner(
             seq_min: packaged.meta.seq_min,
             seq_max: packaged.meta.seq_max,
             tombstone_seq_applied: 0,
+            schema_version: packaged.meta.schema_version as i32,
         })
         .await
     {

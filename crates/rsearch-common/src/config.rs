@@ -184,6 +184,11 @@ pub struct ControlConfig {
     pub compact_max_age_secs: f64,
     /// Max splits rewritten (or marked up to date) per compaction tick.
     pub compact_splits_per_tick: i64,
+    /// Max published splits written under an older layout version that
+    /// are rewritten to the current one per control tick (newest data
+    /// first), so an upgraded cluster converges on one analyzer and every
+    /// split gains the `.keyword` view. 0 disables the pass.
+    pub schema_upgrade_splits_per_tick: i64,
     /// Tombstones are purged from the metastore only once no split can
     /// still hold a version they hide *and* they are at least this old —
     /// the age covers documents still buffered on an ingest node whose
@@ -207,6 +212,7 @@ impl Default for ControlConfig {
             compact_min_tombstones: 1_000,
             compact_max_age_secs: 3_600.0,
             compact_splits_per_tick: 8,
+            schema_upgrade_splits_per_tick: 2,
             tombstone_purge_grace_secs: 3_600.0,
         }
     }

@@ -96,12 +96,13 @@ impl Metastore {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT c.id, c.split_id, c.stream_id, c.state, c.storage_key, c.doc_count,
                     c.size_bytes, c.time_start_millis, c.time_end_millis, c.footer_len,
-                    c.created_by, c.seq_min, c.seq_max, c.tombstone_seq_applied
+                    c.created_by, c.seq_min, c.seq_max, c.tombstone_seq_applied,
+                    c.schema_version
              FROM streams st
              CROSS JOIN LATERAL (
                  SELECT id, split_id, stream_id, state, storage_key, doc_count,
                         size_bytes, time_start_millis, time_end_millis, footer_len,
-                        created_by, seq_min, seq_max, tombstone_seq_applied
+                        created_by, seq_min, seq_max, tombstone_seq_applied, schema_version
                  FROM splits
                  WHERE stream_id = st.id AND state = 'published' AND size_bytes < $1
                  ORDER BY time_start_millis, id
@@ -150,7 +151,7 @@ impl Metastore {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
                     time_start_millis, time_end_millis, footer_len, created_by,
-                    seq_min, seq_max, tombstone_seq_applied
+                    seq_min, seq_max, tombstone_seq_applied, schema_version
              FROM splits
              WHERE state = 'staged'
                AND created_at < now() - make_interval(secs => $1)
@@ -172,7 +173,7 @@ impl Metastore {
         Ok(sqlx::query_as::<_, SplitRecord>(
             "SELECT id, split_id, stream_id, state, storage_key, doc_count, size_bytes,
                     time_start_millis, time_end_millis, footer_len, created_by,
-                    seq_min, seq_max, tombstone_seq_applied
+                    seq_min, seq_max, tombstone_seq_applied, schema_version
              FROM splits
              WHERE state = 'marked_for_delete'
                AND updated_at < now() - make_interval(secs => $1)

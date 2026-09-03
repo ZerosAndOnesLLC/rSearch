@@ -4,7 +4,7 @@
 //! the lock connection; kill the leader and another control node takes
 //! over on its next attempt.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +53,10 @@ pub struct ControlPlane {
     /// healthy steady-state ticks don't pay a full-table scan every 15s.
     repair_scan: std::sync::Mutex<RepairScanState>,
     compaction: std::sync::Mutex<CompactionState>,
+    /// Splits whose schema-upgrade rewrite failed, with the time of the
+    /// failure: skipped for a while so one bad split can't consume the
+    /// per-tick budget forever.
+    schema_upgrade_failed: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Round-robin cursor for the merge job (#60): the stream_id last
     /// selected for a merge, so the next tick starts past it. In-memory
     /// only — fairness only needs to hold across one leader's consecutive
@@ -125,6 +129,7 @@ impl ControlPlane {
             metrics,
             repair_scan: std::sync::Mutex::new(RepairScanState::default()),
             compaction: std::sync::Mutex::new(CompactionState::default()),
+            schema_upgrade_failed: std::sync::Mutex::new(HashMap::new()),
             merge_cursor: std::sync::atomic::AtomicI64::new(0),
         })
     }
@@ -181,6 +186,9 @@ impl ControlPlane {
         }
         if settled && let Err(e) = self.compaction_job().await {
             error!(error = %e, "compaction job failed");
+        }
+        if settled && let Err(e) = self.schema_upgrade_job().await {
+            error!(error = %e, "schema upgrade job failed");
         }
         if let Err(e) = self.tombstone_purge_job().await {
             error!(error = %e, "tombstone purge failed");
@@ -752,6 +760,7 @@ impl ControlPlane {
                 seq_min: packaged.meta.seq_min,
                 seq_max: packaged.meta.seq_max,
                 tombstone_seq_applied: applied_through,
+                schema_version: packaged.meta.schema_version as i32,
             })
             .await?;
         self.metastore
@@ -894,6 +903,76 @@ impl ControlPlane {
         if let Err(e) = step.await {
             warn!(split_id = %split.split_id, error = %e, "compaction step failed");
         }
+    }
+
+    /// Rewrite published splits built under a layout older than
+    /// `CURRENT_SCHEMA_VERSION` (issue #66): after an upgrade the corpus
+    /// converges on one analyzer and every split gains the `.keyword`
+    /// view without operator action. Bounded per tick, newest data first.
+    /// A split whose rewrite fails is skipped for a while so it cannot
+    /// pin the whole budget every tick.
+    async fn schema_upgrade_job(&self) -> anyhow::Result<()> {
+        const RETRY_AFTER: Duration = Duration::from_secs(3600);
+        let budget = self.config.schema_upgrade_splits_per_tick;
+        if budget <= 0 {
+            return Ok(());
+        }
+        let current = rsearch_index::CURRENT_SCHEMA_VERSION as i32;
+        let skipped: Vec<String> = {
+            let mut failed = self.schema_upgrade_failed.lock().unwrap();
+            failed.retain(|_, at| at.elapsed() < RETRY_AFTER);
+            failed.keys().cloned().collect()
+        };
+        let candidates = self
+            .metastore
+            .splits_below_schema_version(current, budget + skipped.len() as i64)
+            .await?;
+        let mut streams: HashMap<i64, Option<rsearch_metastore::StreamRecord>> = HashMap::new();
+        let mut done = 0;
+        for split in candidates.iter().filter(|s| !skipped.contains(&s.split_id)) {
+            if done >= budget {
+                break;
+            }
+            done += 1;
+            let stream = match streams.entry(split.stream_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let fetched = match self.metastore.get_stream_by_id(split.stream_id).await {
+                        Ok(stream) => Some(stream),
+                        Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => None,
+                        Err(e) => return Err(e.into()),
+                    };
+                    e.insert(fetched).clone()
+                }
+            };
+            let Some(stream) = stream else { continue };
+            let step = async {
+                let tombstones = self.stream_tombstones(&stream).await?;
+                info!(
+                    stream = %stream.name,
+                    split_id = %split.split_id,
+                    from_version = split.schema_version,
+                    to_version = current,
+                    docs = split.doc_count,
+                    "rewriting split to the current schema version"
+                );
+                self.rebuild_splits(&stream, &[split], &tombstones).await?;
+                self.metrics
+                    .schema_upgrades
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, anyhow::Error>(())
+            };
+            // Most likely the split was merged or deleted under us; a
+            // persistent failure (unreadable split) is retried later.
+            if let Err(e) = step.await {
+                warn!(split_id = %split.split_id, error = %e, "schema upgrade step failed");
+                self.schema_upgrade_failed
+                    .lock()
+                    .unwrap()
+                    .insert(split.split_id.clone(), std::time::Instant::now());
+            }
+        }
+        Ok(())
     }
 
     /// Purge tombstones no split can still need (see
@@ -1137,6 +1216,7 @@ mod tests {
             seq_min: None,
             seq_max: None,
             tombstone_seq_applied: 0,
+            schema_version: 0,
         }
     }
 

@@ -228,6 +228,24 @@ fields by `name:term` or via `fields`). Aggregations pass
 through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 
+Field semantics follow OpenSearch's dynamic mapping. An unmapped
+string is a `text` field analyzed by the **standard analyzer** (Unicode
+word breaks: `tech_admin` is one token, `Foo-Bar` is two, everything
+lowercased, no stop words) with a **`.keyword` sub-field** holding the
+exact value for strings of at most 256 characters (`ignore_above`).
+`term`/`terms` are not analyzed, so `term role=tech_admin` matches the
+whole token and `term role=admin` matches nothing, while
+`term print_status=printed` still matches "not printed" — on the text
+field, as in OpenSearch; use `print_status.keyword` for exact matching.
+`match`/`match_phrase` analyze their input; on `.keyword` the whole text
+is one term. `prefix`, `wildcard`, `range` and `exists` work on both
+views, and aggregations on `<path>.keyword` use the exact values (the
+bare path is accepted too, a superset of OpenSearch). Explicitly mapped
+`text` fields use the same analyzer; mapped `keyword` fields are exact.
+Splits written before v0.5 (schema version 2) keep their old tokens and
+have no `.keyword` view until the control node rewrites them (see
+`control.schema_upgrade_splits_per_tick` below).
+
 Deep pagination uses `search_after`: every hit's `sort` values are
 `[timestamp_millis, _seq]` — the `_seq` element is an implicit unique
 tiebreak appended to the timestamp sort, the way Elasticsearch's
@@ -295,6 +313,17 @@ On a document-mode index:
   (`control.compact_splits_per_tick`, default 8 per control tick, so a
   stream with many splits takes several ticks) plus `control.gc_grace_secs`
   for the old split object — lower those if an erasure SLA requires.
+  A separate pass rewrites splits whose on-disk layout predates the
+  running version (`control.schema_upgrade_splits_per_tick`, default 2,
+  newest data first, 0 disables; `rsearch_schema_upgrades_total` counts
+  them), so after an upgrade the corpus converges on one analyzer and
+  every split gains its `.keyword` view without operator action — while
+  it runs, a query can see old tokens from not-yet-rewritten splits.
+  Upgrade order matters for v0.5: new splits record the `standard`
+  tokenizer, which an older binary cannot resolve for `match` and
+  `query_string`, so upgrade search nodes before ingest and control
+  nodes (or stop all, then start all) and treat the release as
+  forward-only.
   Tombstone rows are purged once every split of the stream has applied
   them and they are older than `control.tombstone_purge_grace_secs`
   (default 1h); that grace also covers documents still buffered on an
