@@ -19,7 +19,6 @@ use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery};
 use tantivy::schema::{Term, Value as _};
 use tantivy::{DocAddress, TantivyDocument};
 use tokio::sync::Mutex;
-use tracing::warn;
 
 use rsearch_index::{
     ExcludeDocsQuery, ExclusionSet, IndexMapping, MappedSchema, SplitCache, SplitReader, Tombstone,
@@ -33,6 +32,17 @@ use crate::query_dsl::{
 };
 
 const TIMESTAMP_ALIASES: [&str; 3] = ["@timestamp", "timestamp", "_timestamp"];
+
+/// Sort fields accepted as no-ops: ES allows them alongside a field
+/// sort, and our single timestamp order already fixes the sequence.
+const SORT_NOOP_FIELDS: [&str; 2] = ["_score", "_doc"];
+
+fn unsupported_sort_field(field: &str) -> SearchError {
+    SearchError::BadRequest(format!(
+        "unsupported sort field '{field}': only the timestamp \
+         (@timestamp/timestamp/_timestamp), _score and _doc can be sorted on"
+    ))
+}
 /// Cap on cached open split readers (LRU), across all shards.
 const READER_CACHE_CAP: usize = 256;
 /// Reader-cache shards: every split touch on every query locks the cache
@@ -141,7 +151,13 @@ impl SearchRequest {
             Some(Value::Number(n)) => n.as_u64().map(|v| v as usize),
             _ => Some(DEFAULT_TRACK_TOTAL_HITS),
         };
-        // Sort: timestamp desc default; only timestamp sorts supported in v1.
+        // Sort: timestamp desc default; only timestamp sorts supported in
+        // v1. Anything else is a 400 rather than a silently ignored
+        // clause: a request that succeeds in the wrong order is
+        // indistinguishable from a correct one to the caller, and a
+        // `search_after` cursor issued from it pages over the wrong
+        // sequence (#67). `_score`/`_doc` are tolerated as no-ops the way
+        // ES accepts them alongside a field sort.
         let mut sort_desc = true;
         if let Some(sorts) = body.get("sort") {
             let entries: Vec<&Value> = match sorts {
@@ -153,6 +169,8 @@ impl SearchRequest {
                     Value::String(s) if TIMESTAMP_ALIASES.contains(&s.as_str()) => {
                         sort_desc = false;
                     }
+                    Value::String(s) if SORT_NOOP_FIELDS.contains(&s.as_str()) => {}
+                    Value::String(s) => return Err(unsupported_sort_field(s)),
                     Value::Object(map) => {
                         for (field, spec) in map {
                             if TIMESTAMP_ALIASES.contains(&field.as_str()) {
@@ -161,12 +179,16 @@ impl SearchRequest {
                                     .and_then(Value::as_str)
                                     .unwrap_or_else(|| spec.as_str().unwrap_or("desc"));
                                 sort_desc = order != "asc";
-                            } else if field != "_score" && field != "_doc" {
-                                warn!(field, "ignoring unsupported sort field");
+                            } else if !SORT_NOOP_FIELDS.contains(&field.as_str()) {
+                                return Err(unsupported_sort_field(field));
                             }
                         }
                     }
-                    _ => {}
+                    other => {
+                        return Err(SearchError::BadRequest(format!(
+                            "sort entries must be a field name or an object, got {other}"
+                        )));
+                    }
                 }
             }
         }
@@ -1221,6 +1243,45 @@ mod tests {
             parsed.search_after.unwrap().timestamp_millis,
             rsearch_index::MAX_SAFE_MILLIS
         );
+    }
+
+    #[test]
+    fn parses_sort() {
+        // Default and explicit timestamp sorts.
+        assert!(SearchRequest::parse("logs", &json!({})).unwrap().sort_desc);
+        for body in [
+            json!({"sort": "@timestamp"}),
+            json!({"sort": ["timestamp"]}),
+            json!({"sort": [{"@timestamp": "asc"}]}),
+            json!({"sort": [{"_timestamp": {"order": "asc"}}]}),
+            // _score/_doc ride along as no-ops, as in ES.
+            json!({"sort": [{"@timestamp": "asc"}, "_score", {"_doc": "asc"}]}),
+        ] {
+            let parsed = SearchRequest::parse("logs", &body).unwrap();
+            assert!(!parsed.sort_desc, "{body}");
+        }
+        assert!(
+            SearchRequest::parse("logs", &json!({"sort": [{"@timestamp": "desc"}]}))
+                .unwrap()
+                .sort_desc
+        );
+    }
+
+    #[test]
+    fn sort_rejects_unsupported_fields() {
+        // A sort we cannot honour is a 400, never a 200 in timestamp
+        // order: the caller cannot tell the difference, and a
+        // search_after cursor from it pages the wrong sequence (#67).
+        for body in [
+            json!({"sort": [{"n": "asc"}]}),
+            json!({"sort": [{"id": {"order": "desc"}}]}),
+            json!({"sort": "n"}),
+            json!({"sort": [{"@timestamp": "asc"}, {"n": "asc"}]}),
+            json!({"sort": [42]}),
+        ] {
+            let err = SearchRequest::parse("logs", &body).unwrap_err();
+            assert!(matches!(err, SearchError::BadRequest(_)), "{body}");
+        }
     }
 
     #[test]

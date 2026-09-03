@@ -228,6 +228,11 @@ fields by `name:term` or via `fields`). Aggregations pass
 through Tantivy's ES-compatible module (terms, date_histogram, stats,
 percentiles, cardinality, …).
 
+Sorting is by timestamp only (`@timestamp`/`timestamp`/`_timestamp`,
+default descending); `_score` and `_doc` are accepted as no-ops. A
+`sort` on any other field is rejected with 400 rather than silently
+returning timestamp order.
+
 Deep pagination uses `search_after`: every hit's `sort` values are
 `[timestamp_millis, _seq]` — the `_seq` element is an implicit unique
 tiebreak appended to the timestamp sort, the way Elasticsearch's
