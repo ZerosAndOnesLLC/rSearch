@@ -5,7 +5,7 @@ use tantivy::time::OffsetDateTime;
 use tantivy::time::format_description::well_known::Rfc3339;
 
 use crate::error::{IndexError, IndexResult};
-use crate::mapping::{FieldType, MappedSchema};
+use crate::mapping::{FieldType, KEYWORD_IGNORE_ABOVE, MappedSchema};
 
 /// A document's identity within its stream: the `_id` (client-supplied or
 /// generated) and the write sequence stamp that orders versions of it.
@@ -169,6 +169,19 @@ impl DocumentConverter {
             }
         }
         if !dynamic.is_empty() {
+            // The `.keyword` view: exact string values, with OpenSearch's
+            // dynamic `ignore_above` applied. Built before `dynamic` is
+            // moved into the tokenized field.
+            if let Some(raw_field) = self.schema.dynamic_raw
+                && let Some(raw) = keyword_projection(&dynamic)
+            {
+                out.add_object(
+                    raw_field,
+                    raw.into_iter()
+                        .map(|(k, v)| (k, tantivy::schema::OwnedValue::from(v)))
+                        .collect(),
+                );
+            }
             out.add_object(
                 self.schema.dynamic,
                 dynamic
@@ -178,6 +191,34 @@ impl DocumentConverter {
             );
         }
         Ok((out, timestamp))
+    }
+}
+
+/// The subset of `obj` that gets a `.keyword` value: string leaves of at
+/// most [`KEYWORD_IGNORE_ABOVE`] characters, keeping their object/array
+/// nesting so the JSON path is the same as in `_dynamic`. None when no
+/// string qualifies.
+fn keyword_projection(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let projected: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter_map(|(k, v)| keyword_value(v).map(|v| (k.clone(), v)))
+        .collect();
+    (!projected.is_empty()).then_some(projected)
+}
+
+fn keyword_value(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::String(s) => {
+            (s.chars().count() <= KEYWORD_IGNORE_ABOVE).then(|| value.clone())
+        }
+        serde_json::Value::Object(map) => keyword_projection(map).map(serde_json::Value::Object),
+        serde_json::Value::Array(items) => {
+            let kept: Vec<serde_json::Value> = items.iter().filter_map(keyword_value).collect();
+            (!kept.is_empty()).then_some(serde_json::Value::Array(kept))
+        }
+        _ => None,
     }
 }
 
@@ -290,8 +331,47 @@ mod tests {
             )
             .unwrap();
         assert_ne!(ts, fallback());
-        // _source + _timestamp + 4 mapped + _dynamic
-        assert!(doc.field_values().count() >= 6);
+        // _source + _timestamp + 4 mapped + _dynamic + _dynamic_raw
+        assert!(doc.field_values().count() >= 7);
+    }
+
+    #[test]
+    fn keyword_projection_keeps_short_strings_only() {
+        let long = "x".repeat(KEYWORD_IGNORE_ABOVE + 1);
+        let exact = "y".repeat(KEYWORD_IGNORE_ABOVE);
+        let obj = serde_json::json!({
+            "role": "tech_admin",
+            "n": 1,
+            "flag": true,
+            "long": long,
+            "exact": exact,
+            "nested": {"city": "Austin", "count": 2, "deeper": {"zip": "78701"}},
+            "tags": ["a", 7, {"k": "v"}, long, null],
+            "numbers": [1, 2],
+            "empty": {},
+        });
+        let projected = keyword_projection(obj.as_object().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::Value::Object(projected),
+            serde_json::json!({
+                "role": "tech_admin",
+                "exact": exact,
+                "nested": {"city": "Austin", "deeper": {"zip": "78701"}},
+                "tags": ["a", {"k": "v"}],
+            })
+        );
+        assert!(keyword_projection(serde_json::json!({"n": 1}).as_object().unwrap()).is_none());
+    }
+
+    /// Legacy layouts have no `_dynamic_raw`; conversion must not touch it.
+    #[test]
+    fn legacy_schema_gets_no_raw_field() {
+        let schema = MappedSchema::build_versioned(IndexMapping::default(), 1);
+        assert!(schema.dynamic_raw.is_none());
+        let c = DocumentConverter::new(schema);
+        let (doc, _) = c.convert(serde_json::json!({"role": "tech_admin"}), fallback()).unwrap();
+        // _source + _timestamp + _id + _seq + _dynamic
+        assert_eq!(doc.field_values().count(), 5);
     }
 
     #[test]

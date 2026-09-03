@@ -74,6 +74,7 @@ async fn stream_mode_is_fixed_once_data_exists() {
         seq_min: None,
         seq_max: None,
         tombstone_seq_applied: 0,
+        schema_version: 0,
     })
     .await
     .unwrap();
@@ -108,6 +109,7 @@ async fn split_state_machine() {
         seq_min: Some(10),
         seq_max: Some(20),
         tombstone_seq_applied: 0,
+        schema_version: 0,
     })
     .await
     .unwrap();
@@ -202,6 +204,7 @@ async fn small_published_splits_windows_per_stream() {
                 seq_min: None,
                 seq_max: None,
                 tombstone_seq_applied: 0,
+                schema_version: 0,
             })
             .await
             .unwrap();
@@ -444,6 +447,7 @@ async fn tombstones_upsert_and_page_by_seq() {
         seq_min: Some(1),
         seq_max: Some(2),
         tombstone_seq_applied: applied,
+        schema_version: 0,
         }
     }
     let s1 = unique("s1");
@@ -493,6 +497,7 @@ async fn stray_object_keys_finds_placements_without_split_rows() {
         seq_min: None,
         seq_max: None,
         tombstone_seq_applied: 0,
+        schema_version: 0,
     })
     .await
     .unwrap();
@@ -516,5 +521,68 @@ async fn stray_object_keys_finds_placements_without_split_rows() {
 
     ms.remove_object_locations(&stray_key).await.unwrap();
     ms.remove_object_locations(&tracked_key).await.unwrap();
+    ms.delete_stream(&stream.name).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (set RSEARCH_TEST_DATABASE_URL)"]
+async fn splits_below_schema_version_lists_stale_layouts_newest_first() {
+    let Some(ms) = metastore().await else { return };
+    let stream = ms.ensure_stream(&unique("schema-upgrade")).await.unwrap();
+
+    // Two legacy splits (versions 0 and 1) and one current; only the
+    // legacy ones are upgrade candidates, newest data first (#66).
+    let mut ids = Vec::new();
+    for (version, end) in [(0, 1_000_999i64), (2, 3_000_999), (1, 2_000_999)] {
+        let split_id = unique("split");
+        ms.stage_split(&NewSplit {
+            split_id: &split_id,
+            stream_id: stream.id,
+            storage_key: &format!("streams/{}/{split_id}.split", stream.name),
+            doc_count: 10,
+            size_bytes: 1024,
+            time_start_millis: end - 999,
+            time_end_millis: end,
+            footer_len: 128,
+            created_by: None,
+            seq_min: None,
+            seq_max: None,
+            tombstone_seq_applied: 0,
+            schema_version: version,
+        })
+        .await
+        .unwrap();
+        ms.publish_split(&split_id).await.unwrap();
+        ids.push((version, split_id));
+    }
+
+    // The shared dev database may hold other streams' splits.
+    let ours: Vec<_> = ms
+        .splits_below_schema_version(2, 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.stream_id == stream.id)
+        .collect();
+    let expected: Vec<&str> = ids
+        .iter()
+        .filter(|(v, _)| *v < 2)
+        .map(|(_, id)| id.as_str())
+        .collect();
+    assert_eq!(ours.len(), 2);
+    assert_eq!(ours[0].split_id, expected[1], "version-1 split has the newer data");
+    assert_eq!(ours[1].split_id, expected[0]);
+    assert!(ours.iter().all(|s| s.schema_version < 2));
+
+    // The column round-trips through every split read path.
+    let current = ms
+        .splits_for_query(stream.id, None, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.time_end_millis == 3_000_999)
+        .unwrap();
+    assert_eq!(current.schema_version, 2);
+
     ms.delete_stream(&stream.name).await.unwrap();
 }

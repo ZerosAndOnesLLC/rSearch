@@ -31,6 +31,8 @@ pub struct ControlMetrics {
     pub compactions: AtomicU64,
     /// Documents physically removed by compaction rewrites.
     pub compacted_docs: AtomicU64,
+    /// Splits rewritten from an older layout version to the current one.
+    pub schema_upgrades: AtomicU64,
     /// Tombstone rows purged from the metastore.
     pub tombstones_purged: AtomicU64,
     /// Tombstone rows pending (as of the last compaction scan).
@@ -188,6 +190,12 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             "rsearch_compacted_docs_total",
             "Document versions physically removed by compaction.",
             control.compacted_docs.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_schema_upgrades_total",
+            "Splits rewritten from an older layout version to the current one.",
+            control.schema_upgrades.load(Ordering::Relaxed),
         );
         gauge(
             &mut out,

@@ -11,6 +11,7 @@ mod exclusions;
 mod mapping;
 mod reader;
 mod split_file;
+mod tokenizer;
 
 pub use builder::{PackagedSplit, SplitBuilder};
 pub use dynamic_paths::dynamic_string_paths;
@@ -23,7 +24,9 @@ pub use document::{
 pub use error::{IndexError, IndexResult};
 pub use exclusions::{ExcludeDocsQuery, ExclusionSet, Tombstone};
 pub use mapping::{
-    CURRENT_SCHEMA_VERSION, DYNAMIC_FIELD, FieldType, ID_FIELD, IndexMapping, MappedSchema,
-    SEQ_FIELD, SOURCE_FIELD, TIMESTAMP_FIELD,
+    CURRENT_SCHEMA_VERSION, DYNAMIC_FIELD, DYNAMIC_RAW_FIELD, FieldType, ID_FIELD, IndexMapping,
+    KEYWORD_IGNORE_ABOVE, KEYWORD_SUBFIELD, MappedSchema, SEQ_FIELD, SOURCE_FIELD,
+    TIMESTAMP_FIELD,
 };
 pub use split_file::{BundleMeta, FOOTER_TAIL_LEN, FileSpan, SplitMeta, parse_footer_tail, parse_meta};
+pub use tokenizer::{STANDARD_TOKENIZER, register_tokenizers, standard_analyzer};

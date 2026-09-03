@@ -24,3 +24,4 @@ rsearch-storage.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
+unicode-segmentation = "1"

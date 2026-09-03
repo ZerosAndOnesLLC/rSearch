@@ -126,6 +126,10 @@ pub struct SplitRecord {
     /// Highest tombstone `seq` applied when the split was built (0 for
     /// ingest-built splits: nothing applied yet).
     pub tombstone_seq_applied: i64,
+    /// Split layout version it was built under (see
+    /// `rsearch_index::CURRENT_SCHEMA_VERSION`); 0 for rows registered
+    /// before the column existed.
+    pub schema_version: i32,
 }
 
 /// A split to register (see `Metastore::stage_split`).
@@ -155,6 +159,8 @@ pub struct NewSplit<'a> {
     pub seq_max: Option<i64>,
     /// Highest tombstone seq applied while building.
     pub tombstone_seq_applied: i64,
+    /// Split layout version it was built under.
+    pub schema_version: i32,
 }
 
 impl SplitRecord {

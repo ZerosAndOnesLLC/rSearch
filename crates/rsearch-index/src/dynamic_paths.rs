@@ -95,7 +95,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        let index = tantivy::Index::create_in_ram(schema.schema.clone());
+        let index = schema.create_in_ram();
         let mut writer = index.writer(15_000_000).unwrap();
         let converter = crate::document::DocumentConverter::new(schema.clone());
         for doc in [
