@@ -54,6 +54,7 @@ impl SplitBuilder {
         let index_dir = work_dir.path().join("index");
         std::fs::create_dir(&index_dir)?;
         let index = Index::create_in_dir(&index_dir, schema.schema.clone())?;
+        crate::tokenizer::register_tokenizers(&index);
         let writer = index.writer_with_num_threads(1, memory_budget)?;
         Ok(Self {
             split_id: uuid::Uuid::new_v4().simple().to_string(),

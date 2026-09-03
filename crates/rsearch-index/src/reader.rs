@@ -100,6 +100,7 @@ impl SplitReader {
         // reader once here (also blocking: it opens every segment).
         let (index, reader) = tokio::task::spawn_blocking(move || {
             let index = Index::open(directory)?;
+            crate::tokenizer::register_tokenizers(&index);
             let reader = index
                 .reader_builder()
                 .reload_policy(tantivy::ReloadPolicy::Manual)

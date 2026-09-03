@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use tantivy::schema::{
-    DateOptions, DateTimePrecision, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT,
+    DateOptions, DateTimePrecision, FAST, Field, INDEXED, IndexRecordOption, JsonObjectOptions,
+    STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions,
 };
+
+use crate::tokenizer::STANDARD_TOKENIZER;
 
 use crate::error::{IndexError, IndexResult};
 
@@ -20,10 +23,21 @@ pub const ID_FIELD: &str = "_id";
 /// since epoch) taken when the write was accepted. Orders versions of the
 /// same `_id` and scopes tombstones. Present with `schema_version >= 1`.
 pub const SEQ_FIELD: &str = "_seq";
+/// Reserved JSON field holding the exact (untokenized) string values of
+/// unmapped keys: the `<path>.keyword` sub-field OpenSearch maps every
+/// dynamic string with. Present with `schema_version >= 2`.
+pub const DYNAMIC_RAW_FIELD: &str = "_dynamic_raw";
+/// Sub-field name for the exact-value view of a dynamic string.
+pub const KEYWORD_SUBFIELD: &str = "keyword";
+/// OpenSearch's `ignore_above` on dynamic keyword sub-fields: strings
+/// longer than this many characters have no `.keyword` value.
+pub const KEYWORD_IGNORE_ABOVE: usize = 256;
 /// Schema version written into new splits. `0` (or absent in the footer)
 /// is the legacy layout without `_id`/`_seq`; `1` adds them after the
-/// mapped fields so legacy field ordinals are unchanged.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// mapped fields so legacy field ordinals are unchanged; `2` switches
+/// text analysis to the OpenSearch `standard` analyzer and appends the
+/// `_dynamic_raw` keyword sub-field store (issue #66).
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Supported field types — the ES mapping subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +150,9 @@ pub struct MappedSchema {
     pub id: Option<Field>,
     /// Handle to the `_seq` fast field; None for legacy schemas.
     pub seq: Option<Field>,
+    /// Handle to the `_dynamic_raw` JSON field (exact string values of
+    /// unmapped keys, the `.keyword` view); None before version 2.
+    pub dynamic_raw: Option<Field>,
     /// The layout version this schema follows.
     pub schema_version: u32,
 }
@@ -159,13 +176,29 @@ impl MappedSchema {
                 .set_fast()
                 .set_precision(DateTimePrecision::Milliseconds),
         );
-        let dynamic = builder.add_json_field(DYNAMIC_FIELD, TEXT | FAST);
+        // Version 2 analyzes text the way OpenSearch does; earlier splits
+        // were written with Tantivy's `default` tokenizer and must be
+        // read back with the layout they were built under.
+        let (text_options, dynamic_options): (TextOptions, JsonObjectOptions) = if schema_version >= 2 {
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer(STANDARD_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            (
+                TextOptions::default().set_indexing_options(indexing.clone()),
+                JsonObjectOptions::default()
+                    .set_indexing_options(indexing)
+                    .set_fast(None),
+            )
+        } else {
+            (TEXT.into(), (TEXT | FAST).into())
+        };
+        let dynamic = builder.add_json_field(DYNAMIC_FIELD, dynamic_options);
 
         let mut fields = BTreeMap::new();
         for (name, ty) in &mapping.properties {
             let field = match ty {
                 FieldType::Keyword => builder.add_text_field(name, STRING | FAST),
-                FieldType::Text => builder.add_text_field(name, TEXT),
+                FieldType::Text => builder.add_text_field(name, text_options.clone()),
                 FieldType::Long => builder.add_i64_field(name, INDEXED | FAST),
                 FieldType::Double => builder.add_f64_field(name, INDEXED | FAST),
                 FieldType::Boolean => builder.add_bool_field(name, INDEXED | FAST),
@@ -190,6 +223,23 @@ impl MappedSchema {
         } else {
             (None, None)
         };
+        // Exact string values, one term per value (the `raw` tokenizer),
+        // no positions needed. Also a fast field: range, exists and
+        // aggregations on `<path>.keyword` read it, which keeps
+        // `ignore_above` semantics (a value past the limit has no keyword
+        // view at all) exactly as OpenSearch's keyword doc values do.
+        let dynamic_raw = (schema_version >= 2).then(|| {
+            builder.add_json_field(
+                DYNAMIC_RAW_FIELD,
+                JsonObjectOptions::default()
+                    .set_indexing_options(
+                        TextFieldIndexing::default()
+                            .set_tokenizer("raw")
+                            .set_index_option(IndexRecordOption::Basic),
+                    )
+                    .set_fast(None),
+            )
+        });
 
         Self {
             schema: builder.build(),
@@ -200,8 +250,24 @@ impl MappedSchema {
             mapping,
             id,
             seq,
+            dynamic_raw,
             schema_version,
         }
+    }
+
+    /// Name of the analyzer `text` fields and `_dynamic` strings were
+    /// indexed with under this layout version — what `match`-style
+    /// queries must analyze their input with to hit the same tokens.
+    pub fn text_tokenizer(&self) -> &'static str {
+        if self.schema_version >= 2 { STANDARD_TOKENIZER } else { "default" }
+    }
+
+    /// A fresh in-memory Tantivy index over this schema with rSearch's
+    /// analyzers registered (tests and tooling).
+    pub fn create_in_ram(&self) -> tantivy::Index {
+        let index = tantivy::Index::create_in_ram(self.schema.clone());
+        crate::tokenizer::register_tokenizers(&index);
+        index
     }
 }
 

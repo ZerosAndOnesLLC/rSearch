@@ -1244,7 +1244,7 @@ mod tests {
     /// version.
     fn build_index(schema_version: u32, docs: &[(i64, i64)]) -> (MappedSchema, tantivy::Index) {
         let schema = MappedSchema::build_versioned(IndexMapping::default(), schema_version);
-        let index = tantivy::Index::create_in_ram(schema.schema.clone());
+        let index = schema.create_in_ram();
         let converter = DocumentConverter::new(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 20 << 20).unwrap();
         for (i, (ts, seq)) in docs.iter().enumerate() {

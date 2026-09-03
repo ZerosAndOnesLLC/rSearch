@@ -9,8 +9,8 @@ use std::ops::Bound;
 
 use serde_json::Value;
 use tantivy::query::{
-    AllQuery, BooleanQuery, ExistsQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
-    RangeQuery, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, EmptyQuery, ExistsQuery, FuzzyTermQuery, Occur, PhraseQuery, Query,
+    QueryParser, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Term};
 use tantivy::time::OffsetDateTime;
@@ -27,7 +27,14 @@ const TIMESTAMP_ALIASES: [&str; 3] = ["@timestamp", "timestamp", "_timestamp"];
 enum Resolved {
     Timestamp(Field),
     Typed(Field, FieldType),
+    /// An unmapped name: a path into the tokenized `_dynamic` JSON field.
     Dynamic(Field, String),
+    /// `<path>.keyword` on an unmapped name: the exact-value view in
+    /// `_dynamic_raw` (issue #66). The field is None on splits written
+    /// before schema version 2, where the clause can match nothing —
+    /// the same way a `.keyword` sub-field that was never mapped behaves
+    /// in OpenSearch.
+    DynamicKeyword(Option<Field>, String),
 }
 
 fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
@@ -50,7 +57,35 @@ fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
     {
         return Resolved::Typed(field, FieldType::Long);
     }
+    // OpenSearch maps every dynamic string as `text` with a `keyword`
+    // sub-field; only unmapped names have one here too. A mapped field's
+    // `.keyword` falls through to a raw path no document holds, i.e. it
+    // matches nothing — as an undeclared sub-field does in OpenSearch.
+    if let Some(base) = name.strip_suffix(KEYWORD_PATH_SUFFIX)
+        && !base.is_empty()
+    {
+        return Resolved::DynamicKeyword(schema.dynamic_raw, base.to_string());
+    }
     Resolved::Dynamic(schema.dynamic, name.to_string())
+}
+
+/// `.keyword`, the OpenSearch dynamic sub-field suffix.
+const KEYWORD_PATH_SUFFIX: &str = ".keyword";
+
+/// A query that matches no document: the `.keyword` view on a split
+/// written before it existed.
+fn empty_query() -> Box<dyn Query> {
+    Box::new(EmptyQuery)
+}
+
+/// Exact-value term for `path` in the `_dynamic_raw` field. Non-string
+/// JSON literals are matched by their text form, as a keyword field
+/// coerces them in OpenSearch.
+fn raw_term(field: Field, path: &str, value: &Value) -> Term {
+    let mut term = Term::from_field_json_path(field, path, false);
+    let s = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+    term.append_type_and_str(&s);
+    term
 }
 
 /// Rewrite aggregation field names the same way queries resolve them, so
@@ -74,10 +109,20 @@ pub fn rewrite_agg_fields(schema: &MappedSchema, aggs: &Value) -> Value {
                     if k == "field"
                         && let Some(name) = v.as_str()
                     {
+                        // `.keyword` aggregates the raw field's fast column
+                        // (exact values within ignore_above, as OpenSearch's
+                        // keyword doc values). The bare path is accepted too
+                        // — `_dynamic`'s fast values are whole strings — a
+                        // superset of OpenSearch, which rejects text-field
+                        // aggregations. On a legacy split the raw field is
+                        // absent and the aggregation simply has no values.
                         let rewritten = match resolve(schema, name) {
                             Resolved::Timestamp(_) => "_timestamp".to_string(),
                             Resolved::Typed(..) => name.to_string(),
                             Resolved::Dynamic(_, path) => format!("_dynamic.{path}"),
+                            Resolved::DynamicKeyword(_, path) => {
+                                format!("{}.{path}", rsearch_index::DYNAMIC_RAW_FIELD)
+                            }
                         };
                         (k.clone(), Value::String(rewritten))
                     } else if k == "interval" && v.is_string() {
@@ -413,6 +458,8 @@ fn term_query_for(schema: &MappedSchema, name: &str, value: &Value) -> SearchRes
         }
         Resolved::Typed(field, ty) => typed_term(field, ty, value)?,
         Resolved::Dynamic(field, path) => dynamic_term(field, &path, value),
+        Resolved::DynamicKeyword(Some(field), path) => raw_term(field, &path, value),
+        Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
     };
     Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
 }
@@ -495,8 +542,13 @@ fn translate_range(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn 
             }
             Resolved::Typed(field, ty) => typed_term(field, ty, value),
             Resolved::Dynamic(field, path) => Ok(dynamic_term(field, &path, value)),
+            Resolved::DynamicKeyword(Some(field), path) => Ok(raw_term(field, &path, value)),
+            Resolved::DynamicKeyword(None, _) => Err(SearchError::BadRequest(String::new())),
         }
     };
+    if let Resolved::DynamicKeyword(None, _) = resolve(schema, name) {
+        return Ok(empty_query());
+    }
 
     let mut lower = Bound::Unbounded;
     let mut upper = Bound::Unbounded;
@@ -596,10 +648,11 @@ fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn
         let field = match resolve(schema, name) {
             Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => field,
             Resolved::Typed(..) | Resolved::Timestamp(_) => return Err(not_string_field()),
-            Resolved::Dynamic(field, path) => {
+            Resolved::Dynamic(field, path) | Resolved::DynamicKeyword(Some(field), path) => {
                 push_dynamic_path_prefix(&mut pattern, field, &path)?;
                 field
             }
+            Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
         };
         pattern.push_str("(?i:");
         push_regex_literal_str(&mut pattern, text);
@@ -614,11 +667,12 @@ fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn
             Term::from_field_text(field, text)
         }
         Resolved::Typed(..) | Resolved::Timestamp(_) => return Err(not_string_field()),
-        Resolved::Dynamic(field, path) => {
+        Resolved::Dynamic(field, path) | Resolved::DynamicKeyword(Some(field), path) => {
             let mut term = Term::from_field_json_path(field, &path, false);
             term.append_type_and_str(text);
             term
         }
+        Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
     };
     Ok(Box::new(FuzzyTermQuery::new_prefix(term, 0, false)))
 }
@@ -673,12 +727,14 @@ fn translate_wildcard(schema: &MappedSchema, body: &Value) -> SearchResult<Box<d
                 "wildcard query requires a string field, '{name}' is not"
             )));
         }
-        // Unmapped fields: the pattern carries the `_dynamic` path key
-        // prefix literally, so only this path's string terms can match.
-        Resolved::Dynamic(field, path) => {
+        // Unmapped fields: the pattern carries the `_dynamic` (or, for
+        // `.keyword`, `_dynamic_raw`) path key prefix literally, so only
+        // this path's string terms can match.
+        Resolved::Dynamic(field, path) | Resolved::DynamicKeyword(Some(field), path) => {
             push_dynamic_path_prefix(&mut pattern, field, &path)?;
             field
         }
+        Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
     };
     if case_insensitive {
         pattern.push_str("(?i:");
@@ -701,6 +757,12 @@ fn translate_exists(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn
         Resolved::Timestamp(_) => "_timestamp".to_string(),
         Resolved::Typed(..) => name.to_string(),
         Resolved::Dynamic(_, path) => format!("_dynamic.{path}"),
+        // `.keyword` exists only for strings within `ignore_above`: the
+        // raw field's fast column holds exactly those.
+        Resolved::DynamicKeyword(Some(_), path) => {
+            format!("{}.{path}", rsearch_index::DYNAMIC_RAW_FIELD)
+        }
+        Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
     };
     Ok(Box::new(ExistsQuery::new(field_name, true)))
 }
@@ -741,10 +803,10 @@ fn translate_match(
 
     match resolve(schema, name) {
         Resolved::Typed(field, FieldType::Text) => {
-            // Text fields use the default tokenizer (mapping subset v1).
+            // Analyze with the tokenizer the split was written with.
             let mut analyzer = index
                 .tokenizers()
-                .get("default")
+                .get(schema.text_tokenizer())
                 .ok_or_else(|| SearchError::Internal("missing tokenizer".into()))?;
             let tokens = tokenize(&mut analyzer, &text);
             if tokens.is_empty() {
@@ -784,7 +846,7 @@ fn translate_match(
         Resolved::Dynamic(field, path) => {
             let mut analyzer = index
                 .tokenizers()
-                .get("default")
+                .get(schema.text_tokenizer())
                 .ok_or_else(|| SearchError::Internal("missing tokenizer".into()))?;
             let tokens = tokenize(&mut analyzer, &text);
             if tokens.is_empty() {
@@ -817,9 +879,49 @@ fn translate_match(
                 Ok(Box::new(BooleanQuery::new(clauses)))
             }
         }
-        // Non-text mapped fields: match degrades to an exact term.
+        // `.keyword` analyzes with the keyword analyzer, i.e. the whole
+        // text is one term; non-text mapped fields likewise degrade to an
+        // exact term.
         _ => term_query_for(schema, name, spec.get("query").unwrap_or(spec)),
     }
+}
+
+/// Rewrite `name.keyword:` field prefixes in query-string syntax to
+/// `_dynamic_raw.name:` when `name` is unmapped, so Tantivy's parser
+/// targets the exact-value field (its `raw` tokenizer keeps the value
+/// whole). Only a field position is touched: the token must start the
+/// text or follow whitespace, `(`, `+`, `-` or `!`, and end in `:`.
+fn rewrite_keyword_paths(schema: &MappedSchema, text: &str) -> String {
+    let Some(_) = schema.dynamic_raw else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(KEYWORD_PATH_SUFFIX) {
+        let after = &rest[pos + KEYWORD_PATH_SUFFIX.len()..];
+        // Field name: the run of non-space, non-syntax bytes before `.keyword`.
+        let before = &rest[..pos];
+        let start = before
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '(' | '+' | '-' | '!' | ':' | '"'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let name = &before[start..];
+        let is_field_position = after.starts_with(':')
+            && !name.is_empty()
+            && matches!(resolve(schema, name), Resolved::Dynamic(..));
+        if is_field_position {
+            out.push_str(&before[..start]);
+            out.push_str(rsearch_index::DYNAMIC_RAW_FIELD);
+            out.push('.');
+            out.push_str(name);
+            rest = after;
+        } else {
+            out.push_str(&rest[..pos + KEYWORD_PATH_SUFFIX.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `query_string` / `simple_query_string`. Honors `fields` (with ES `^boost`
@@ -840,6 +942,9 @@ fn translate_query_string(
         .get("query")
         .and_then(Value::as_str)
         .ok_or_else(|| SearchError::BadRequest("query_string needs 'query'".into()))?;
+    // `path.keyword:value` inside the text must reach `_dynamic_raw`, which
+    // the parser only does under that field's own name.
+    let query_text = &rewrite_keyword_paths(schema, query_text);
     let conjunction = matches!(
         body.get("default_operator").and_then(Value::as_str),
         Some(op) if op.eq_ignore_ascii_case("and")
@@ -870,6 +975,8 @@ fn translate_query_string(
     let mut default_fields: Vec<Field> = Vec::new();
     let mut boosts: Vec<(Field, f32)> = Vec::new();
     let mut dynamic_paths: Vec<(String, f32)> = Vec::new();
+    let mut raw_paths: Vec<(String, f32)> = Vec::new();
+    let mut legacy_keyword_only = false;
     if all {
         default_fields.extend(
             schema
@@ -902,9 +1009,15 @@ fn translate_query_string(
                 // Numeric/date/ip/timestamp fields can't take free text.
                 Resolved::Typed(..) | Resolved::Timestamp(_) => {}
                 Resolved::Dynamic(_, path) => dynamic_paths.push((path, boost)),
+                Resolved::DynamicKeyword(Some(_), path) => raw_paths.push((path, boost)),
+                // No raw field on this split: the clause matches nothing.
+                Resolved::DynamicKeyword(None, _) => legacy_keyword_only = true,
             }
         }
-        if default_fields.is_empty() && dynamic_paths.is_empty() {
+        if default_fields.is_empty() && dynamic_paths.is_empty() && raw_paths.is_empty() {
+            if legacy_keyword_only {
+                return Ok(empty_query());
+            }
             return Err(SearchError::BadRequest(
                 "query_string 'fields' names no searchable field".into(),
             ));
@@ -932,6 +1045,18 @@ fn translate_query_string(
         let boosts = if boost != 1.0 { vec![(schema.dynamic, boost)] } else { Vec::new() };
         clauses.push((Occur::Should, parse(vec![schema.dynamic], &boosts, &wrapped)));
     }
+    // `.keyword` fields parse against `_dynamic_raw`, whose `raw`
+    // tokenizer makes the whole text one exact term.
+    if let Some(raw) = schema.dynamic_raw {
+        for (path, boost) in raw_paths {
+            let wrapped = format!("{}.{path}:({query_text})", rsearch_index::DYNAMIC_RAW_FIELD);
+            let boosts = if boost != 1.0 { vec![(raw, boost)] } else { Vec::new() };
+            clauses.push((Occur::Should, parse(vec![raw], &boosts, &wrapped)));
+        }
+    }
+    if clauses.is_empty() {
+        return Ok(empty_query());
+    }
     Ok(match clauses.len() {
         1 => clauses.pop().map(|(_, q)| q).expect("one clause"),
         _ => Box::new(BooleanQuery::new(clauses)),
@@ -957,7 +1082,7 @@ mod tests {
     }
 
     fn index(schema: &MappedSchema) -> tantivy::Index {
-        tantivy::Index::create_in_ram(schema.schema.clone())
+        schema.create_in_ram()
     }
 
     /// Path provider for tests: scans the in-RAM index the way the real
@@ -1026,6 +1151,142 @@ mod tests {
         let q = translate_query(&idx, &s, query, &paths_of(&idx, &s))
             .unwrap_or_else(|e| panic!("{query}: {e}"));
         searcher.search(&q, &Count).unwrap()
+    }
+
+    /// Index `docs` under `schema_version` and count hits for `query`.
+    fn count_in(schema_version: u32, docs: &[serde_json::Value], query: &serde_json::Value) -> usize {
+        use rsearch_index::{DocumentConverter, IndexMapping};
+        use tantivy::collector::Count;
+        let s = MappedSchema::build_versioned(IndexMapping::default(), schema_version);
+        let idx = index(&s);
+        let converter = DocumentConverter::new(s.clone());
+        let mut writer = idx.writer_with_num_threads(1, 20 << 20).unwrap();
+        for doc in docs {
+            let (doc, _) = converter
+                .convert(doc.clone(), tantivy::DateTime::from_timestamp_millis(0))
+                .unwrap();
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = idx.reader().unwrap().searcher();
+        let q = translate_query(&idx, &s, query, &paths_of(&idx, &s))
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        searcher.search(&q, &Count).unwrap()
+    }
+
+    /// The issue #66 documents plus one whose value is past `ignore_above`.
+    fn issue66_docs() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"role": "tech_admin", "n": 1, "print_status": "printed", "tag": "Foo-Bar_baz"}),
+            serde_json::json!({"role": "super_admin", "n": 2, "print_status": "not printed", "tag": "x"}),
+            serde_json::json!({"role": "a".repeat(rsearch_index::KEYWORD_IGNORE_ABOVE + 1)}),
+        ]
+    }
+
+    /// Every expectation here was taken from OpenSearch 3.6 running the
+    /// same documents in a dynamically mapped index (issue #66).
+    #[test]
+    fn dynamic_fields_match_opensearch_semantics() {
+        let docs = issue66_docs();
+        let long = "a".repeat(rsearch_index::KEYWORD_IGNORE_ABOVE + 1);
+        let cases: Vec<(serde_json::Value, usize)> = vec![
+            // term is unanalyzed against standard-analyzer tokens: `_` joins.
+            (serde_json::json!({"term": {"role": "tech_admin"}}), 1),
+            (serde_json::json!({"term": {"role": "super_admin"}}), 1),
+            (serde_json::json!({"term": {"role": "Tech_Admin"}}), 0),
+            (serde_json::json!({"term": {"role": "admin"}}), 0),
+            (serde_json::json!({"term": {"role": "tech"}}), 0),
+            // A text-field term still matches a token inside a longer value.
+            (serde_json::json!({"term": {"print_status": "printed"}}), 2),
+            // `.keyword` is the exact value.
+            (serde_json::json!({"term": {"print_status.keyword": "printed"}}), 1),
+            (serde_json::json!({"term": {"role.keyword": "tech_admin"}}), 1),
+            (serde_json::json!({"term": {"role.keyword": {"value": "tech_admin"}}}), 1),
+            (serde_json::json!({"term": {"role.keyword": "Tech_Admin"}}), 0),
+            (serde_json::json!({"terms": {"role.keyword": ["tech_admin", "x"]}}), 1),
+            // match analyzes; on `.keyword` the whole text is one term.
+            (serde_json::json!({"match": {"role": "Tech_Admin"}}), 1),
+            (serde_json::json!({"match": {"role.keyword": "tech_admin"}}), 1),
+            (serde_json::json!({"match": {"role.keyword": "Tech_Admin"}}), 0),
+            (serde_json::json!({"match_phrase": {"print_status": "not printed"}}), 1),
+            (serde_json::json!({"match_phrase": {"print_status.keyword": "not printed"}}), 1),
+            // `-` splits, `_` joins, everything lowercases.
+            (serde_json::json!({"term": {"tag": "foo"}}), 1),
+            (serde_json::json!({"term": {"tag": "bar_baz"}}), 1),
+            // prefix / wildcard on tokens vs the exact value.
+            (serde_json::json!({"prefix": {"role": "tech"}}), 1),
+            (serde_json::json!({"prefix": {"role.keyword": "tech"}}), 1),
+            (serde_json::json!({"prefix": {"role.keyword": {"value": "TECH", "case_insensitive": true}}}), 1),
+            (serde_json::json!({"wildcard": {"role": "*admin"}}), 2),
+            (serde_json::json!({"wildcard": {"print_status": "*print*"}}), 2),
+            (serde_json::json!({"wildcard": {"print_status.keyword": "*print*"}}), 2),
+            (serde_json::json!({"wildcard": {"print_status.keyword": "not*"}}), 1),
+            // exists on `.keyword` excludes values past ignore_above.
+            (serde_json::json!({"exists": {"field": "role"}}), 3),
+            (serde_json::json!({"exists": {"field": "role.keyword"}}), 2),
+            (serde_json::json!({"range": {"role.keyword": {"gte": "s"}}}), 2),
+            (serde_json::json!({"range": {"role.keyword": {"gte": "tech_admin", "lte": "tech_admin"}}}), 1),
+            // ignore_above: no keyword value; the text field split the
+            // over-long word at max_token_length, so the whole is no term.
+            (serde_json::json!({"term": {"role.keyword": long}}), 0),
+            (serde_json::json!({"term": {"role": long}}), 0),
+            // Numbers have no `.keyword`; unknown fields match nothing.
+            (serde_json::json!({"term": {"n": 1}}), 1),
+            (serde_json::json!({"term": {"n.keyword": 1}}), 0),
+            (serde_json::json!({"term": {"nope": 1}}), 0),
+            // query_string: field syntax, bare terms, and `.keyword` paths.
+            (serde_json::json!({"query_string": {"query": "role.keyword:tech_admin"}}), 1),
+            (serde_json::json!({"query_string": {"query": "role.keyword:Tech_Admin"}}), 0),
+            (serde_json::json!({"query_string": {"query": "role:admin"}}), 0),
+            (serde_json::json!({"query_string": {"query": "admin"}}), 0),
+            (serde_json::json!({"query_string": {"query": "tech_admin"}}), 1),
+            (serde_json::json!({"query_string": {"query": "tech_admin", "fields": ["role.keyword"]}}), 1),
+            (serde_json::json!({"query_string": {"query": "\"not printed\"", "fields": ["print_status.keyword"]}}), 1),
+            (serde_json::json!({"bool": {"must_not": [{"term": {"role.keyword": "tech_admin"}}]}}), 2),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(count_in(2, &docs, &query), expected, "{query}");
+        }
+    }
+
+    /// Splits written before schema version 2 have no `.keyword` view:
+    /// those clauses match nothing there rather than failing the request.
+    #[test]
+    fn keyword_clauses_are_empty_on_legacy_splits() {
+        let docs = issue66_docs();
+        for query in [
+            serde_json::json!({"term": {"role.keyword": "tech_admin"}}),
+            serde_json::json!({"terms": {"role.keyword": ["tech_admin"]}}),
+            serde_json::json!({"prefix": {"role.keyword": "tech"}}),
+            serde_json::json!({"prefix": {"role.keyword": {"value": "tech", "case_insensitive": true}}}),
+            serde_json::json!({"wildcard": {"role.keyword": "*admin"}}),
+            serde_json::json!({"exists": {"field": "role.keyword"}}),
+            serde_json::json!({"range": {"role.keyword": {"gte": "a"}}}),
+            serde_json::json!({"match": {"role.keyword": "tech_admin"}}),
+            serde_json::json!({"query_string": {"query": "tech_admin", "fields": ["role.keyword"]}}),
+            serde_json::json!({"query_string": {"query": "role.keyword:tech_admin"}}),
+        ] {
+            assert_eq!(count_in(1, &docs, &query), 0, "{query}");
+        }
+        // The legacy tokenizer is still used to read legacy splits.
+        assert_eq!(count_in(1, &docs, &serde_json::json!({"match": {"role": "admin"}})), 2);
+    }
+
+    #[test]
+    fn keyword_paths_rewrite_only_in_field_position() {
+        let s = schema();
+        assert_eq!(
+            rewrite_keyword_paths(&s, "role.keyword:x AND (city.keyword:y OR -zip.keyword:z)"),
+            "_dynamic_raw.role:x AND (_dynamic_raw.city:y OR -_dynamic_raw.zip:z)"
+        );
+        // Not a field position, a mapped field, or a bare value: untouched.
+        assert_eq!(rewrite_keyword_paths(&s, "find role.keyword here"), "find role.keyword here");
+        assert_eq!(rewrite_keyword_paths(&s, "service.keyword:api"), "service.keyword:api");
+        // Aggregations on `.keyword` read the raw field's fast column.
+        let aggs = rewrite_agg_fields(&s, &serde_json::json!({"r": {"terms": {"field": "role.keyword"}}}));
+        assert_eq!(aggs["r"]["terms"]["field"], "_dynamic_raw.role");
+        let aggs = rewrite_agg_fields(&s, &serde_json::json!({"r": {"terms": {"field": "role"}}}));
+        assert_eq!(aggs["r"]["terms"]["field"], "_dynamic.role");
     }
 
     #[test]
