@@ -21,6 +21,10 @@ cleanup() { [ -n "$PID" ] && kill -9 "$PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
 set -a; source .env; set +a
+# Merging is disabled (both merge knobs 0: the target is the larger of
+# the two, and no split is smaller than 0 bytes) so the compaction job,
+# not a merge, is what makes deletes physical — the assertion below
+# checks for its log line.
 # Point the node at a dedicated test database when .env's DATABASE_URL
 # is a shared dev instance (the table wipe below is destructive).
 DATABASE_URL=${RSEARCH_TEST_DATABASE_URL:-$DATABASE_URL}
@@ -38,6 +42,7 @@ env DATABASE_URL="$DATABASE_URL" \
   RSEARCH_INGEST__DOCUMENT_MAX_BATCH_SECS=1 \
   RSEARCH_INGEST__BALANCE_BULK=false \
   RSEARCH_CONTROL__INTERVAL_SECS=2 \
+  RSEARCH_CONTROL__MERGE_TARGET_MB=0 \
   RSEARCH_CONTROL__MERGE_MIN_MB=0 \
   RSEARCH_CONTROL__GC_GRACE_SECS=2 \
   RSEARCH_CONTROL__COMPACT_MAX_AGE_SECS=5 \
