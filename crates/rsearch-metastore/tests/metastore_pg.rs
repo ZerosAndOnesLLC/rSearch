@@ -75,6 +75,7 @@ async fn stream_mode_is_fixed_once_data_exists() {
         seq_max: None,
         tombstone_seq_applied: 0,
         schema_version: 0,
+        dynamic_fields: None,
     })
     .await
     .unwrap();
@@ -110,6 +111,7 @@ async fn split_state_machine() {
         seq_max: Some(20),
         tombstone_seq_applied: 0,
         schema_version: 0,
+        dynamic_fields: None,
     })
     .await
     .unwrap();
@@ -205,6 +207,7 @@ async fn small_published_splits_windows_per_stream() {
                 seq_max: None,
                 tombstone_seq_applied: 0,
                 schema_version: 0,
+                dynamic_fields: None,
             })
             .await
             .unwrap();
@@ -448,6 +451,7 @@ async fn tombstones_upsert_and_page_by_seq() {
         seq_max: Some(2),
         tombstone_seq_applied: applied,
         schema_version: 0,
+        dynamic_fields: None,
         }
     }
     let s1 = unique("s1");
@@ -498,6 +502,7 @@ async fn stray_object_keys_finds_placements_without_split_rows() {
         seq_max: None,
         tombstone_seq_applied: 0,
         schema_version: 0,
+        dynamic_fields: None,
     })
     .await
     .unwrap();
@@ -549,6 +554,7 @@ async fn splits_below_schema_version_lists_stale_layouts_newest_first() {
             seq_max: None,
             tombstone_seq_applied: 0,
             schema_version: version,
+            dynamic_fields: None,
         })
         .await
         .unwrap();

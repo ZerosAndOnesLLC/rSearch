@@ -54,6 +54,11 @@ pub struct SplitMeta {
     /// Highest `_seq` in the split; None when documents carry no ids.
     #[serde(default)]
     pub seq_max: Option<i64>,
+    /// Unmapped field paths present in `_dynamic` and the value types
+    /// seen under each (issue #76); absent in footers written before it
+    /// was recorded.
+    #[serde(default)]
+    pub dynamic_fields: Option<crate::dynamic_paths::DynamicFields>,
 }
 
 /// Full footer contents: bundled file map + split metadata.

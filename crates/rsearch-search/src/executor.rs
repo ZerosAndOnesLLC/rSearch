@@ -30,19 +30,9 @@ use crate::error::{SearchError, SearchResult};
 use crate::query_dsl::{
     extract_time_bounds, fix_date_histogram_keys, rewrite_agg_fields, translate_query,
 };
-
-const TIMESTAMP_ALIASES: [&str; 3] = ["@timestamp", "timestamp", "_timestamp"];
-
-/// Sort fields accepted as no-ops: ES allows them alongside a field
-/// sort, and our single timestamp order already fixes the sequence.
-const SORT_NOOP_FIELDS: [&str; 2] = ["_score", "_doc"];
-
-fn unsupported_sort_field(field: &str) -> SearchError {
-    SearchError::BadRequest(format!(
-        "unsupported sort field '{field}': only the timestamp \
-         (@timestamp/timestamp/_timestamp), _score and _doc can be sorted on"
-    ))
-}
+use crate::sort::{
+    FieldCursor, FieldSortCollector, FieldSortPlan, SortSpec, SortValue, cmp_hits, resolve_sort,
+};
 /// Cap on cached open split readers (LRU), across all shards.
 const READER_CACHE_CAP: usize = 256;
 /// Reader-cache shards: every split touch on every query locks the cache
@@ -111,8 +101,9 @@ pub struct SearchRequest {
     pub from: usize,
     /// Page size; defaults to 10.
     pub size: usize,
-    /// Timestamp sort direction; true (default) = newest first.
-    pub sort_desc: bool,
+    /// Requested order: timestamp (default newest first) or field
+    /// clauses (issue #77).
+    pub sort: SortSpec,
     /// ES `aggs`/`aggregations` body, if present.
     pub aggs: Option<Value>,
     /// Whether hits include `_source` (`"_source": false` disables).
@@ -124,6 +115,9 @@ pub struct SearchRequest {
     /// pages past `max_result_window` (issue #52). Totals and
     /// aggregations still reflect the full query, as in ES.
     pub search_after: Option<SearchAfter>,
+    /// The raw `search_after` values of a field sort, resolved against
+    /// the stream's mapping at execution time.
+    pub search_after_values: Option<Vec<Value>>,
 }
 
 impl SearchRequest {
@@ -151,55 +145,32 @@ impl SearchRequest {
             Some(Value::Number(n)) => n.as_u64().map(|v| v as usize),
             _ => Some(DEFAULT_TRACK_TOTAL_HITS),
         };
-        // Sort: timestamp desc default; only timestamp sorts supported in
-        // v1. Anything else is a 400 rather than a silently ignored
-        // clause: a request that succeeds in the wrong order is
-        // indistinguishable from a correct one to the caller, and a
-        // `search_after` cursor issued from it pages over the wrong
-        // sequence (#67). `_score`/`_doc` are tolerated as no-ops the way
-        // ES accepts them alongside a field sort.
-        let mut sort_desc = true;
-        if let Some(sorts) = body.get("sort") {
-            let entries: Vec<&Value> = match sorts {
-                Value::Array(items) => items.iter().collect(),
-                single => vec![single],
-            };
-            for entry in entries {
-                match entry {
-                    Value::String(s) if TIMESTAMP_ALIASES.contains(&s.as_str()) => {
-                        sort_desc = false;
-                    }
-                    Value::String(s) if SORT_NOOP_FIELDS.contains(&s.as_str()) => {}
-                    Value::String(s) => return Err(unsupported_sort_field(s)),
-                    Value::Object(map) => {
-                        for (field, spec) in map {
-                            if TIMESTAMP_ALIASES.contains(&field.as_str()) {
-                                let order = spec
-                                    .get("order")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_else(|| spec.as_str().unwrap_or("desc"));
-                                sort_desc = order != "asc";
-                            } else if !SORT_NOOP_FIELDS.contains(&field.as_str()) {
-                                return Err(unsupported_sort_field(field));
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(SearchError::BadRequest(format!(
-                            "sort entries must be a field name or an object, got {other}"
-                        )));
-                    }
-                }
-            }
-        }
+        // Sort: timestamp desc by default; field sorts resolve against
+        // the mapping at execution time (#77). Anything unsortable is a
+        // 400 rather than a silently ignored clause: a request that
+        // succeeds in the wrong order is indistinguishable from a
+        // correct one to the caller, and a `search_after` cursor issued
+        // from it pages over the wrong sequence (#67).
+        let sort = SortSpec::parse(body.get("sort"))?;
+        let field_sort = matches!(sort, SortSpec::Fields(_));
         // search_after: the previous page's last `sort` values. The
         // timestamp is taken verbatim as epoch millis (it is what our own
         // `sort` emitted — no unit heuristic, which would rescale small
         // values), clamped to the tantivy-safe range like every other
         // timestamp input so a hostile cursor can't overflow the nanos
         // conversion.
+        let mut search_after_values = None;
         let search_after = match body.get("search_after") {
             None | Some(Value::Null) => None,
+            Some(Value::Array(vals)) if field_sort => {
+                if vals.is_empty() {
+                    return Err(SearchError::BadRequest(
+                        "search_after must be a non-empty array of sort values".into(),
+                    ));
+                }
+                search_after_values = Some(vals.clone());
+                None
+            }
             Some(Value::Array(vals)) if (1..=2).contains(&vals.len()) => {
                 // Whole-valued floats are accepted: JSON round-trips in
                 // some clients re-encode the echoed integer as a float.
@@ -238,7 +209,7 @@ impl SearchRequest {
                 ));
             }
         };
-        if search_after.is_some() && from != 0 {
+        if (search_after.is_some() || search_after_values.is_some()) && from != 0 {
             return Err(SearchError::BadRequest(
                 "[from] parameter must be set to 0 when [search_after] is used".into(),
             ));
@@ -256,13 +227,27 @@ impl SearchRequest {
             query,
             from,
             size,
-            sort_desc,
+            sort,
             aggs,
             include_source,
             track_total_hits,
             search_after,
+            search_after_values,
         })
     }
+}
+
+/// How one search orders and pages its hits, resolved against the
+/// stream.
+#[derive(Clone)]
+enum SortPlan {
+    /// (timestamp, `_seq`) order with the range-clause cursor.
+    Timestamp {
+        desc: bool,
+        cursor: Option<SearchAfter>,
+    },
+    /// Field clauses collected by [`FieldSortCollector`].
+    Fields(Arc<FieldSortPlan>),
 }
 
 /// A fetched page document: (page position, stored `_id`, `_seq`,
@@ -280,6 +265,8 @@ struct SplitHit {
     seq: Option<i64>,
     split_idx: usize,
     doc: DocAddress,
+    /// Field-sort values (None under a timestamp sort).
+    values: Option<Vec<SortValue>>,
 }
 
 /// A document-mode stream's tombstones as last fetched: ascending by
@@ -306,6 +293,25 @@ struct SplitOutcome {
 struct CachedStream {
     record: rsearch_metastore::StreamRecord,
     schema: Arc<MappedSchema>,
+    /// Unmapped fields its published splits hold (path → value types),
+    /// what field sorts resolve dynamic names against. Fetched on first
+    /// use only (an aggregate over every published split), single-flight,
+    /// and reused for the record's cache lifetime.
+    dynamic_fields: tokio::sync::OnceCell<Arc<std::collections::BTreeMap<String, Vec<String>>>>,
+}
+
+impl CachedStream {
+    async fn dynamic_fields(
+        &self,
+        metastore: &Metastore,
+    ) -> SearchResult<Arc<std::collections::BTreeMap<String, Vec<String>>>> {
+        self.dynamic_fields
+            .get_or_try_init(|| async {
+                Ok(Arc::new(metastore.stream_dynamic_fields(self.record.id).await?))
+            })
+            .await
+            .cloned()
+    }
 }
 
 /// Stateless search service: metastore for pruning, storage for split
@@ -480,6 +486,7 @@ impl SearchService {
         let cached = Arc::new(CachedStream {
             schema: Arc::new(MappedSchema::build(mapping)),
             record,
+            dynamic_fields: tokio::sync::OnceCell::new(),
         });
         let mut streams = self.streams.lock().unwrap();
         // Bounded so a probe flood of stream names can't grow it forever.
@@ -566,11 +573,12 @@ impl SearchService {
                 query: json!({"ids": {"values": chunk}}),
                 from: 0,
                 size: MAX_RESULT_WINDOW,
-                sort_desc: true,
+                sort: SortSpec::Timestamp { desc: true },
                 aggs: None,
                 include_source: true,
                 track_total_hits: Some(0),
                 search_after: None,
+                search_after_values: None,
             };
             let response = self.search(request).await?;
             for hit in response["hits"]["hits"].as_array().into_iter().flatten() {
@@ -633,6 +641,39 @@ impl SearchService {
             None
         };
 
+        // Resolve the sort against the stream (mapping + dynamic field
+        // inventory) before any split is opened, so an unsortable field
+        // is a 400 with OpenSearch's message and a cursor is typed.
+        let plan = match &request.sort {
+            SortSpec::Timestamp { desc } => SortPlan::Timestamp {
+                desc: *desc,
+                cursor: request.search_after,
+            },
+            SortSpec::Fields(fields) => {
+                // The dynamic inventory is only consulted for names the
+                // mapping does not settle.
+                let needs_inventory = fields.iter().any(|f| {
+                    !f.is_timestamp()
+                        && f.field != rsearch_index::SEQ_FIELD
+                        && !schema.fields.contains_key(&f.field)
+                });
+                let inventory = if needs_inventory {
+                    cached.dynamic_fields(&self.metastore).await?
+                } else {
+                    Arc::new(Default::default())
+                };
+                let resolved = resolve_sort(fields, &schema, &inventory)?;
+                let cursor = match &request.search_after_values {
+                    Some(values) => Some(FieldCursor::parse(values, &resolved)?),
+                    None => None,
+                };
+                SortPlan::Fields(Arc::new(FieldSortPlan {
+                    fields: resolved,
+                    cursor,
+                }))
+            }
+        };
+
         let fetch_limit = request.from + request.size;
         let query = Arc::new(request.query.clone());
         // Whether the query is exactly match_all — lets fully-covered
@@ -646,8 +687,6 @@ impl SearchService {
         // Open readers and search all splits concurrently (bounded), in
         // split order so split_idx stays meaningful.
         let track = request.track_total_hits;
-        let sort_desc = request.sort_desc;
-        let cursor = request.search_after;
         // Running total of counted matches across splits. Once it passes
         // track_total_hits, later splits skip their Count collector and the
         // response reports `"relation": "gte"` — the default 10k cap stops
@@ -681,11 +720,18 @@ impl SearchService {
                 // skipped, and when the count is skippable too the split
                 // is not even opened. (Strict compare: a split touching
                 // the boundary timestamp may still hold page docs.)
-                let outside_cursor = match cursor {
-                    Some(c) if sort_desc => split.time_start_millis > c.timestamp_millis,
-                    Some(c) => split.time_end_millis < c.timestamp_millis,
-                    None => false,
+                let outside_cursor = match &plan {
+                    SortPlan::Timestamp {
+                        desc: true,
+                        cursor: Some(c),
+                    } => split.time_start_millis > c.timestamp_millis,
+                    SortPlan::Timestamp {
+                        desc: false,
+                        cursor: Some(c),
+                    } => split.time_end_millis < c.timestamp_millis,
+                    _ => false,
                 };
+                let plan = plan.clone();
                 async move {
                     let skip_count = match track {
                         Some(cap) => counted.load(Ordering::Relaxed) >= cap,
@@ -711,8 +757,7 @@ impl SearchService {
                             &query,
                             aggregations,
                             fetch_limit,
-                            sort_desc,
-                            cursor,
+                            &plan,
                             outside_cursor,
                             skip_count,
                             idx,
@@ -753,19 +798,41 @@ impl SearchService {
         // — legacy docs without one sort as -1), then split index and doc
         // for determinism — so equal timestamps page deterministically
         // (L8) and cursors resume at the same global position (issue #52).
+        let field_orders = match &plan {
+            SortPlan::Fields(plan) => Some(plan.orders()),
+            SortPlan::Timestamp { .. } => None,
+        };
         let cmp = |a: &SplitHit, b: &SplitHit| {
-            let (ts, seq) = if request.sort_desc {
-                (
-                    b.timestamp_millis.cmp(&a.timestamp_millis),
-                    b.seq.unwrap_or(-1).cmp(&a.seq.unwrap_or(-1)),
-                )
-            } else {
-                (
-                    a.timestamp_millis.cmp(&b.timestamp_millis),
-                    a.seq.unwrap_or(-1).cmp(&b.seq.unwrap_or(-1)),
-                )
+            let primary = match &field_orders {
+                Some(orders) => cmp_hits(
+                    orders,
+                    (
+                        a.values.as_deref().unwrap_or(&[]),
+                        a.timestamp_millis,
+                        a.seq.unwrap_or(-1),
+                    ),
+                    (
+                        b.values.as_deref().unwrap_or(&[]),
+                        b.timestamp_millis,
+                        b.seq.unwrap_or(-1),
+                    ),
+                ),
+                None => {
+                    let (ts, seq) = if matches!(plan, SortPlan::Timestamp { desc: true, .. }) {
+                        (
+                            b.timestamp_millis.cmp(&a.timestamp_millis),
+                            b.seq.unwrap_or(-1).cmp(&a.seq.unwrap_or(-1)),
+                        )
+                    } else {
+                        (
+                            a.timestamp_millis.cmp(&b.timestamp_millis),
+                            a.seq.unwrap_or(-1).cmp(&b.seq.unwrap_or(-1)),
+                        )
+                    };
+                    ts.then(seq)
+                }
             };
-            ts.then(seq)
+            primary
                 .then(a.split_idx.cmp(&b.split_idx))
                 .then(a.doc.segment_ord.cmp(&b.doc.segment_ord))
                 .then(a.doc.doc_id.cmp(&b.doc.doc_id))
@@ -781,7 +848,7 @@ impl SearchService {
         // only for the final page, grouped by split so each reader is used
         // once (H4).
         let page_entries = self
-            .fetch_page_sources(&splits, &page, &request.stream, request.include_source)
+            .fetch_page_sources(&splits, &page, &request.stream, request.include_source, &plan)
             .await?;
 
         let merged_aggs = match (&aggregations, &aggs_json) {
@@ -849,6 +916,7 @@ impl SearchService {
         page: &[SplitHit],
         stream: &str,
         include_source: bool,
+        plan: &SortPlan,
     ) -> SearchResult<Vec<Value>> {
         use futures::stream::{self, StreamExt};
 
@@ -922,7 +990,7 @@ impl SearchService {
                         .and_then(|s| serde_json::from_str(s).ok())
                         .unwrap_or(Value::Null)
                 });
-                hit_envelope(hit, splits, stream, id, seq, source)
+                hit_envelope(hit, splits, stream, id, seq, source, plan)
             })
             .collect())
     }
@@ -939,18 +1007,28 @@ fn hit_envelope(
     id: Option<String>,
     seq: Option<i64>,
     source: Option<Value>,
+    plan: &SortPlan,
 ) -> Value {
     let split_id = &splits[hit.split_idx].split_id;
     let id = id.unwrap_or_else(|| {
         format!("{}:{}:{}", split_id, hit.doc.segment_ord, hit.doc.doc_id)
     });
-    // `sort` is the search_after cursor: [timestamp, _seq]. Legacy docs
-    // without a `_seq` report the -1 sentinel (issue #52).
+    // `sort` is the search_after cursor: the field values (if any) then
+    // [timestamp, _seq]. Legacy docs without a `_seq` report the -1
+    // sentinel (issue #52).
+    let sort = match plan {
+        SortPlan::Fields(plan) => plan.hit_sort_json(
+            hit.values.as_deref().unwrap_or(&[]),
+            hit.timestamp_millis,
+            seq.unwrap_or(-1),
+        ),
+        SortPlan::Timestamp { .. } => json!([hit.timestamp_millis, seq.unwrap_or(-1)]),
+    };
     let mut entry = json!({
         "_index": stream,
         "_id": id,
         "_score": Value::Null,
-        "sort": [hit.timestamp_millis, seq.unwrap_or(-1)],
+        "sort": sort,
     });
     // `_version` is the write sequence: what the bulk/_doc responses
     // reported for this version of the document.
@@ -1053,8 +1131,7 @@ fn search_one_split(
     query_json: &Value,
     aggregations: Option<Aggregations>,
     fetch_limit: usize,
-    sort_desc: bool,
-    cursor: Option<SearchAfter>,
+    plan: &SortPlan,
     page_outside_cursor: bool,
     skip_count: bool,
     split_idx: usize,
@@ -1082,6 +1159,12 @@ fn search_one_split(
     }
     let searcher = reader.searcher()?;
 
+    // The timestamp plan's (desc, cursor); a field plan pages inside its
+    // collector instead.
+    let (sort_desc, cursor) = match plan {
+        SortPlan::Timestamp { desc, cursor } => (*desc, *cursor),
+        SortPlan::Fields(_) => (true, None),
+    };
     let top_collector = top_sort_key_collector(fetch_limit, sort_desc);
 
     // Resolve the collector's ((ts, seq), doc) pairs into hits,
@@ -1097,6 +1180,7 @@ fn search_one_split(
                     seq: (seq >= 0).then_some(seq),
                     split_idx,
                     doc,
+                    values: None,
                 }
             })
             .collect()
@@ -1105,10 +1189,30 @@ fn search_one_split(
     // aggregations keep reflecting the full query, as in ES. A split
     // wholly on the paged side of the cursor skips the pass entirely.
     // Builds its own collector so the combined-collector arms below can
-    // consume the shared one.
-    let page_search = |base: Box<dyn Query>| -> SearchResult<Vec<((i64, i64), DocAddress)>> {
+    // consume the shared one. Under a field sort the page always runs
+    // as its own pass (the collector applies the cursor per document).
+    let page_search = |base: Box<dyn Query>| -> SearchResult<Vec<SplitHit>> {
         if page_outside_cursor {
             return Ok(Vec::new());
+        }
+        if let SortPlan::Fields(field_plan) = plan {
+            let collector = FieldSortCollector::new(
+                field_plan.clone(),
+                reader.mapped_schema().clone(),
+                fetch_limit,
+            );
+            return Ok(searcher
+                .search(&base, &collector)
+                .map_err(SearchError::Tantivy)?
+                .into_iter()
+                .map(|hit| SplitHit {
+                    timestamp_millis: hit.timestamp_millis,
+                    seq: (hit.seq >= 0).then_some(hit.seq),
+                    split_idx,
+                    doc: hit.doc,
+                    values: Some(hit.values),
+                })
+                .collect());
         }
         let collector = top_sort_key_collector(fetch_limit, sort_desc);
         let page_query: Box<dyn Query> = match cursor {
@@ -1118,16 +1222,20 @@ fn search_one_split(
             ])),
             None => base,
         };
-        searcher
-            .search(&page_query, &collector)
-            .map_err(SearchError::Tantivy)
+        Ok(make_hits(
+            searcher
+                .search(&page_query, &collector)
+                .map_err(SearchError::Tantivy)?,
+        ))
     };
+    // Whether the page needs its own pass (a cursor, or a field sort).
+    let separate_page = cursor.is_some() || matches!(plan, SortPlan::Fields(_));
 
     // match_all over a fully-covered split: the count is the split's
     // doc_count; skip the Count collector entirely (H3). Still runs the
     // top-k collector for the page.
     if fully_covered && aggregations.is_none() {
-        let hits = make_hits(page_search(query)?);
+        let hits = page_search(query)?;
         return Ok(SplitOutcome {
             count: doc_count,
             count_is_lower_bound: false,
@@ -1142,52 +1250,50 @@ fn search_one_split(
     // their collector, and counting is free alongside their full scan.
     // With a search_after cursor the page runs as its own search, so the
     // count/agg pass over the full query stays separate.
-    let (count, count_is_lower_bound, top, agg_result) = match (aggregations, skip_count, cursor) {
-        (Some(aggs), _, cursor) => {
-            let agg_collector = tantivy::aggregation::DistributedAggregationCollector::from_aggs(
-                aggs,
-                tantivy::aggregation::AggContextParams::new(
-                    default_limits(),
-                    index.tokenizers().clone(),
-                ),
-            );
-            match cursor {
-                None => {
-                    let (count, top, aggs) = searcher
-                        .search(&query, &(Count, top_collector, agg_collector))
-                        .map_err(SearchError::Tantivy)?;
-                    (count, false, top, Some(aggs))
-                }
-                Some(_) => {
+    let (count, count_is_lower_bound, hits, agg_result) =
+        match (aggregations, skip_count, separate_page) {
+            (Some(aggs), _, separate_page) => {
+                let agg_collector =
+                    tantivy::aggregation::DistributedAggregationCollector::from_aggs(
+                        aggs,
+                        tantivy::aggregation::AggContextParams::new(
+                            default_limits(),
+                            index.tokenizers().clone(),
+                        ),
+                    );
+                if separate_page {
                     let (count, aggs) = searcher
                         .search(&query, &(Count, agg_collector))
                         .map_err(SearchError::Tantivy)?;
-                    let top = page_search(query)?;
-                    (count, false, top, Some(aggs))
+                    let hits = page_search(query)?;
+                    (count, false, hits, Some(aggs))
+                } else {
+                    let (count, top, aggs) = searcher
+                        .search(&query, &(Count, top_collector, agg_collector))
+                        .map_err(SearchError::Tantivy)?;
+                    (count, false, make_hits(top), Some(aggs))
                 }
             }
-        }
-        (None, true, _) => {
-            let top = page_search(query)?;
-            // Lower bound: at least the number of hits we returned.
-            (top.len(), true, top, None)
-        }
-        (None, false, None) => {
-            let (count, top) = searcher
-                .search(&query, &(Count, top_collector))
-                .map_err(SearchError::Tantivy)?;
-            (count, false, top, None)
-        }
-        (None, false, Some(_)) => {
-            let count = searcher.search(&query, &Count).map_err(SearchError::Tantivy)?;
-            let top = page_search(query)?;
-            (count, false, top, None)
-        }
-    };
+            (None, true, _) => {
+                let hits = page_search(query)?;
+                // Lower bound: at least the number of hits we returned.
+                (hits.len(), true, hits, None)
+            }
+            (None, false, false) => {
+                let (count, top) = searcher
+                    .search(&query, &(Count, top_collector))
+                    .map_err(SearchError::Tantivy)?;
+                (count, false, make_hits(top), None)
+            }
+            (None, false, true) => {
+                let count = searcher.search(&query, &Count).map_err(SearchError::Tantivy)?;
+                let hits = page_search(query)?;
+                (count, false, hits, None)
+            }
+        };
 
     // Source is fetched later, only for the merged final page — here we
     // just record references (H4).
-    let hits = make_hits(top);
     Ok(SplitOutcome {
         count,
         count_is_lower_bound,
@@ -1248,7 +1354,10 @@ mod tests {
     #[test]
     fn parses_sort() {
         // Default and explicit timestamp sorts.
-        assert!(SearchRequest::parse("logs", &json!({})).unwrap().sort_desc);
+        assert_eq!(
+            SearchRequest::parse("logs", &json!({})).unwrap().sort,
+            SortSpec::Timestamp { desc: true }
+        );
         for body in [
             json!({"sort": "@timestamp"}),
             json!({"sort": ["timestamp"]}),
@@ -1258,26 +1367,40 @@ mod tests {
             json!({"sort": [{"@timestamp": "asc"}, "_score", {"_doc": "asc"}]}),
         ] {
             let parsed = SearchRequest::parse("logs", &body).unwrap();
-            assert!(!parsed.sort_desc, "{body}");
+            assert_eq!(parsed.sort, SortSpec::Timestamp { desc: false }, "{body}");
         }
-        assert!(
+        assert_eq!(
             SearchRequest::parse("logs", &json!({"sort": [{"@timestamp": "desc"}]}))
                 .unwrap()
-                .sort_desc
+                .sort,
+            SortSpec::Timestamp { desc: true }
         );
     }
 
     #[test]
-    fn sort_rejects_unsupported_fields() {
-        // A sort we cannot honour is a 400, never a 200 in timestamp
-        // order: the caller cannot tell the difference, and a
-        // search_after cursor from it pages the wrong sequence (#67).
+    fn field_sorts_parse_and_defer_resolution() {
+        // A field sort is resolved against the mapping at execution time
+        // (#77); the parse only shapes it. Its search_after is kept raw.
         for body in [
             json!({"sort": [{"n": "asc"}]}),
             json!({"sort": [{"id": {"order": "desc"}}]}),
             json!({"sort": "n"}),
             json!({"sort": [{"@timestamp": "asc"}, {"n": "asc"}]}),
+        ] {
+            let parsed = SearchRequest::parse("logs", &body).unwrap();
+            assert!(matches!(parsed.sort, SortSpec::Fields(_)), "{body}");
+        }
+        let parsed =
+            SearchRequest::parse("logs", &json!({"sort": [{"n": "asc"}], "search_after": [5, 1000, 3]}))
+                .unwrap();
+        assert_eq!(parsed.search_after_values, Some(vec![json!(5), json!(1000), json!(3)]));
+        assert!(parsed.search_after.is_none());
+        // Malformed entries and from + search_after are still 400s.
+        for body in [
             json!({"sort": [42]}),
+            json!({"sort": [{"n": "sideways"}]}),
+            json!({"sort": [{"n": "asc"}], "search_after": []}),
+            json!({"sort": [{"n": "asc"}], "search_after": [1], "from": 3}),
         ] {
             let err = SearchRequest::parse("logs", &body).unwrap_err();
             assert!(matches!(err, SearchError::BadRequest(_)), "{body}");

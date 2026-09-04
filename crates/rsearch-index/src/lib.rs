@@ -14,7 +14,7 @@ mod split_file;
 mod tokenizer;
 
 pub use builder::{PackagedSplit, SplitBuilder};
-pub use dynamic_paths::dynamic_string_paths;
+pub use dynamic_paths::{DynamicFields, DynamicType, dynamic_field_types, dynamic_string_paths, string_paths};
 pub use tantivy::DateTime;
 pub use cache::SplitCache;
 pub use reader::{ReadDoc, SplitReader};

@@ -210,8 +210,8 @@ and IMDS are never touched.
 |------|-----------|
 | Ingest | `POST /_bulk`, `POST /{index}/_bulk` (`index`, `create`; plus `update`, `delete` on document-mode indices; `?refresh=true\|wait_for`) |
 | Documents | `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `POST /{index}/_doc`, `PUT/POST /{index}/_create/{id}`, `POST /{index}/_update/{id}`, `GET /{index}/_source/{id}`, `POST /{index}/_delete_by_query` (document-mode indices) |
-| Search | `POST /{index}/_search`, `POST /_msearch`, `GET /{index}/_mapping` |
-| Index admin | `PUT /{index}` (settings + mapping), `GET/HEAD /{index}`, `GET /{index}/_settings`, `GET /_cat/indices` |
+| Search | `POST/GET /{index}/_search` (`?scroll=` opens a scroll), `POST/GET /_search/scroll[/{id}]`, `DELETE /_search/scroll[/{id}\|/_all]`, `GET/POST /{index}/_count` (`?q=` or a `query` body), `POST /_msearch` |
+| Index admin | `PUT /{index}` (settings + mapping), `PUT /{index}/_mapping` (add fields), `GET /{index}/_mapping` (declared + dynamic fields), `DELETE /{index}` (name, list, or glob; `_all` and `*` refused), `GET/HEAD /{index}`, `GET /{index}/_settings`, `GET /_cat/indices` |
 | Cluster | `GET /`, `GET /_cluster/health`, `GET /_cat/nodes` |
 | Streams | `PUT /_rsearch/streams/{name}/retention`, routing rules under `/_rsearch/routing_rules` |
 | Alerts | `PUT/GET/DELETE /_rsearch/alerts[/{name}]` (scheduled query → webhook) |
@@ -246,27 +246,89 @@ Splits written before v0.5 (schema version 2) keep their old tokens and
 have no `.keyword` view until the control node rewrites them (see
 `control.schema_upgrade_splits_per_tick` below).
 
-Sorting is by timestamp only (`@timestamp`/`timestamp`/`_timestamp`,
-default descending); `_score` and `_doc` are accepted as no-ops. A
-`sort` on any other field is rejected with 400 rather than silently
-returning timestamp order.
+`GET /{index}/_mapping` (and `GET /{index}`) reports the declared
+properties plus every unmapped field the index's splits hold, typed the
+way OpenSearch's dynamic mapping would have typed it: strings as `text`
+with the `keyword` sub-field, integers `long`, fractions `float`,
+booleans `boolean`, nested objects as nested `properties`. Each split
+records its unmapped fields when it is built; splits from before this
+existed are inventoried once by the control leader (a bounded number per
+tick) and report nothing until then. `PUT /{index}/_mapping` adds fields
+to an existing index; a field that already exists must keep its type
+(400, as in OpenSearch), and `PUT /{index}` on an existing index is still
+accepted as an update rather than a 400.
 
-Deep pagination uses `search_after`: every hit's `sort` values are
-`[timestamp_millis, _seq]` — the `_seq` element is an implicit unique
-tiebreak appended to the timestamp sort, the way Elasticsearch's
-point-in-time search appends `_shard_doc` — and passing the last hit's
-values back as `search_after` (with `from` = 0) pages strictly past it.
-Each page costs only `size` per split, so it pages past
-`max_result_window`, which caps plain `from`/`size` at 10k. Totals and
-aggregations reflect the full query on every page, as in Elasticsearch;
-send `track_total_hits: false` on follow-up pages to skip recounting,
-which also lets splits wholly behind the cursor be skipped entirely.
-Always pass both sort values back: a one-element `[timestamp]` cursor
-pages strictly by timestamp and skips equal-timestamp documents at the
-page boundary (the classic ES footgun with a non-unique sort). Hits
-from legacy (pre-`_seq`) splits report `-1` as the tiebreak and page by
-timestamp only there; merging them to the current split format restores
-exact paging.
+Sorting works on any field OpenSearch can sort on: mapped `keyword`,
+`long`, `double`, `boolean`, `date` and `ip` fields, the timestamp
+(`@timestamp`/`timestamp`/`_timestamp`, the default order, newest
+first), dynamic `<path>.keyword` sub-fields and dynamic numeric or
+boolean paths, with several clauses in order. A sort on a `text` field
+(mapped, or a bare dynamic string) is a 400 with OpenSearch's fielddata
+message, and a field no document holds is a 400 (`No mapping found for
+[f] in order to sort on`) unless `unmapped_type` is given. Missing values
+sort last in either direction unless `missing: "_first"`, or a concrete
+`missing` value substitutes; `mode` accepts `min`/`max` (the default:
+multi-valued fields sort by their smallest value ascending and largest
+descending). Hits report OpenSearch's sort values, including its
+sentinels for a missing value (`null` for keywords, the extreme long,
+`"Infinity"`/`"-Infinity"` for doubles). `_score` and `_doc` are
+accepted as no-ops. Write one field per sort entry: a single object
+naming several fields is refused with 400, because JSON object order
+does not survive parsing and the clauses could not be applied in the
+order written. Dynamic fields become sortable as their splits' field
+inventories are recorded — immediately for splits written by 0.6, and
+for older splits once the control leader's backfill has reached them
+(20 splits per tick).
+
+Deep pagination uses `search_after`: every hit's `sort` values end with
+`[timestamp_millis, _seq]` — an implicit unique tiebreak appended to
+whatever was sorted on, the way Elasticsearch's point-in-time search
+appends `_shard_doc` — and passing the last hit's values back as
+`search_after` (with `from` = 0) pages strictly past it. Under a field
+sort the cursor may also be the field values alone, as an OpenSearch
+client would build it; a page of equal keys is then skipped at the
+boundary, exactly as there. Each page costs only `size` per split, so it
+pages past `max_result_window`, which caps plain `from`/`size` at 10k.
+Totals and aggregations reflect the full query on every page, as in
+Elasticsearch; send `track_total_hits: false` on follow-up pages to
+skip recounting, which also lets splits wholly behind a timestamp cursor
+be skipped entirely. Always pass every sort value back: a one-element
+`[timestamp]` cursor pages strictly by timestamp and skips
+equal-timestamp documents at the page boundary (the classic ES footgun
+with a non-unique sort). Hits from legacy (pre-`_seq`) splits report
+`-1` as the tiebreak and page by timestamp only there; merging them to
+the current split format restores exact paging.
+
+The scroll API is the same paging under the ES clients' `scroll`
+helpers: `POST /{index}/_search?scroll=1m` returns a `_scroll_id`,
+`POST /_search/scroll` with `{"scroll": "1m", "scroll_id": …}` returns
+the next page (the id stays the same; `hits.total` is the first page's
+count; aggregations come with the first page only), and `DELETE
+/_search/scroll` with `{"scroll_id": …}` (or `/_all`) frees it. A scroll
+context is a row in the metastore — the original search plus the last
+page's cursor — so it continues on any search node and expires after its
+keep-alive (up to `1d`). It is a replay from the cursor, not a snapshot:
+documents written or updated while a scroll is open can appear on a later
+page, whereas OpenSearch's scroll pins the index as it was opened.
+A stream-scoped key can only continue or free scrolls on its own streams
+(`/_all` frees just those). `from` and `search_after` are refused in a
+scroll context, an expired or freed id is a 404
+(`search_context_missing_exception`), and `sort: ["_doc"]` is served by
+the stable (timestamp, `_seq`) sequence.
+
+`DELETE /{index}` retires an index immediately: its splits leave the
+published set, its name is free to re-create at once (the drop half of a
+drop-and-rebuild reindex), and the control leader reclaims storage after
+`control.gc_grace_secs` and then drops the row. The path is an index
+expression — a name (404 if missing), a comma-separated list, or globs
+(a glob matching nothing is acknowledged); `_all` and a bare `*` are
+refused. A stream-scoped key may delete only indices inside its scope,
+whatever the expression expands to. Documents still buffered on an
+ingest node when the index is deleted die with it, as in OpenSearch (the
+node logs how many it dropped); a batch that races the deletion is never
+published under the retired index, and an index re-created under the
+same name keeps the mode and mapping it was re-created with. Other
+nodes forget the old index within their 10-second stream caches.
 
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.

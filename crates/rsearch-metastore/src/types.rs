@@ -161,6 +161,9 @@ pub struct NewSplit<'a> {
     pub tombstone_seq_applied: i64,
     /// Split layout version it was built under.
     pub schema_version: i32,
+    /// Unmapped field inventory as recorded in the split footer; None
+    /// when the builder did not record one.
+    pub dynamic_fields: Option<serde_json::Value>,
 }
 
 impl SplitRecord {

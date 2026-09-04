@@ -145,6 +145,10 @@ struct WorkItem {
     /// Document identity (`_id`, `_seq`).
     identity: DocIdentity,
     pos: WalPos,
+    /// The stream row the write was accepted against. A worker that is
+    /// rebound to a re-created stream (#71) drops items of the retired
+    /// one instead of publishing them into the new index.
+    stream_id: i64,
 }
 
 /// Ingest metrics counters (monotonic).
@@ -431,12 +435,14 @@ impl IngestPipeline {
         identity: DocIdentity,
         pos: WalPos,
     ) -> IngestResult<()> {
+        let stream_id = self.stream_info(stream).await?.id;
         let tx = self.worker_for(stream).await?;
         let size = source.len() as u64;
         match tx.try_send(WorkerMsg::Doc(WorkItem {
             source,
             identity,
             pos,
+            stream_id,
         })) {
             Ok(()) => {
                 self.note_enqueued(size);
@@ -511,6 +517,7 @@ impl IngestPipeline {
                 Ok(text) => Arc::from(text),
                 Err(_) => Arc::from(String::from_utf8_lossy(&record.doc).into_owned()),
             };
+            let stream_id = self.stream_info(&record.stream).await?.id;
             let tx = self.worker_for(&record.stream).await?;
             self.inner.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
             if tx
@@ -518,6 +525,7 @@ impl IngestPipeline {
                     source,
                     identity: DocIdentity::new(record.id, record.seq),
                     pos: record.pos,
+                    stream_id,
                 }))
                 .await
                 .is_err()
@@ -602,6 +610,16 @@ impl IngestPipeline {
 /// task + bounded queue + schema for the life of the process.
 const WORKER_IDLE_EXIT_SECS: u64 = 600;
 
+/// The stream a worker flushes into, re-resolved before every flush
+/// attempt (see [`flush`]).
+struct WorkerStream {
+    name: String,
+    id: i64,
+    document_mode: bool,
+    schema: MappedSchema,
+    mapping_json: Value,
+}
+
 async fn stream_worker(
     inner: Arc<PipelineInner>,
     stream: String,
@@ -611,28 +629,34 @@ async fn stream_worker(
     mut rx: mpsc::Receiver<WorkerMsg>,
 ) {
     let max_docs = inner.config.max_batch_docs.max(1);
-    let age_secs = if document_mode {
-        inner.config.document_max_batch_secs
-    } else {
-        inner.config.max_batch_secs
-    };
-    let max_age = Duration::from_secs(age_secs.max(1));
     let idle_exit = Duration::from_secs(WORKER_IDLE_EXIT_SECS);
     let mut buffer: Vec<WorkItem> = Vec::new();
     // Refresh waiters, answered after the next flush completes.
     let mut waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle_exit;
-    // Re-resolved before each flush so a mapping change (PUT /{index})
-    // takes effect on the next split, not only after a restart (L7).
-    let mut schema = schema;
-    let mut mapping_json = schema.mapping.to_json();
+    let mapping_json = schema.mapping.to_json();
+    let mut target = WorkerStream {
+        name: stream.clone(),
+        id: stream_id,
+        document_mode,
+        schema,
+        mapping_json,
+    };
+    let batch_age = |document_mode: bool| {
+        let secs = if document_mode {
+            inner.config.document_max_batch_secs
+        } else {
+            inner.config.max_batch_secs
+        };
+        Duration::from_secs(secs.max(1))
+    };
 
     loop {
         let flush_now = tokio::select! {
             msg = rx.recv() => match msg {
                 Some(WorkerMsg::Doc(item)) => {
                     if buffer.is_empty() {
-                        deadline = tokio::time::Instant::now() + max_age;
+                        deadline = tokio::time::Instant::now() + batch_age(target.document_mode);
                     }
                     buffer.push(item);
                     buffer.len() >= max_docs
@@ -650,7 +674,7 @@ async fn stream_worker(
                 None => {
                     // Channel closed: final flush then exit.
                     if !buffer.is_empty() {
-                        flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+                        flush(&inner, &mut target, &mut buffer).await;
                     }
                     return;
                 }
@@ -672,7 +696,7 @@ async fn stream_worker(
                         }
                     }
                     if !buffer.is_empty() {
-                        flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+                        flush(&inner, &mut target, &mut buffer).await;
                     }
                     for done in waiters.drain(..) {
                         let _ = done.send(());
@@ -684,15 +708,7 @@ async fn stream_worker(
             },
         };
         if flush_now {
-            // Pick up mapping changes before building the split.
-            if let Ok(record) = inner.metastore.get_stream(&stream).await
-                && record.mapping != mapping_json
-            {
-                let mapping = IndexMapping::from_json(&record.mapping).unwrap_or_default();
-                schema = MappedSchema::build(mapping);
-                mapping_json = record.mapping;
-            }
-            flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
+            flush(&inner, &mut target, &mut buffer).await;
             for done in waiters.drain(..) {
                 let _ = done.send(());
             }
@@ -701,17 +717,56 @@ async fn stream_worker(
     }
 }
 
-async fn flush(
-    inner: &Arc<PipelineInner>,
-    stream: &str,
-    stream_id: i64,
-    schema: &MappedSchema,
-    buffer: &mut Vec<WorkItem>,
-) {
+/// What re-resolving the worker's stream found.
+enum Resolved {
+    /// The stream exists (possibly re-created or re-mapped since).
+    Live,
+    /// No stream by that name: it was deleted.
+    Deleted,
+    /// The metastore could not be asked; keep the current binding.
+    Unknown,
+}
+
+/// Re-resolve the stream by name before a flush attempt. Picks up
+/// mapping changes (PUT /{index}, PUT /{index}/_mapping); a stream
+/// deleted and re-created under the same name (#71) rebinds the worker
+/// to the new row — its id, mode and mapping — so the split is never
+/// published under the retired id, where the purge would sweep it away.
+async fn resolve_target(inner: &Arc<PipelineInner>, target: &mut WorkerStream) -> Resolved {
+    match inner.metastore.get_stream(&target.name).await {
+        Ok(record) => {
+            if record.id != target.id {
+                info!(
+                    stream = %target.name,
+                    old_id = target.id,
+                    new_id = record.id,
+                    "stream re-created; worker rebound"
+                );
+                target.id = record.id;
+                target.document_mode = record.is_document_mode();
+                inner.stream_info.write().unwrap().remove(&target.name);
+            }
+            if record.mapping != target.mapping_json {
+                let mapping = IndexMapping::from_json(&record.mapping).unwrap_or_default();
+                target.schema = MappedSchema::build(mapping);
+                target.mapping_json = record.mapping;
+            }
+            Resolved::Live
+        }
+        Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => Resolved::Deleted,
+        Err(e) => {
+            warn!(stream = %target.name, error = %e, "stream lookup failed before flush; keeping current binding");
+            Resolved::Unknown
+        }
+    }
+}
+
+async fn flush(inner: &Arc<PipelineInner>, target: &mut WorkerStream, buffer: &mut Vec<WorkItem>) {
     let mut batch = std::mem::take(buffer);
     let count = batch.len() as u64;
     inner.metrics.queue_depth.fetch_sub(count, Ordering::Relaxed);
     let positions: Vec<WalPos> = batch.iter().map(|item| item.pos).collect();
+    let stream = target.name.clone();
 
     // Retry the flush with capped backoff on transient errors (S3/DB
     // blips). Data is already WAL-durable, so an in-process retry recovers
@@ -723,11 +778,45 @@ async fn flush(
     let mut attempt = 0u64;
     loop {
         attempt += 1;
-        match flush_inner(inner, stream, stream_id, schema, batch).await {
+        // Every attempt re-resolves the stream: a DELETE /{index} that
+        // lands between stage and publish fails the publish (the staged
+        // row was marked for delete) and must not be retried under the
+        // retired id. A deleted index takes its buffered documents with
+        // it, as in OpenSearch; their WAL entries are confirmed so replay
+        // does not resurrect them.
+        if let Resolved::Deleted = resolve_target(inner, target).await {
+            inner.wal.confirm(&positions);
+            inner.stream_info.write().unwrap().remove(&stream);
+            warn!(stream, docs = count, "index deleted; buffered documents dropped");
+            return;
+        }
+        // Items accepted against a since-retired row (the index was
+        // deleted and re-created while they were buffered) die with it;
+        // only writes accepted against the new row are published.
+        let stale: Vec<WalPos> = batch
+            .iter()
+            .filter(|item| item.stream_id != target.id)
+            .map(|item| item.pos)
+            .collect();
+        if !stale.is_empty() {
+            batch.retain(|item| item.stream_id == target.id);
+            inner.wal.confirm(&stale);
+            warn!(
+                stream,
+                docs = stale.len(),
+                "index re-created; documents buffered for the deleted one dropped"
+            );
+            if batch.is_empty() {
+                return;
+            }
+        }
+        let live: Vec<WalPos> = batch.iter().map(|item| item.pos).collect();
+        match flush_inner(inner, &stream, target.id, &target.schema, batch).await {
             Ok(Some((split_id, indexed))) => {
-                inner.wal.confirm(&positions);
+                inner.wal.confirm(&live);
                 inner.metrics.docs_indexed.fetch_add(indexed, Ordering::Relaxed);
                 inner.metrics.splits_published.fetch_add(1, Ordering::Relaxed);
+                let count = live.len() as u64;
                 if indexed < count {
                     warn!(
                         stream,
@@ -742,8 +831,8 @@ async fn flush(
                 // Nothing in the batch was indexable. The docs are still
                 // processed: confirm their WAL entries so replay doesn't
                 // resurrect (and re-skip) them forever.
-                inner.wal.confirm(&positions);
-                warn!(stream, docs = count, "batch contained no indexable docs; dropped");
+                inner.wal.confirm(&live);
+                warn!(stream, docs = live.len(), "batch contained no indexable docs; dropped");
                 return;
             }
             Err((e, returned)) => {
@@ -891,6 +980,11 @@ async fn flush_inner(
             seq_max: packaged.meta.seq_max,
             tombstone_seq_applied: 0,
             schema_version: packaged.meta.schema_version as i32,
+            dynamic_fields: packaged
+                .meta
+                .dynamic_fields
+                .as_ref()
+                .map(|f| serde_json::to_value(f).unwrap_or(serde_json::Value::Null)),
         })
         .await
     {

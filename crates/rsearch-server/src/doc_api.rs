@@ -321,11 +321,12 @@ pub async fn delete_by_query(
             query: query.clone(),
             from: 0,
             size: DELETE_BY_QUERY_PAGE,
-            sort_desc: true,
+            sort: rsearch_search::SortSpec::Timestamp { desc: true },
             aggs: None,
             include_source: false,
             track_total_hits: Some(0),
             search_after: None,
+            search_after_values: None,
         };
         let response = match lookup.search(request).await {
             Ok(response) => response,
