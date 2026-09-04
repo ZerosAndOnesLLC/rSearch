@@ -155,11 +155,22 @@ impl SplitReader {
         if let Some(paths) = self.dynamic_paths.get() {
             return Ok(paths);
         }
-        let paths = crate::dynamic_paths::dynamic_string_paths(
+        let paths = crate::dynamic_paths::string_paths(&self.dynamic_field_types()?);
+        Ok(self.dynamic_paths.get_or_init(|| paths))
+    }
+
+    /// The unmapped paths in this split and the value types under each:
+    /// from the footer when the split recorded them at build time, else a
+    /// skip-scan of the `_dynamic` term dictionary. Call from a blocking
+    /// context.
+    pub fn dynamic_field_types(&self) -> IndexResult<crate::dynamic_paths::DynamicFields> {
+        if let Some(fields) = &self.meta.split.dynamic_fields {
+            return Ok(fields.clone());
+        }
+        Ok(crate::dynamic_paths::dynamic_field_types(
             &self.reader.searcher(),
             self.schema.dynamic,
-        )?;
-        Ok(self.dynamic_paths.get_or_init(|| paths))
+        )?)
     }
 
     /// Visit every document — used by the merge/compaction jobs to

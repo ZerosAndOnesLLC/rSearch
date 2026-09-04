@@ -8,7 +8,7 @@ use crate::types::{NewSplit, SplitRecord, SplitState, StreamMode, StreamRecord, 
 
 pub(crate) const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
      size_bytes, time_start_millis, time_end_millis, footer_len, created_by, \
-     seq_min, seq_max, tombstone_seq_applied, schema_version";
+     seq_min, seq_max, tombstone_seq_applied, schema_version, dynamic_fields";
 
 /// Postgres-backed metadata store shared by every node role: streams,
 /// splits, nodes, placement, auth, routing rules, and alerts. Cloning
@@ -73,7 +73,8 @@ impl Metastore {
     /// Look up a stream by name; `StreamNotFound` if missing.
     pub async fn get_stream(&self, name: &str) -> MetastoreResult<StreamRecord> {
         sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours, mode FROM streams WHERE name = $1",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams
+             WHERE name = $1 AND deleted_at IS NULL",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -90,6 +91,7 @@ impl Metastore {
                     COALESCE(SUM(s.size_bytes) FILTER (WHERE s.state = 'published'), 0)::bigint AS size_bytes
              FROM streams st
              LEFT JOIN splits s ON s.stream_id = st.id
+             WHERE st.deleted_at IS NULL
              GROUP BY st.id
              ORDER BY st.name",
         )
@@ -111,7 +113,8 @@ impl Metastore {
     /// All streams, ordered by name.
     pub async fn list_streams(&self) -> MetastoreResult<Vec<StreamRecord>> {
         Ok(sqlx::query_as::<_, StreamRecord>(
-            "SELECT id, name, mapping, retention_hours, mode FROM streams ORDER BY name",
+            "SELECT id, name, mapping, retention_hours, mode FROM streams
+             WHERE deleted_at IS NULL ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -206,6 +209,69 @@ impl Metastore {
         Ok(())
     }
 
+    /// Retire a stream (DELETE /{index}, issue #71): every split is marked
+    /// for delete (the GC job removes the objects, then the rows), its
+    /// tombstones go now, and the row is renamed to `.deleted-{id}-{name}`
+    /// and stamped `deleted_at` so the name is immediately free for
+    /// re-creation. [`Metastore::purge_deleted_streams`] drops the row
+    /// once no split references it. `StreamNotFound` if there is no live
+    /// stream by that name.
+    pub async fn retire_stream(&self, name: &str) -> MetastoreResult<i64> {
+        let mut tx = self.pool.begin().await?;
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM streams WHERE name = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = id else {
+            return Err(MetastoreError::StreamNotFound(name.to_string()));
+        };
+        sqlx::query(
+            "UPDATE splits SET state = 'marked_for_delete', updated_at = now()
+             WHERE stream_id = $1 AND state <> 'marked_for_delete'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM doc_tombstones WHERE stream_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE streams
+             SET name = '.deleted-' || id::text || '-' || name, deleted_at = now(),
+                 updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Finish retired streams: mark any split that landed after the
+    /// retirement (a late ingest flush), then delete every retired stream
+    /// row that no split references any more. Returns the rows deleted.
+    pub async fn purge_deleted_streams(&self) -> MetastoreResult<u64> {
+        sqlx::query(
+            "UPDATE splits SET state = 'marked_for_delete', updated_at = now()
+             WHERE state <> 'marked_for_delete'
+               AND stream_id IN (SELECT id FROM streams WHERE deleted_at IS NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await?;
+        let result = sqlx::query(
+            "DELETE FROM streams
+             WHERE deleted_at IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM splits WHERE splits.stream_id = streams.id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     // ---- split lifecycle ----
 
     /// Register a freshly-uploaded split in `staged` state.
@@ -213,8 +279,9 @@ impl Metastore {
         sqlx::query(
             "INSERT INTO splits (split_id, stream_id, storage_key, doc_count, size_bytes,
                                  time_start_millis, time_end_millis, footer_len, created_by,
-                                 seq_min, seq_max, tombstone_seq_applied, schema_version)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                                 seq_min, seq_max, tombstone_seq_applied, schema_version,
+                                 dynamic_fields)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(split.split_id)
         .bind(split.stream_id)
@@ -229,9 +296,69 @@ impl Metastore {
         .bind(split.seq_max)
         .bind(split.tombstone_seq_applied)
         .bind(split.schema_version)
+        .bind(&split.dynamic_fields)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a split's unmapped-field inventory (the control leader's
+    /// backfill for rows registered before the column existed, #76).
+    pub async fn set_split_dynamic_fields(
+        &self,
+        split_id: &str,
+        dynamic_fields: &serde_json::Value,
+    ) -> MetastoreResult<()> {
+        sqlx::query("UPDATE splits SET dynamic_fields = $2 WHERE split_id = $1")
+            .bind(split_id)
+            .bind(dynamic_fields)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Published splits whose unmapped-field inventory is unknown, newest
+    /// data first, at most `limit` (the backfill job's work list).
+    pub async fn splits_without_dynamic_fields(
+        &self,
+        limit: i64,
+    ) -> MetastoreResult<Vec<SplitRecord>> {
+        let query = format!(
+            "SELECT {SPLIT_COLUMNS} FROM splits
+             WHERE state = 'published' AND dynamic_fields IS NULL
+             ORDER BY time_end_millis DESC
+             LIMIT $1"
+        );
+        Ok(sqlx::query_as::<_, SplitRecord>(sqlx::AssertSqlSafe(query))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// The union of a stream's unmapped fields across its published
+    /// splits: path → the value types seen (`string`, `long`, `double`,
+    /// `boolean`, `date`), sorted by path. Splits whose inventory is not
+    /// yet recorded contribute nothing until the backfill reaches them.
+    pub async fn stream_dynamic_fields(
+        &self,
+        stream_id: i64,
+    ) -> MetastoreResult<std::collections::BTreeMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT kv.key, t.value
+             FROM splits s,
+                  jsonb_each(s.dynamic_fields) AS kv,
+                  jsonb_array_elements_text(kv.value) AS t
+             WHERE s.stream_id = $1 AND s.state = 'published' AND s.dynamic_fields IS NOT NULL
+             ORDER BY kv.key, t.value",
+        )
+        .bind(stream_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (path, ty) in rows {
+            out.entry(path).or_default().push(ty);
+        }
+        Ok(out)
     }
 
     /// Published splits built under a layout older than `version`, newest

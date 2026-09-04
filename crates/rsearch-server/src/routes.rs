@@ -39,6 +39,19 @@ pub fn router(state: AppState) -> Router {
             post(search_api::search).get(search_api::search),
         )
         .route("/_msearch", post(search_api::msearch))
+        // Scroll API (#72): continue with POST/GET, free with DELETE.
+        .route(
+            "/_search/scroll",
+            post(search_api::scroll_next)
+                .get(search_api::scroll_next)
+                .delete(search_api::clear_scroll),
+        )
+        .route(
+            "/_search/scroll/{scroll_id}",
+            post(search_api::scroll_next_by_path)
+                .get(search_api::scroll_next_by_path)
+                .delete(search_api::clear_scroll_by_path),
+        )
         // Loki-compatible query API subset (#11): lets Grafana's built-in
         // Loki datasource and Logs Drilldown run against rSearch.
         .route("/ready", get(crate::loki_api::ready))
@@ -92,13 +105,21 @@ pub fn router(state: AppState) -> Router {
         .route("/{index}/_update/{id}", post(crate::doc_api::update_doc))
         .route("/{index}/_source/{id}", get(crate::doc_api::get_source))
         .route("/{index}/_delete_by_query", post(crate::doc_api::delete_by_query))
-        .route("/{index}/_mapping", get(search_api::get_mapping))
+        .route(
+            "/{index}/_mapping",
+            get(search_api::get_mapping).put(search_api::put_mapping),
+        )
+        .route(
+            "/{index}/_count",
+            get(search_api::count).post(search_api::count),
+        )
         .route("/{index}/_settings", get(search_api::get_settings))
         .route(
             "/{index}",
             axum::routing::put(search_api::put_index)
                 .get(search_api::get_index)
-                .head(search_api::head_index),
+                .head(search_api::head_index)
+                .delete(search_api::delete_index),
         )
         .route("/_cat/indices", get(crate::admin_api::cat_indices))
         .route("/_rsearch/routing_rules", get(crate::admin_api::list_rules))

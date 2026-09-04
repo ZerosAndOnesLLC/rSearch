@@ -201,7 +201,7 @@ fn float_as_exact_i64(value: &Value) -> Option<i64> {
 }
 
 /// Parse a timestamp literal (RFC 3339, epoch secs/millis, or "now").
-fn parse_time_millis(value: &Value) -> Option<i64> {
+pub(crate) fn parse_time_millis(value: &Value) -> Option<i64> {
     match value {
         Value::String(s) => {
             if s == "now" {

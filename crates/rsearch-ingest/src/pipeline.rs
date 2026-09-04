@@ -605,7 +605,7 @@ const WORKER_IDLE_EXIT_SECS: u64 = 600;
 async fn stream_worker(
     inner: Arc<PipelineInner>,
     stream: String,
-    stream_id: i64,
+    mut stream_id: i64,
     document_mode: bool,
     schema: MappedSchema,
     mut rx: mpsc::Receiver<WorkerMsg>,
@@ -684,13 +684,30 @@ async fn stream_worker(
             },
         };
         if flush_now {
-            // Pick up mapping changes before building the split.
-            if let Ok(record) = inner.metastore.get_stream(&stream).await
-                && record.mapping != mapping_json
-            {
-                let mapping = IndexMapping::from_json(&record.mapping).unwrap_or_default();
-                schema = MappedSchema::build(mapping);
-                mapping_json = record.mapping;
+            // Re-resolve the stream before building the split: picks up
+            // mapping changes (PUT /{index}, PUT /{index}/_mapping), and a
+            // stream deleted and re-created under the same name (#71) gets
+            // its new id — a split published under the retired id would
+            // be swept away with it. A stream that is gone is re-created,
+            // the implicit creation `_bulk` always did for a first write.
+            let resolved = match inner.metastore.get_stream(&stream).await {
+                Ok(record) => Some(record),
+                Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => {
+                    inner.metastore.ensure_stream(&stream).await.ok()
+                }
+                Err(_) => None,
+            };
+            if let Some(record) = resolved {
+                if record.id != stream_id {
+                    info!(stream, old_id = stream_id, new_id = record.id, "stream re-created; worker rebound");
+                    stream_id = record.id;
+                    inner.stream_info.write().unwrap().remove(&stream);
+                }
+                if record.mapping != mapping_json {
+                    let mapping = IndexMapping::from_json(&record.mapping).unwrap_or_default();
+                    schema = MappedSchema::build(mapping);
+                    mapping_json = record.mapping;
+                }
             }
             flush(&inner, &stream, stream_id, &schema, &mut buffer).await;
             for done in waiters.drain(..) {
@@ -891,6 +908,11 @@ async fn flush_inner(
             seq_max: packaged.meta.seq_max,
             tombstone_seq_applied: 0,
             schema_version: packaged.meta.schema_version as i32,
+            dynamic_fields: packaged
+                .meta
+                .dynamic_fields
+                .as_ref()
+                .map(|f| serde_json::to_value(f).unwrap_or(serde_json::Value::Null)),
         })
         .await
     {

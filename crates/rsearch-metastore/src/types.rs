@@ -130,6 +130,11 @@ pub struct SplitRecord {
     /// `rsearch_index::CURRENT_SCHEMA_VERSION`); 0 for rows registered
     /// before the column existed.
     pub schema_version: i32,
+    /// Unmapped field inventory (`{"path": ["string", …]}`, issue #76);
+    /// None when unknown (splits registered before the column existed, or
+    /// read by a query that does not select it).
+    #[sqlx(default)]
+    pub dynamic_fields: Option<serde_json::Value>,
 }
 
 /// A split to register (see `Metastore::stage_split`).
@@ -161,6 +166,9 @@ pub struct NewSplit<'a> {
     pub tombstone_seq_applied: i64,
     /// Split layout version it was built under.
     pub schema_version: i32,
+    /// Unmapped field inventory as recorded in the split footer; None
+    /// when the builder did not record one.
+    pub dynamic_fields: Option<serde_json::Value>,
 }
 
 impl SplitRecord {

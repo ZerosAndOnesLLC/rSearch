@@ -128,6 +128,20 @@ impl SplitBuilder {
         self.writer.commit()?;
         self.writer.wait_merging_threads()?;
 
+        // Inventory the unmapped paths while the index is open: a
+        // skip-scan of the `_dynamic` term dictionary, proportional to the
+        // number of distinct paths. Recorded in the footer and the
+        // metastore so `_mapping` never has to open the split for it.
+        let dynamic_fields = {
+            let reader = self
+                .index
+                .reader_builder()
+                .reload_policy(tantivy::ReloadPolicy::Manual)
+                .try_into()?;
+            let searcher = reader.searcher();
+            crate::dynamic_paths::dynamic_field_types(&searcher, self.converter.schema().dynamic)?
+        };
+
         let index_dir = self.work_dir.path().join("index");
         // Ensure directory contents are fully flushed before bundling.
         drop(self.index);
@@ -142,6 +156,7 @@ impl SplitBuilder {
             schema_version: self.converter.schema().schema_version,
             seq_min: self.converter.schema().seq.map(|_| self.min_seq),
             seq_max: self.converter.schema().seq.map(|_| self.max_seq),
+            dynamic_fields: Some(dynamic_fields),
         };
 
         let file_path = self.work_dir.path().join(format!("{}.split", self.split_id));

@@ -208,6 +208,15 @@ impl ControlPlane {
         if let Err(e) = self.gc_job().await {
             error!(error = %e, "gc job failed");
         }
+        if let Err(e) = self.stream_purge_job().await {
+            error!(error = %e, "stream purge failed");
+        }
+        if let Err(e) = self.dynamic_fields_backfill_job().await {
+            error!(error = %e, "dynamic-fields backfill failed");
+        }
+        if let Err(e) = self.metastore.purge_expired_scrolls().await {
+            error!(error = %e, "scroll expiry sweep failed");
+        }
         if let Err(e) = self.metastore.expire_dead_nodes(3600.0).await {
             error!(error = %e, "node expiry failed");
         }
@@ -761,6 +770,11 @@ impl ControlPlane {
                 seq_max: packaged.meta.seq_max,
                 tombstone_seq_applied: applied_through,
                 schema_version: packaged.meta.schema_version as i32,
+                dynamic_fields: packaged
+                    .meta
+                    .dynamic_fields
+                    .as_ref()
+                    .map(|f| serde_json::to_value(f).unwrap_or(serde_json::Value::Null)),
             })
             .await?;
         self.metastore
@@ -1073,6 +1087,55 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Record the unmapped-field inventory of splits registered before
+    /// it was tracked (#76): each is opened once and its `_dynamic` term
+    /// dictionary skip-scanned, newest data first, a bounded number per
+    /// tick. Until a split is reached, `_mapping` omits the dynamic
+    /// fields only it holds.
+    async fn dynamic_fields_backfill_job(&self) -> anyhow::Result<()> {
+        const PER_TICK: i64 = 20;
+        let candidates = self.metastore.splits_without_dynamic_fields(PER_TICK).await?;
+        for split in candidates {
+            let step = async {
+                let reader = SplitReader::open(
+                    self.storage.clone(),
+                    &split.storage_key,
+                    self.cache.clone(),
+                )
+                .await?;
+                let fields = tokio::task::spawn_blocking(move || reader.dynamic_field_types())
+                    .await??;
+                self.metastore
+                    .set_split_dynamic_fields(&split.split_id, &serde_json::to_value(fields)?)
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            match step.await {
+                Ok(()) => info!(split_id = %split.split_id, "dynamic fields recorded"),
+                // Unreadable split: record an empty inventory so it does
+                // not pin the budget every tick; a rewrite (merge,
+                // compaction) records the real one.
+                Err(e) => {
+                    warn!(split_id = %split.split_id, error = %e, "dynamic-fields scan failed; recording none");
+                    self.metastore
+                        .set_split_dynamic_fields(&split.split_id, &serde_json::json!({}))
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop retired stream rows (DELETE /{index}, #71) once GC has removed
+    /// every split; a split flushed after the retirement is marked here.
+    async fn stream_purge_job(&self) -> anyhow::Result<()> {
+        let purged = self.metastore.purge_deleted_streams().await?;
+        if purged > 0 {
+            info!(purged, "stream purge: retired streams removed");
+        }
+        Ok(())
+    }
+
     async fn gc_job(&self) -> anyhow::Result<()> {
         let candidates = self
             .metastore
@@ -1217,6 +1280,7 @@ mod tests {
             seq_max: None,
             tombstone_seq_applied: 0,
             schema_version: 0,
+            dynamic_fields: None,
         }
     }
 

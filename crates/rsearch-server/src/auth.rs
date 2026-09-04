@@ -151,7 +151,8 @@ pub struct Identity {
 }
 
 impl Identity {
-    fn allows_stream(&self, stream: &str) -> bool {
+    /// Whether this identity's stream scope covers `stream`.
+    pub fn allows_stream(&self, stream: &str) -> bool {
         self.streams.iter().any(|s| stream_glob_matches(s, stream))
     }
 }
@@ -186,6 +187,9 @@ enum Action {
     Open,
     Ingest(Option<String>),
     Search(Option<String>),
+    /// Search on a stream named by server-side state (a scroll context)
+    /// rather than the path; the handler checks the stream scope.
+    SearchContext,
     Admin,
 }
 
@@ -214,8 +218,16 @@ fn classify(method: &str, path: &str) -> Action {
             Action::Search(Some(index.to_string()))
         }
         // Search / read
-        (_, [index, "_search"]) => Action::Search(Some(index.to_string())),
+        (_, [index, "_search"]) | (_, [index, "_count"]) => {
+            Action::Search(Some(index.to_string()))
+        }
+        // Mapping updates are index setup, the same level as PUT /{index}.
+        ("PUT", [index, "_mapping"]) => Action::Ingest(Some(index.to_string())),
         ("POST", ["_msearch"]) => Action::Search(None),
+        // Scroll continuation/clear (#72): the stream is in the stored
+        // context, not the path — the handler checks it against the
+        // identity's scope.
+        (_, ["_search", "scroll", ..]) => Action::SearchContext,
         ("GET", [index, "_mapping"]) | ("GET", [index, "_settings"]) => {
             Action::Search(Some(index.to_string()))
         }
@@ -228,7 +240,11 @@ fn classify(method: &str, path: &str) -> Action {
         // above. Index creation / mapping update is an ingest-level action:
         // an ingest key scoped to a stream already creates it implicitly
         // via _bulk, so PUT /{index} (mode + mapping) needs no more.
-        ("PUT", [index]) if !index.starts_with('_') => {
+        // DELETE /{index} is the drop half of an application's
+        // drop-and-rebuild reindex, so it sits at the same level; the
+        // handler re-checks every stream a wildcard or list resolves to
+        // against the identity's scope.
+        ("PUT" | "DELETE", [index]) if !index.starts_with('_') => {
             Action::Ingest(Some(index.to_string()))
         }
         ("GET" | "HEAD", [index]) if !index.starts_with('_') => {
@@ -395,6 +411,7 @@ pub async fn require(
                     None => identity.streams.iter().any(|s| s == "*"),
                 }
         }
+        Action::SearchContext => identity.actions.contains("search"),
     };
     if !allowed {
         return forbidden(&format!(
