@@ -113,6 +113,15 @@ pub fn router(state: AppState) -> Router {
             "/{index}/_count",
             get(search_api::count).post(search_api::count),
         )
+        // _refresh (#80): make buffered writes searchable now.
+        .route(
+            "/_refresh",
+            post(crate::refresh_api::refresh_all).get(crate::refresh_api::refresh_all),
+        )
+        .route(
+            "/{index}/_refresh",
+            post(crate::refresh_api::refresh_index).get(crate::refresh_api::refresh_index),
+        )
         .route("/{index}/_settings", get(search_api::get_settings))
         .route(
             "/{index}",
@@ -190,6 +199,16 @@ pub fn router(state: AppState) -> Router {
         router.route(
             "/_rsearch/internal/bulk",
             post(bulk_api::bulk_internal).layer(DefaultBodyLimit::max(BULK_BODY_LIMIT)),
+        )
+    } else {
+        router
+    };
+    // And the refresh fan-out receiver (#80): only ingest nodes hold
+    // buffers, so only they answer.
+    let router = if state.refresh_peers.is_some() && state.pipeline.is_some() {
+        router.route(
+            "/_rsearch/internal/refresh",
+            post(crate::refresh_api::refresh_internal),
         )
     } else {
         router

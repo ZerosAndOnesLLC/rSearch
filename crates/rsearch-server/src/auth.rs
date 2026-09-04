@@ -223,6 +223,11 @@ fn classify(method: &str, path: &str) -> Action {
         }
         // Mapping updates are index setup, the same level as PUT /{index}.
         ("PUT", [index, "_mapping"]) => Action::Ingest(Some(index.to_string())),
+        // _refresh (#80) cuts buffered writes: the write side's level, as
+        // `?refresh=` on _bulk is. The handler re-checks what a glob or
+        // list expands to against the identity's scope.
+        (_, ["_refresh"]) => Action::Ingest(None),
+        (_, [index, "_refresh"]) => Action::Ingest(Some(index.to_string())),
         ("POST", ["_msearch"]) => Action::Search(None),
         // Scroll continuation/clear (#72): the stream is in the stored
         // context, not the path — the handler checks it against the
@@ -501,6 +506,11 @@ mod tests {
             Action::Search(Some("app-logs".into()))
         );
         assert_eq!(classify("GET", "/_cat/indices"), Action::Search(None));
+        assert_eq!(classify("POST", "/_refresh"), Action::Ingest(None));
+        assert_eq!(
+            classify("GET", "/app-logs/_refresh"),
+            Action::Ingest(Some("app-logs".into()))
+        );
         // Loki-compatible surface: everything under /loki/api/v1 needs
         // global search access; /ready is health-equivalent and open.
         assert_eq!(classify("GET", "/loki/api/v1/query_range"), Action::Search(None));

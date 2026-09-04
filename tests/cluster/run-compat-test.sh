@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# OpenSearch-compatibility end-to-end test for issues #71–#77: index
-# deletion, scroll, PUT _mapping, _count, dynamic fields in _mapping and
-# field sorting. One all-roles node on the fs backend + Postgres. Every
+# OpenSearch-compatibility end-to-end test for issues #71–#77 and #80:
+# index deletion, scroll, PUT _mapping, _count, dynamic fields in
+# _mapping, field sorting and _refresh. One all-roles node on the fs backend + Postgres. Every
 # expected shape below was taken from a real OpenSearch 3.6.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -237,4 +237,28 @@ MINE=$(curl -s -XPOST "$U/app-s/_search?scroll=1m" -H "Authorization: Bearer $KE
 [ "$(sql "SELECT count(*) FROM scroll_contexts WHERE id = '$FOREIGN'")" = 1 ] || fail "foreign context survived a scoped _all"
 [ "$(code -XPOST "$U/_search/scroll" -H "Authorization: Bearer $TOKEN" -H "$J" -d "{\"scroll_id\":\"$MINE\"}")" = 404 ] || fail "own context was freed"
 
-say "PASS: OpenSearch compatibility (#71 #72 #73 #74 #76 #77)"
+say "#80 _refresh"
+A="Authorization: Bearer $TOKEN"
+curl -s -XPUT "$U/rf" -H "$A" -H "$J" -d '{"settings":{"index":{"mode":"document"}}}' | jq -e '.acknowledged' >/dev/null || fail "create rf"
+curl -s -XPOST "$U/rf/_bulk" -H "$A" -H "$ND" --data-binary $'{"index":{"_id":"1"}}\n{"v":1}\n{"index":{"_id":"2"}}\n{"v":2}\n' | jq -e '.errors == false' >/dev/null || fail "bulk rf"
+[ "$(curl -s -XPOST "$U/rf/_refresh" -H "$A" | jq -cS .)" = '{"_shards":{"failed":0,"successful":1,"total":1}}' ] || fail "POST _refresh: $(curl -s -XPOST "$U/rf/_refresh" -H "$A")"
+[ "$(curl -s "$U/rf/_count" -H "$A" | jq -r .count)" = 2 ] || fail "writes visible right after _refresh"
+[ "$(curl -s "$U/rf/_refresh" -H "$A" | jq -cS .)" = '{"_shards":{"failed":0,"successful":1,"total":1}}' ] || fail "GET _refresh"
+[ "$(curl -s -XPOST "$U/rf,people/_refresh" -H "$A" | jq -r '._shards.total')" = 2 ] || fail "list _refresh counts one shard per index"
+[ "$(curl -s -XPOST "$U/re*/_refresh" -H "$A" | jq -r '._shards.total')" = 1 ] || fail "glob _refresh matches redo only"
+[ "$(curl -s -XPOST "$U/nomatch-*/_refresh" -H "$A" | jq -cS .)" = '{"_shards":{"failed":0,"successful":0,"total":0}}' ] || fail "glob matching nothing is acknowledged"
+R=$(curl -s -XPOST "$U/nope/_refresh" -H "$A")
+[ "$(echo "$R" | jq -r .status)" = 404 ] || fail "missing index is 404: $R"
+[ "$(echo "$R" | jq -r '.error.root_cause[0].reason')" = "no such index [nope]" ] || fail "missing index reason: $R"
+[ "$(code -XPOST "$U/rf,nope/_refresh" -H "$A")" = 404 ] || fail "list with a missing index is 404"
+ALL=$(curl -s "$U/_cat/indices?format=json" -H "$A" | jq 'length')
+[ "$(curl -s -XPOST "$U/_refresh" -H "$A" | jq -r '._shards.total')" = "$ALL" ] || fail "/_refresh covers every index"
+[ "$(curl -s -XPOST "$U/_all/_refresh" -H "$A" | jq -r '._shards.total')" = "$ALL" ] || fail "_all/_refresh covers every index"
+[ "$(code -XPUT "$U/rf/_refresh" -H "$A")" = 405 ] || fail "PUT _refresh is 405"
+say "  scoped keys refresh only inside their streams"
+[ "$(code -XPOST "$U/app-y/_refresh" -H "Authorization: Bearer $KEY")" = 200 ] || fail "scoped key refreshes its own index"
+[ "$(code -XPOST "$U/keep/_refresh" -H "Authorization: Bearer $KEY")" = 403 ] || fail "scoped key denied outside scope"
+[ "$(code -XPOST "$U/app-*,keep/_refresh" -H "Authorization: Bearer $KEY")" = 403 ] || fail "list escaping the scope is denied"
+[ "$(code -XPOST "$U/_refresh" -H "Authorization: Bearer $KEY")" = 403 ] || fail "scoped key cannot refresh everything"
+
+say "PASS: OpenSearch compatibility (#71 #72 #73 #74 #76 #77 #80)"

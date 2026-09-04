@@ -1140,7 +1140,7 @@ fn map_search_error(err: SearchError) -> Response {
     }
 }
 
-fn es_error(status: StatusCode, error_type: &str, reason: &str) -> Response {
+pub(crate) fn es_error(status: StatusCode, error_type: &str, reason: &str) -> Response {
     (
         status,
         Json(json!({
