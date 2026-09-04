@@ -31,6 +31,9 @@ pub struct AppState {
     /// with a cluster token; whether this node *initiates* handoffs is
     /// its `ingest.balance_bulk` setting.
     pub bulk_forward: Option<Arc<crate::bulk_forward::BulkForwarder>>,
+    /// `_refresh` fan-out to ingest peers (#80). Present on every node
+    /// with a cluster token.
+    pub refresh_peers: Option<Arc<crate::refresh_api::RefreshPeers>>,
     /// Set when the operator drains this node (learned via heartbeat):
     /// bulk ingest is refused so the WAL empties out ahead of shutdown.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
@@ -76,6 +79,7 @@ impl AppState {
             cors_allow_origin: config.http.cors_allow_origin.clone(),
             internal: None,
             bulk_forward: None,
+            refresh_peers: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control: None,
             reconcile: None,

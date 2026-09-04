@@ -14,6 +14,7 @@ mod loki_api;
 mod metrics;
 mod placement;
 mod reconcile;
+mod refresh_api;
 mod routes;
 mod search_api;
 mod state;
@@ -318,6 +319,24 @@ async fn main() -> anyhow::Result<()> {
             config.node_id(),
             rsearch_common::crypto::token_digest(&config.cluster.internal_token),
             config.ingest.balance_bulk,
+        )));
+    }
+    // `_refresh` (#80) must reach every ingest node's buffer from
+    // whichever node took the request, so the fan-out client exists on
+    // every node with a cluster token; without one the node flushes only
+    // its own buffer (a single-node deployment).
+    if !config.cluster.internal_token.is_empty() {
+        state.refresh_peers = Some(std::sync::Arc::new(refresh_api::RefreshPeers::new(
+            state.metastore.clone(),
+            rsearch_storage::PeerClient::new(
+                &config.cluster.internal_token,
+                (!config.cluster.peer_ca_file.is_empty())
+                    .then_some(config.cluster.peer_ca_file.as_str()),
+            )
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("building refresh peer client")?,
+            config.node_id(),
+            rsearch_common::crypto::token_digest(&config.cluster.internal_token),
         )));
     }
     if config.storage.backend == "replicated" {

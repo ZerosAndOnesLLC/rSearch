@@ -211,7 +211,7 @@ and IMDS are never touched.
 | Ingest | `POST /_bulk`, `POST /{index}/_bulk` (`index`, `create`; plus `update`, `delete` on document-mode indices; `?refresh=true\|wait_for`) |
 | Documents | `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `POST /{index}/_doc`, `PUT/POST /{index}/_create/{id}`, `POST /{index}/_update/{id}`, `GET /{index}/_source/{id}`, `POST /{index}/_delete_by_query` (document-mode indices) |
 | Search | `POST/GET /{index}/_search` (`?scroll=` opens a scroll), `POST/GET /_search/scroll[/{id}]`, `DELETE /_search/scroll[/{id}\|/_all]`, `GET/POST /{index}/_count` (`?q=` or a `query` body), `POST /_msearch` |
-| Index admin | `PUT /{index}` (settings + mapping), `PUT /{index}/_mapping` (add fields), `GET /{index}/_mapping` (declared + dynamic fields), `DELETE /{index}` (name, list, or glob; `_all` and `*` refused), `GET/HEAD /{index}`, `GET /{index}/_settings`, `GET /_cat/indices` |
+| Index admin | `PUT /{index}` (settings + mapping), `PUT /{index}/_mapping` (add fields), `GET /{index}/_mapping` (declared + dynamic fields), `DELETE /{index}` (name, list, or glob; `_all` and `*` refused), `GET/HEAD /{index}`, `GET /{index}/_settings`, `POST/GET /{index}/_refresh` and `/_refresh` (name, list, glob, or `_all`), `GET /_cat/indices` |
 | Cluster | `GET /`, `GET /_cluster/health`, `GET /_cat/nodes` |
 | Streams | `PUT /_rsearch/streams/{name}/retention`, routing rules under `/_rsearch/routing_rules` |
 | Alerts | `PUT/GET/DELETE /_rsearch/alerts[/{name}]` (scheduled query → webhook) |
@@ -363,7 +363,10 @@ On a document-mode index:
   `ingest.max_batch_secs`, default 30s). `?refresh=true` or
   `?refresh=wait_for` on `_bulk` or any document route cuts the split now
   and returns once it is published, so a save-then-search flow sees its
-  own write. Deletes are visible immediately on the node that took them
+  own write. `POST /{index}/_refresh` (the `indices.refresh` client
+  helper) does the same for an index's buffered writes on every ingest
+  node, for callers that did not make the write; on log indices it is
+  acknowledged without cutting a split. Deletes are visible immediately on the node that took them
   and within ~1s elsewhere. `update`/`create`/GET read published splits
   only, so a read-modify-write chain should set `refresh=wait_for` on
   each step.

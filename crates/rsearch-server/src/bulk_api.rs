@@ -58,7 +58,7 @@ pub struct InternalBulkQuery {
 /// How long a refresh waits for the cut split to publish before the
 /// response goes out anyway (the documents are WAL-durable and will
 /// appear; a storage/metastore outage must not hang the client forever).
-const REFRESH_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const REFRESH_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Receive a batch handed off by a peer (#19). Authenticated by the
 /// cluster token like the internal object API; always indexes locally —

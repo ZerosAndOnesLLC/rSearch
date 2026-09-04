@@ -118,6 +118,23 @@ UNDER=$(under_held rlogs 2 "'node-1','node-2','node-3'")
 [ "$UNDER" = "0" ] || fail "$UNDER published splits below replication factor"
 say "PASS: placement at factor 2"
 
+# ---------- _refresh fans out to every ingest node's buffer (#80) ----------
+say "TEST: _refresh on one node cuts document buffers held on the others"
+curl -s -XPUT "http://127.0.0.1:9311/rdocs" -H 'Content-Type: application/json' \
+  -d '{"settings":{"index":{"mode":"document"}}}' | jq -e '.acknowledged' >/dev/null || fail "create rdocs"
+# Document buffers cut on their own only after document_max_batch_secs
+# (default 5s); the write goes to node-1 and node-2, the refresh to node-3.
+for port in 9311 9312; do
+  printf '{"index":{"_id":"d%s"}}\n{"v":%s}\n' "$port" "$port" \
+    | curl -s -XPOST "http://127.0.0.1:$port/rdocs/_bulk" -H 'Content-Type: application/x-ndjson' --data-binary @- \
+    | jq -e '.errors == false' >/dev/null || fail "bulk rdocs to :$port"
+done
+R=$(curl -s -XPOST "http://127.0.0.1:9313/rdocs/_refresh")
+[ "$(echo "$R" | jq -cS .)" = '{"_shards":{"failed":0,"successful":1,"total":1}}' ] || fail "_refresh via node-3: $R"
+C=$(count_docs 9313 rdocs)
+[ "$C" = "2" ] || fail "node-3 sees $C/2 rdocs right after _refresh"
+say "PASS: _refresh reached both ingest buffers"
+
 # ---------- holder death ----------
 say "TEST: killing node-1; survivors keep answering"
 kill -9 "${PIDS[node-1]}"; unset 'PIDS[node-1]'
