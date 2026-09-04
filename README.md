@@ -252,8 +252,10 @@ way OpenSearch's dynamic mapping would have typed it: strings as `text`
 with the `keyword` sub-field, integers `long`, fractions `float`,
 booleans `boolean`, nested objects as nested `properties`. Each split
 records its unmapped fields when it is built; splits from before this
-existed are inventoried once by the control leader (a bounded number per
-tick) and report nothing until then. `PUT /{index}/_mapping` adds fields
+existed are inventoried once by the control leader
+(`control.dynamic_fields_backfill_splits_per_tick`, default 20, newest
+first, scanned a few at a time in parallel, 0 disables) and report
+nothing until then. `PUT /{index}/_mapping` adds fields
 to an existing index; a field that already exists must keep its type
 (400, as in OpenSearch), and `PUT /{index}` on an existing index is still
 accepted as an update rather than a 400.

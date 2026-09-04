@@ -21,6 +21,10 @@ const REPAIR_DRAIN_CONCURRENCY: usize = 8;
 /// Ceiling on drain batches processed per node per tick — bounds how long
 /// one tick can run while still draining far faster than one batch/tick.
 const DRAIN_BATCHES_PER_TICK: usize = 10;
+/// Dynamic-field backfill scans in flight at once (#82): each opens a
+/// split, a remote fetch on an object-store backend, so a serial batch
+/// was bound by round trips rather than CPU.
+const BACKFILL_SCAN_CONCURRENCY: usize = 4;
 /// How often the full under-replication scan must run even with no
 /// membership change — catches writes that never reached the factor.
 const REPAIR_FULL_SCAN_SECS: u64 = 300;
@@ -1089,25 +1093,40 @@ impl ControlPlane {
 
     /// Record the unmapped-field inventory of splits registered before
     /// it was tracked (#76): each is opened once and its `_dynamic` term
-    /// dictionary skip-scanned, newest data first, a bounded number per
-    /// tick. Until a split is reached, `_mapping` omits the dynamic
-    /// fields only it holds.
+    /// dictionary skip-scanned, newest data first,
+    /// `control.dynamic_fields_backfill_splits_per_tick` per tick (#82).
+    /// The scans are remote fetches on an object-store backend, so a
+    /// batch runs `BACKFILL_SCAN_CONCURRENCY` of them at a time. Until a
+    /// split is reached, `_mapping` omits the dynamic fields only it
+    /// holds.
     async fn dynamic_fields_backfill_job(&self) -> anyhow::Result<()> {
-        const PER_TICK: i64 = 20;
-        let candidates = self.metastore.splits_without_dynamic_fields(PER_TICK).await?;
-        for split in candidates {
-            let scan = async {
-                let reader = SplitReader::open(
-                    self.storage.clone(),
-                    &split.storage_key,
-                    self.cache.clone(),
-                )
-                .await?;
-                tokio::task::spawn_blocking(move || reader.dynamic_field_types())
-                    .await
-                    .map_err(|e| rsearch_index::IndexError::InvalidDocument(e.to_string()))?
-            };
-            let inventory = match scan.await {
+        use futures::stream::{self, StreamExt};
+        let budget = self.config.dynamic_fields_backfill_splits_per_tick;
+        if budget <= 0 {
+            return Ok(());
+        }
+        let candidates = self.metastore.splits_without_dynamic_fields(budget).await?;
+        let scans = stream::iter(candidates)
+            .map(|split| async move {
+                let scanned = async {
+                    let reader = SplitReader::open(
+                        self.storage.clone(),
+                        &split.storage_key,
+                        self.cache.clone(),
+                    )
+                    .await?;
+                    tokio::task::spawn_blocking(move || reader.dynamic_field_types())
+                        .await
+                        .map_err(|e| rsearch_index::IndexError::InvalidDocument(e.to_string()))?
+                }
+                .await;
+                (split, scanned)
+            })
+            .buffer_unordered(BACKFILL_SCAN_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (split, scanned) in scans {
+            let inventory = match scanned {
                 Ok(fields) => serde_json::to_value(fields)?,
                 // A malformed split will never scan: record an empty
                 // inventory so it does not pin the budget every tick (a

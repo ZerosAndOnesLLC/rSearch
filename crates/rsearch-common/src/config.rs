@@ -189,6 +189,14 @@ pub struct ControlConfig {
     /// first), so an upgraded cluster converges on one analyzer and every
     /// split gains the `.keyword` view. 0 disables the pass.
     pub schema_upgrade_splits_per_tick: i64,
+    /// Max published splits registered before the unmapped-field
+    /// inventory was tracked (v0.6) whose inventory is recorded per
+    /// control tick (newest data first). Each costs one split open plus a
+    /// term-dictionary skip-scan — a remote fetch on an object-store
+    /// backend — done a few at a time in parallel. Until a split is
+    /// reached, `_mapping` omits the dynamic fields only it holds. 0
+    /// disables the pass.
+    pub dynamic_fields_backfill_splits_per_tick: i64,
     /// Tombstones are purged from the metastore only once no split can
     /// still hold a version they hide *and* they are at least this old —
     /// the age covers documents still buffered on an ingest node whose
@@ -213,6 +221,7 @@ impl Default for ControlConfig {
             compact_max_age_secs: 3_600.0,
             compact_splits_per_tick: 8,
             schema_upgrade_splits_per_tick: 2,
+            dynamic_fields_backfill_splits_per_tick: 20,
             tombstone_purge_grace_secs: 3_600.0,
         }
     }
