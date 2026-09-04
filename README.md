@@ -272,7 +272,13 @@ multi-valued fields sort by their smallest value ascending and largest
 descending). Hits report OpenSearch's sort values, including its
 sentinels for a missing value (`null` for keywords, the extreme long,
 `"Infinity"`/`"-Infinity"` for doubles). `_score` and `_doc` are
-accepted as no-ops.
+accepted as no-ops. Write one field per sort entry: a single object
+naming several fields is refused with 400, because JSON object order
+does not survive parsing and the clauses could not be applied in the
+order written. Dynamic fields become sortable as their splits' field
+inventories are recorded — immediately for splits written by 0.6, and
+for older splits once the control leader's backfill has reached them
+(20 splits per tick).
 
 Deep pagination uses `search_after`: every hit's `sort` values end with
 `[timestamp_millis, _seq]` — an implicit unique tiebreak appended to
@@ -301,7 +307,11 @@ count; aggregations come with the first page only), and `DELETE
 /_search/scroll` with `{"scroll_id": …}` (or `/_all`) frees it. A scroll
 context is a row in the metastore — the original search plus the last
 page's cursor — so it continues on any search node and expires after its
-keep-alive (up to `1d`). `from` and `search_after` are refused in a
+keep-alive (up to `1d`). It is a replay from the cursor, not a snapshot:
+documents written or updated while a scroll is open can appear on a later
+page, whereas OpenSearch's scroll pins the index as it was opened.
+A stream-scoped key can only continue or free scrolls on its own streams
+(`/_all` frees just those). `from` and `search_after` are refused in a
 scroll context, an expired or freed id is a 404
 (`search_context_missing_exception`), and `sort: ["_doc"]` is served by
 the stable (timestamp, `_seq`) sequence.
@@ -314,9 +324,11 @@ expression — a name (404 if missing), a comma-separated list, or globs
 (a glob matching nothing is acknowledged); `_all` and a bare `*` are
 refused. A stream-scoped key may delete only indices inside its scope,
 whatever the expression expands to. Documents still buffered on an
-ingest node when the index is deleted are flushed into the re-created
-index, or re-create it, the way a `_bulk` to a missing index always has;
-other nodes forget the old index within their 10-second stream caches.
+ingest node when the index is deleted die with it, as in OpenSearch (the
+node logs how many it dropped); a batch that races the deletion is never
+published under the retired index, and an index re-created under the
+same name keeps the mode and mapping it was re-created with. Other
+nodes forget the old index within their 10-second stream caches.
 
 Inputs beyond HTTP: syslog (RFC 5424 + 3164, UDP/TCP, optional TLS) and
 GELF (TCP), each routable to a stream and subject to routing rules.

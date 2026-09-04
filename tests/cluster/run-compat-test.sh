@@ -112,6 +112,17 @@ say "#77 sort"
 [ "$(order '{"sort":[{"age":{"order":"asc","missing":27}}]}')" = "2,3,1" ] || fail "missing value"
 [ "$(sortvals '{"sort":[{"age":{"order":"asc","missing":27}}]}')" = "[25,27,30]" ] || fail "missing value reported"
 [ "$(order '{"sort":[{"age":{"order":"asc","mode":"min"}}]}')" = "2,1,3" ] || fail "mode min accepted"
+[ "$(order '{"sort":[{"age":"DESC"}]}')" = "1,2,3" ] || fail "order is case-insensitive"
+[ "$(code -XPOST "$U/people/_search" -H "$J" -d '{"sort":[{"age":"desc","name":"asc"}]}')" = 400 ] || fail "multi-key sort object is refused (order cannot be honoured)"
+curl -s -XPOST "$U/people/_bulk?refresh=wait_for" -H "$ND" --data-binary $'{"index":{"_id":"m1"}}\n{"tags":[1,100]}\n{"index":{"_id":"m2"}}\n{"tags":[50,60]}\n' >/dev/null
+# (a field first seen by the split just published becomes sortable once
+# the node's 10s stream cache refreshes its dynamic-field inventory)
+for i in $(seq 1 15); do
+  got=$(curl -s -XPOST "$U/people/_search" -H "$J" -d '{"sort":[{"tags":{"order":"asc","mode":"max"}}],"query":{"exists":{"field":"tags"}}}' | jq -r '[.hits.hits[]?._id] | join(",")')
+  [ "$got" = "m2,m1" ] && break; pause 1
+done
+[ "$got" = "m2,m1" ] || fail "mode max on a multi-valued field: $got"
+curl -s -XPOST "$U/people/_delete_by_query" -H "$J" -d '{"query":{"ids":{"values":["m1","m2"]}}}' >/dev/null; curl -s -XPOST "$U/people/_search?size=0" >/dev/null; pause 1.5
 R=$(curl -s -XPOST "$U/people/_search" -H "$J" -d '{"size":1,"sort":[{"age":"asc"},{"name":"desc"}],"_source":false}')
 [ "$(echo "$R" | jq -r '.hits.hits[0]._id')" = 2 ] || fail "multi sort first"
 SA=$(echo "$R" | jq -c '.hits.hits[0].sort')
@@ -191,11 +202,21 @@ curl -s -XPUT "$U/tmp_a" >/dev/null; curl -s -XPUT "$U/tmp_b" >/dev/null; curl -
 [ "$(curl -s -XDELETE "$U/tmp_*,nope_*")" = '{"acknowledged":true}' ] || fail "glob delete"
 # (deletes are audited into rsearch-audit, which appears alongside)
 [ "$(curl -s "$U/_cat/indices" | jq -r '[.[].index | select(. != "rsearch-audit")] | sort | join(",")')" = "keep,people" ] || fail "globbed indices gone: $(curl -s "$U/_cat/indices" | jq -c '[.[].index]')"
-say "  documents in flight at deletion land in the re-created index"
+say "  documents in flight at deletion die with the index (as in OpenSearch)"
 curl -s -XPOST "$U/inflight/_bulk" -H "$ND" --data-binary $'{"index":{}}\n{"m":"buffered"}\n' | jq -e '.errors == false' >/dev/null || fail "bulk inflight"
 [ "$(curl -s -XDELETE "$U/inflight")" = '{"acknowledged":true}' ] || fail "delete inflight"
-for i in $(seq 1 20); do [ "$(curl -s "$U/inflight/_count" | jq -r '.count // 0')" = 1 ] && break; pause 1; done
-[ "$(curl -s "$U/inflight/_count" | jq -r .count)" = 1 ] || fail "late flush re-created the index with its document"
+pause 6
+[ "$(code -I "$U/inflight")" = 404 ] || fail "a late flush must not resurrect a deleted index"
+grep -q "index deleted; buffered documents dropped" "$LOGDIR/node.log" || fail "drop not logged"
+say "  delete + re-create while a document-mode batch is buffered keeps the new mode"
+curl -s -XPUT "$U/redo" -H "$J" -d '{"settings":{"index":{"mode":"document"}}}' >/dev/null
+curl -s -XPOST "$U/redo/_bulk" -H "$ND" --data-binary $'{"index":{"_id":"old"}}\n{"v":"old"}\n' >/dev/null
+[ "$(curl -s -XDELETE "$U/redo")" = '{"acknowledged":true}' ] || fail "delete redo"
+curl -s -XPUT "$U/redo" -H "$J" -d '{"settings":{"index":{"mode":"document"}}}' | jq -e '.acknowledged' >/dev/null || fail "re-create redo as document mode"
+curl -s -XPOST "$U/redo/_bulk?refresh=wait_for" -H "$ND" --data-binary $'{"index":{"_id":"new"}}\n{"v":"new"}\n' | jq -e '.errors == false' >/dev/null || fail "bulk into re-created redo"
+pause 3
+[ "$(curl -s "$U/redo/_settings" | jq -r '.redo.settings.index.mode')" = document ] || fail "re-created index keeps document mode"
+[ "$(curl -s "$U/redo/_search" -H "$J" -d '{"_source":false}' | jq -r '[.hits.hits[]._id] | sort | join(",")')" = "new" ] || fail "only the post-recreate document survives: $(curl -s "$U/redo/_search" -H "$J" -d '{"_source":false}' | jq -c '[.hits.hits[]._id]')"
 say "  scoped keys delete only inside their streams"
 curl -s -XPUT "$U/_rsearch/users/admin" -H "$J" -d '{"password":"adminpassword123","role":"admin"}' | jq -e '.acknowledged' >/dev/null || fail "create admin"
 TOKEN=$(curl -s -XPOST "$U/_rsearch/login" -H "$J" -d '{"username":"admin","password":"adminpassword123"}' | jq -r '.token')
@@ -207,5 +228,13 @@ curl -s -XPUT "$U/app-y" -H "Authorization: Bearer $KEY" >/dev/null
 [ "$(code -XDELETE "$U/app-*,keep" -H "Authorization: Bearer $KEY")" = 403 ] || fail "list escaping the scope is denied"
 [ "$(code -I "$U/app-y" -H "Authorization: Bearer $KEY")" = 200 ] || fail "denied list deleted nothing"
 [ "$(code "$U/_search/scroll?scroll_id=$(printf '%032d' 0)" -H "Authorization: Bearer $KEY")" = 404 ] || fail "scoped key can reach the scroll API"
+say "  scoped keys clear only their own scroll contexts"
+curl -s -XPUT "$U/app-s" -H "Authorization: Bearer $KEY" >/dev/null
+FOREIGN=$(curl -s -XPOST "$U/keep/_search?scroll=1m" -H "Authorization: Bearer $TOKEN" -H "$J" -d '{}' | jq -r '._scroll_id')
+MINE=$(curl -s -XPOST "$U/app-s/_search?scroll=1m" -H "Authorization: Bearer $KEY" -H "$J" -d '{}' | jq -r '._scroll_id')
+[ "$(code -XDELETE "$U/_search/scroll" -H "Authorization: Bearer $KEY" -H "$J" -d "{\"scroll_id\":\"$FOREIGN\"}")" = 403 ] || fail "scoped key cannot free another tenant's scroll"
+[ "$(curl -s -XDELETE "$U/_search/scroll/_all" -H "Authorization: Bearer $KEY" | jq -r .num_freed)" = 1 ] || fail "scoped _all frees only the key's own contexts"
+[ "$(sql "SELECT count(*) FROM scroll_contexts WHERE id = '$FOREIGN'")" = 1 ] || fail "foreign context survived a scoped _all"
+[ "$(code -XPOST "$U/_search/scroll" -H "Authorization: Bearer $TOKEN" -H "$J" -d "{\"scroll_id\":\"$MINE\"}")" = 404 ] || fail "own context was freed"
 
 say "PASS: OpenSearch compatibility (#71 #72 #73 #74 #76 #77)"

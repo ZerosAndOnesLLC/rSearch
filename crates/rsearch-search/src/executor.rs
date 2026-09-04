@@ -152,7 +152,6 @@ impl SearchRequest {
         // correct one to the caller, and a `search_after` cursor issued
         // from it pages over the wrong sequence (#67).
         let sort = SortSpec::parse(body.get("sort"))?;
-        let sort_desc = sort.timestamp_desc().unwrap_or(true);
         let field_sort = matches!(sort, SortSpec::Fields(_));
         // search_after: the previous page's last `sort` values. The
         // timestamp is taken verbatim as epoch millis (it is what our own
@@ -215,7 +214,6 @@ impl SearchRequest {
                 "[from] parameter must be set to 0 when [search_after] is used".into(),
             ));
         }
-        let _ = sort_desc;
         let aggs = body
             .get("aggs")
             .or_else(|| body.get("aggregations"))
@@ -296,8 +294,24 @@ struct CachedStream {
     record: rsearch_metastore::StreamRecord,
     schema: Arc<MappedSchema>,
     /// Unmapped fields its published splits hold (path → value types),
-    /// what field sorts resolve dynamic names against.
-    dynamic_fields: std::collections::BTreeMap<String, Vec<String>>,
+    /// what field sorts resolve dynamic names against. Fetched on first
+    /// use only (an aggregate over every published split), single-flight,
+    /// and reused for the record's cache lifetime.
+    dynamic_fields: tokio::sync::OnceCell<Arc<std::collections::BTreeMap<String, Vec<String>>>>,
+}
+
+impl CachedStream {
+    async fn dynamic_fields(
+        &self,
+        metastore: &Metastore,
+    ) -> SearchResult<Arc<std::collections::BTreeMap<String, Vec<String>>>> {
+        self.dynamic_fields
+            .get_or_try_init(|| async {
+                Ok(Arc::new(metastore.stream_dynamic_fields(self.record.id).await?))
+            })
+            .await
+            .cloned()
+    }
 }
 
 /// Stateless search service: metastore for pruning, storage for split
@@ -469,11 +483,10 @@ impl SearchService {
         let record = self.metastore.get_stream(name).await?;
         let mapping = IndexMapping::from_json(&record.mapping)
             .map_err(|e| SearchError::BadRequest(e.to_string()))?;
-        let dynamic_fields = self.metastore.stream_dynamic_fields(record.id).await?;
         let cached = Arc::new(CachedStream {
             schema: Arc::new(MappedSchema::build(mapping)),
             record,
-            dynamic_fields,
+            dynamic_fields: tokio::sync::OnceCell::new(),
         });
         let mut streams = self.streams.lock().unwrap();
         // Bounded so a probe flood of stream names can't grow it forever.
@@ -637,7 +650,19 @@ impl SearchService {
                 cursor: request.search_after,
             },
             SortSpec::Fields(fields) => {
-                let resolved = resolve_sort(fields, &schema, &cached.dynamic_fields)?;
+                // The dynamic inventory is only consulted for names the
+                // mapping does not settle.
+                let needs_inventory = fields.iter().any(|f| {
+                    !f.is_timestamp()
+                        && f.field != rsearch_index::SEQ_FIELD
+                        && !schema.fields.contains_key(&f.field)
+                });
+                let inventory = if needs_inventory {
+                    cached.dynamic_fields(&self.metastore).await?
+                } else {
+                    Arc::new(Default::default())
+                };
+                let resolved = resolve_sort(fields, &schema, &inventory)?;
                 let cursor = match &request.search_after_values {
                     Some(values) => Some(FieldCursor::parse(values, &resolved)?),
                     None => None,

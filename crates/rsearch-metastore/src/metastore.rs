@@ -8,7 +8,7 @@ use crate::types::{NewSplit, SplitRecord, SplitState, StreamMode, StreamRecord, 
 
 pub(crate) const SPLIT_COLUMNS: &str = "id, split_id, stream_id, state, storage_key, doc_count, \
      size_bytes, time_start_millis, time_end_millis, footer_len, created_by, \
-     seq_min, seq_max, tombstone_seq_applied, schema_version, dynamic_fields";
+     seq_min, seq_max, tombstone_seq_applied, schema_version";
 
 /// Postgres-backed metadata store shared by every node role: streams,
 /// splits, nodes, placement, auth, routing rules, and alerts. Cloning
@@ -138,6 +138,28 @@ impl Metastore {
             return Err(MetastoreError::StreamNotFound(name.to_string()));
         }
         Ok(())
+    }
+
+    /// Replace a stream's mapping only if it still equals `expected`
+    /// (compare-and-set, so concurrent PUT /{index}/_mapping merges never
+    /// overwrite each other's fields). `Ok(false)` = the mapping changed
+    /// underneath; re-read and merge again.
+    pub async fn update_stream_mapping_if(
+        &self,
+        name: &str,
+        expected: &serde_json::Value,
+        mapping: &serde_json::Value,
+    ) -> MetastoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE streams SET mapping = $3, updated_at = now()
+             WHERE name = $1 AND deleted_at IS NULL AND mapping = $2",
+        )
+        .bind(name)
+        .bind(expected)
+        .bind(mapping)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Fetch-or-create a stream with an explicit mode. An existing stream

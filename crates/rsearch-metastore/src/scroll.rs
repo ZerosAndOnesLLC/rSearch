@@ -93,6 +93,13 @@ impl Metastore {
         Ok(())
     }
 
+    /// Every live context's (id, stream), for scope filtering.
+    pub async fn list_scrolls(&self) -> MetastoreResult<Vec<(String, String)>> {
+        Ok(sqlx::query_as("SELECT id, stream FROM scroll_contexts WHERE expires_at > now()")
+            .fetch_all(self.pool())
+            .await?)
+    }
+
     /// Free scroll contexts by id; returns how many existed.
     pub async fn delete_scrolls(&self, ids: &[String]) -> MetastoreResult<u64> {
         let result = sqlx::query("DELETE FROM scroll_contexts WHERE id = ANY($1)")

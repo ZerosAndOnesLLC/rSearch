@@ -1096,32 +1096,37 @@ impl ControlPlane {
         const PER_TICK: i64 = 20;
         let candidates = self.metastore.splits_without_dynamic_fields(PER_TICK).await?;
         for split in candidates {
-            let step = async {
+            let scan = async {
                 let reader = SplitReader::open(
                     self.storage.clone(),
                     &split.storage_key,
                     self.cache.clone(),
                 )
                 .await?;
-                let fields = tokio::task::spawn_blocking(move || reader.dynamic_field_types())
-                    .await??;
-                self.metastore
-                    .set_split_dynamic_fields(&split.split_id, &serde_json::to_value(fields)?)
-                    .await?;
-                Ok::<_, anyhow::Error>(())
+                tokio::task::spawn_blocking(move || reader.dynamic_field_types())
+                    .await
+                    .map_err(|e| rsearch_index::IndexError::InvalidDocument(e.to_string()))?
             };
-            match step.await {
-                Ok(()) => info!(split_id = %split.split_id, "dynamic fields recorded"),
-                // Unreadable split: record an empty inventory so it does
-                // not pin the budget every tick; a rewrite (merge,
-                // compaction) records the real one.
-                Err(e) => {
-                    warn!(split_id = %split.split_id, error = %e, "dynamic-fields scan failed; recording none");
-                    self.metastore
-                        .set_split_dynamic_fields(&split.split_id, &serde_json::json!({}))
-                        .await?;
+            let inventory = match scan.await {
+                Ok(fields) => serde_json::to_value(fields)?,
+                // A malformed split will never scan: record an empty
+                // inventory so it does not pin the budget every tick (a
+                // rewrite — merge, compaction — records the real one).
+                // Anything else (storage, I/O) is transient: leave the
+                // row NULL and retry next tick.
+                Err(rsearch_index::IndexError::InvalidDocument(reason)) => {
+                    warn!(split_id = %split.split_id, reason, "split unreadable; recording an empty dynamic-field inventory");
+                    serde_json::json!({})
                 }
-            }
+                Err(e) => {
+                    warn!(split_id = %split.split_id, error = %e, "dynamic-fields scan failed; will retry");
+                    continue;
+                }
+            };
+            self.metastore
+                .set_split_dynamic_fields(&split.split_id, &inventory)
+                .await?;
+            info!(split_id = %split.split_id, "dynamic fields recorded");
         }
         Ok(())
     }
@@ -1280,7 +1285,6 @@ mod tests {
             seq_max: None,
             tombstone_seq_applied: 0,
             schema_version: 0,
-            dynamic_fields: None,
         }
     }
 

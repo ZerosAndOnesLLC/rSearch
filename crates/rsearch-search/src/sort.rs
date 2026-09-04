@@ -71,6 +71,18 @@ pub struct SortField {
     /// `unmapped_type`: sort on a field no document holds, as all
     /// missing, instead of a 400.
     pub unmapped_type: Option<String>,
+    /// `mode`: which of a multi-valued field's values represents the
+    /// document — `max` or `min` (default: min ascending, max descending).
+    pub mode: Option<SortMode>,
+}
+
+/// Which value of a multi-valued field a document sorts by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortMode {
+    /// The smallest value.
+    Min,
+    /// The largest value.
+    Max,
 }
 
 impl SortField {
@@ -82,6 +94,17 @@ impl SortField {
         match entry {
             Value::String(name) => Ok(Self::named(name)),
             Value::Object(map) => {
+                // OpenSearch applies a multi-key object as ordered clauses;
+                // JSON object order does not survive parsing here, so the
+                // order could not be honoured — refuse rather than sort in
+                // an order the caller did not ask for.
+                if map.len() > 1 {
+                    return Err(SearchError::BadRequest(format!(
+                        "sort object with {} fields: use one field per sort entry, e.g. \
+                         [{{\"a\": \"asc\"}}, {{\"b\": \"desc\"}}]",
+                        map.len()
+                    )));
+                }
                 let mut parsed = None;
                 for (name, spec) in map {
                     let Some(mut field) = Self::named(name) else { continue };
@@ -103,16 +126,19 @@ impl SortField {
                                         field.unmapped_type =
                                             Some(value.as_str().unwrap_or("").to_string());
                                     }
-                                    // Multi-valued fields sort by their
-                                    // min (asc) / max (desc), the default
-                                    // mode; other modes are not supported.
+                                    // Multi-valued fields sort by one
+                                    // representative value; avg/sum/median
+                                    // are not supported.
                                     "mode" => {
-                                        let mode = value.as_str().unwrap_or("");
-                                        if mode != "min" && mode != "max" {
-                                            return Err(SearchError::BadRequest(format!(
-                                                "sort mode [{mode}] on [{name}] is not supported"
-                                            )));
-                                        }
+                                        field.mode = match value.as_str().unwrap_or("") {
+                                            "min" => Some(SortMode::Min),
+                                            "max" => Some(SortMode::Max),
+                                            other => {
+                                                return Err(SearchError::BadRequest(format!(
+                                                    "sort mode [{other}] on [{name}] is not supported"
+                                                )));
+                                            }
+                                        };
                                     }
                                     other => {
                                         return Err(SearchError::BadRequest(format!(
@@ -150,6 +176,7 @@ impl SortField {
             desc: false,
             missing: None,
             unmapped_type: None,
+            mode: None,
         })
     }
 
@@ -160,7 +187,8 @@ impl SortField {
 }
 
 fn parse_order(name: &str, order: &str) -> SearchResult<bool> {
-    match order {
+    // Case-insensitive, as OpenSearch's SortOrder.fromString.
+    match order.to_ascii_lowercase().as_str() {
         "asc" => Ok(false),
         "desc" => Ok(true),
         other => Err(SearchError::BadRequest(format!(
@@ -244,6 +272,8 @@ pub struct ResolvedSort {
     pub ty: SortType,
     /// Descending order.
     pub desc: bool,
+    /// A multi-valued document sorts by its largest value (else smallest).
+    pub use_max: bool,
     /// Missing documents sort as if they held the maximum value.
     pub null_is_max: bool,
     /// Substitute value for missing documents (`missing: <value>`).
@@ -449,6 +479,11 @@ pub fn resolve_sort(
                 target,
                 ty,
                 desc: field.desc,
+                use_max: match field.mode {
+                    Some(SortMode::Max) => true,
+                    Some(SortMode::Min) => false,
+                    None => field.desc,
+                },
                 null_is_max,
                 substitute,
             })
@@ -691,7 +726,8 @@ enum SegAccessor {
 }
 
 impl SegAccessor {
-    /// The document's key: min of its values for asc, max for desc.
+    /// The document's key: the largest of its values when `desc`
+    /// (`use_max`), else the smallest.
     fn key(&self, doc: DocId, desc: bool) -> SegKey {
         fn pick<T: Copy, I: Iterator<Item = T>>(
             iter: I,
@@ -930,7 +966,7 @@ impl FieldSortSegmentCollector {
             .zip(&self.fields.fields)
             .zip(&self.substitutes)
             .map(|((accessor, sort), substitute)| {
-                let key = accessor.key(doc, sort.desc);
+                let key = accessor.key(doc, sort.use_max);
                 match (key, substitute) {
                     (SegKey::Missing, Some(sub)) => *sub,
                     (key, _) => key,
@@ -1189,12 +1225,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(f.desc && f.missing == Some(json!("_first")) && f.unmapped_type.as_deref() == Some("long"));
+        assert_eq!(f.mode, Some(SortMode::Max));
+        // Order is case-insensitive, as in OpenSearch.
+        assert!(SortField::parse(&json!({"age": "DESC"})).unwrap().unwrap().desc);
+        assert!(!SortField::parse(&json!({"age": {"order": "Asc"}})).unwrap().unwrap().desc);
         assert!(SortField::parse(&json!("_score")).unwrap().is_none());
         assert!(SortField::parse(&json!({"_doc": "asc"})).unwrap().is_none());
         for bad in [
             json!({"age": "sideways"}),
             json!({"age": {"order": "asc", "nested": {}}}),
             json!({"age": {"mode": "avg"}}),
+            // A multi-key object cannot be applied in the caller's order.
+            json!({"age": "desc", "name": "asc"}),
             json!(42),
         ] {
             assert!(SortField::parse(&bad).is_err(), "{bad}");
@@ -1299,6 +1341,26 @@ mod tests {
         let cursor = FieldCursor::parse(&[json!("b")], &resolved).unwrap();
         let plan = FieldSortPlan { fields: resolved, cursor: Some(cursor) };
         assert_eq!(ids(&run(&index, &schema, plan, 10)), vec![0, 2]);
+    }
+
+    #[test]
+    fn mode_picks_the_representative_value() {
+        let docs = vec![json!({"tags": [1, 100]}), json!({"tags": [50, 60]})];
+        let (schema, index) = index(serde_json::from_str(MAPPING).unwrap(), &docs);
+        let resolve_tags = |sort: Value| {
+            let fields: Vec<SortField> = vec![SortField::parse(&sort).unwrap().unwrap()];
+            resolve_sort(&fields, &schema, &dynamic(&[("tags", &["long"])])).unwrap()
+        };
+        let run_ids = |sort: Value| {
+            let plan = FieldSortPlan { fields: resolve_tags(sort), cursor: None };
+            ids(&run(&index, &schema, plan, 10))
+        };
+        // Defaults: min ascending, max descending (OpenSearch).
+        assert_eq!(run_ids(json!({"tags": "asc"})), vec![0, 1]);
+        assert_eq!(run_ids(json!({"tags": "desc"})), vec![0, 1]);
+        // Explicit modes flip the representative value.
+        assert_eq!(run_ids(json!({"tags": {"order": "asc", "mode": "max"}})), vec![1, 0]);
+        assert_eq!(run_ids(json!({"tags": {"order": "desc", "mode": "min"}})), vec![1, 0]);
     }
 
     #[test]

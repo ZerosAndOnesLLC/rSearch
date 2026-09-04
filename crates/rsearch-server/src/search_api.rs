@@ -355,9 +355,10 @@ fn scroll_context_missing(id: &str) -> Response {
 pub async fn clear_scroll(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
     body: String,
 ) -> Response {
-    clear_scrolls(state, params, body, None).await
+    clear_scrolls(state, params, identity, body, None).await
 }
 
 /// DELETE /_search/scroll/{scroll_id} (`_all` frees every context).
@@ -365,14 +366,19 @@ pub async fn clear_scroll_by_path(
     State(state): State<AppState>,
     Path(scroll_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
     body: String,
 ) -> Response {
-    clear_scrolls(state, params, body, Some(&scroll_id)).await
+    clear_scrolls(state, params, identity, body, Some(&scroll_id)).await
 }
 
+/// A scoped identity frees only contexts on streams inside its scope:
+/// `_all` clears its own, and a foreign id is a 403 (never a silent
+/// no-op, so a tenant cannot probe for other tenants' ids).
 async fn clear_scrolls(
     state: AppState,
     params: std::collections::HashMap<String, String>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
     body: String,
     path_id: Option<&str>,
 ) -> Response {
@@ -380,9 +386,12 @@ async fn clear_scrolls(
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
-    let freed = if parsed.ids.iter().any(|id| id == "_all") {
-        state.metastore.delete_all_scrolls().await
-    } else {
+    let scoped = identity
+        .as_ref()
+        .map(|axum::Extension(identity)| identity)
+        .filter(|identity| !identity.is_admin && !identity.streams.iter().any(|s| s == "*"));
+    let all = parsed.ids.iter().any(|id| id == "_all");
+    if !all {
         if parsed.ids.is_empty() {
             return es_error(
                 StatusCode::BAD_REQUEST,
@@ -393,7 +402,37 @@ async fn clear_scrolls(
         if parsed.ids.iter().any(|id| !valid_scroll_id(id)) {
             return scroll_id_unparseable();
         }
-        state.metastore.delete_scrolls(&parsed.ids).await
+    }
+    let freed = match (scoped, all) {
+        (None, true) => state.metastore.delete_all_scrolls().await,
+        (None, false) => state.metastore.delete_scrolls(&parsed.ids).await,
+        (Some(identity), all) => match state.metastore.list_scrolls().await {
+            Ok(live) => {
+                let mine: Vec<String> = live
+                    .iter()
+                    .filter(|(id, stream)| {
+                        identity.allows_stream(stream) && (all || parsed.ids.contains(id))
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if !all
+                    && let Some((_, stream)) = live
+                        .iter()
+                        .find(|(id, stream)| parsed.ids.contains(id) && !identity.allows_stream(stream))
+                {
+                    return es_error(
+                        StatusCode::FORBIDDEN,
+                        "security_exception",
+                        &format!(
+                            "identity '{}' is not permitted to read index [{stream}]",
+                            identity.name
+                        ),
+                    );
+                }
+                state.metastore.delete_scrolls(&mine).await
+            }
+            Err(e) => Err(e),
+        },
     };
     match freed {
         Ok(n) => Json(json!({"succeeded": true, "num_freed": n})).into_response(),
@@ -521,7 +560,7 @@ async fn resolve_stream(state: &AppState, pattern: &str) -> Result<String, Strin
         .map_err(|e| e.to_string())?;
     let matches: Vec<String> = streams
         .iter()
-        .filter(|name| glob_match(pattern, name))
+        .filter(|name| crate::auth::stream_glob_matches(pattern, name))
         .cloned()
         .collect();
     match matches.len() {
@@ -531,29 +570,6 @@ async fn resolve_stream(state: &AppState, pattern: &str) -> Result<String, Strin
             "'{pattern}' matches {n} streams; multi-stream search is not supported yet"
         )),
     }
-}
-
-/// Minimal glob: '*' matches any run of characters.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let mut rest = name;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        match rest.find(part) {
-            Some(pos) => {
-                // First part must anchor at the start.
-                if i == 0 && pos != 0 {
-                    return false;
-                }
-                rest = &rest[pos + part.len()..];
-            }
-            None => return false,
-        }
-    }
-    // Last part must anchor at the end unless the pattern ends with '*'.
-    pattern.ends_with('*') || parts.last().map(|p| rest.is_empty() || p.is_empty()).unwrap_or(true)
 }
 
 /// GET /{index}/_mapping — Grafana fetches this to discover fields.
@@ -871,7 +887,12 @@ pub async fn delete_index(
     let mut targets: Vec<String> = Vec::new();
     for part in expression.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         if part.contains('*') {
-            targets.extend(names.iter().filter(|n| glob_match(part, n)).cloned());
+            targets.extend(
+                names
+                    .iter()
+                    .filter(|n| crate::auth::stream_glob_matches(part, n))
+                    .cloned(),
+            );
         } else if names.iter().any(|n| n == part) {
             targets.push(part.to_string());
         } else {
@@ -1186,13 +1207,5 @@ mod tests {
                 "log.level": {"type": "text"},
             })
         );
-    }
-
-    #[test]
-    fn glob_matches_index_expressions() {
-        assert!(glob_match("tmp_*", "tmp_termrepro"));
-        assert!(glob_match("*", "anything"));
-        assert!(!glob_match("tmp_*", "people"));
-        assert!(glob_match("people", "people"));
     }
 }
