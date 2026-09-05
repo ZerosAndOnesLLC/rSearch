@@ -2334,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-bench"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-common"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "aws-lc-rs",
  "config",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-index"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "bytes",
  "memmap2",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-ingest"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "crc32fast",
  "rsearch-common",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-metastore"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "rsearch-common",
  "serde",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-search"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "futures",
  "lru 0.18.2",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-server"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "rsearch-storage"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "aws-config",
