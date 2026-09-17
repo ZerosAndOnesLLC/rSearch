@@ -91,6 +91,8 @@ say "#85 keyword normalizer applies on both sides"
 [ "$(hits probe '{"query":{"prefix":{"code":"KIRSTEN"}}}')" = 1 ] || fail "normalized prefix"
 [ "$(hits probe '{"query":{"wildcard":{"code":"*ANDERSEN"}}}')" = 1 ] || fail "normalized wildcard"
 [ "$(hits probe '{"query":{"terms":{"code":["KIRSTEN ANDERSEN"]}}}')" = 1 ] || fail "normalized terms"
+[ "$(hits probe '{"query":{"match":{"code":"KIRSTEN ANDERSEN"}}}')" = 1 ] || fail "normalized match"
+[ "$(hits probe '{"query":{"range":{"code":{"gte":"KIRSTEN","lte":"KIRSTENZ"}}}}')" = 1 ] || fail "normalized range bound"
 [ "$(curl -s "$U/probe/_settings" | jq -r '.probe.settings.index.analysis.normalizer.lower.filter[0]')" = lowercase ] \
   || fail "_settings echoes the normalizer"
 
