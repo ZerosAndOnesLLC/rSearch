@@ -372,12 +372,27 @@ impl IngestPipeline {
     /// does not exist — the same implicit creation `_bulk` has always
     /// done), through a short TTL cache.
     pub async fn stream_info(&self, name: &str) -> IngestResult<StreamInfo> {
+        self.stream_info_creating(name, StreamMode::Log).await
+    }
+
+    /// Same, but a stream created here is created in `mode`. A write that
+    /// carries an explicit `_id` asks for document semantics, so the index
+    /// it implicitly creates is a document index rather than a log one it
+    /// could never use (issue #87).
+    pub async fn stream_info_creating(
+        &self,
+        name: &str,
+        mode: StreamMode,
+    ) -> IngestResult<StreamInfo> {
         if let Some((info, at)) = self.inner.stream_info.read().unwrap().get(name)
             && at.elapsed() < STREAM_INFO_TTL
         {
             return Ok(*info);
         }
-        let record = self.inner.metastore.ensure_stream(name).await?;
+        let record = match mode {
+            StreamMode::Log => self.inner.metastore.ensure_stream(name).await?,
+            mode => self.inner.metastore.ensure_stream_with_mode(name, mode).await?,
+        };
         let info = StreamInfo {
             id: record.id,
             mode: record.mode(),

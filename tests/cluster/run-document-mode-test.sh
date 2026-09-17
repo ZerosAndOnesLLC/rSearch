@@ -155,8 +155,13 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app-items/_doc/1?refresh
 [ "$code" = 200 ] || fail "scoped key writes a document (got $code)"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$U/app-items/_doc/1" -H "Authorization: Bearer $KEY")
 [ "$code" = 200 ] || fail "scoped key reads a document (got $code)"
+# A write carrying an explicit _id creates the index in document mode
+# (issue #87), where an explicit id always answers "updated"/200 — the
+# write path does not look up whether that id was there already.
 code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app-orders/_doc/1?refresh=wait_for" -H "Authorization: Bearer $KEY" -H "$J" -d '{"n":1}')
-[ "$code" = 201 ] || fail "glob scope covers a new tenant index (got $code)"
+[ "$code" = 200 ] || fail "glob scope covers a new tenant index (got $code)"
+[ "$(curl -s "$U/app-orders/_settings" -H "Authorization: Bearer $KEY" | jq -r '.["app-orders"].settings.index.mode')" = document ] \
+  || fail "an implicit index created by an _id write is a document index"
 code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/other/_doc/1" -H "Authorization: Bearer $KEY" -H "$J" -d '{}')
 [ "$code" = 403 ] || fail "scoped key is denied outside its streams (got $code)"
 code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$U/app/_doc/1" -H "Authorization: Bearer $KEY" -H "$J" -d '{}')

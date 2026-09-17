@@ -398,15 +398,14 @@ async fn handle_bulk_local(
         pipeline: &rsearch_ingest::IngestPipeline,
         infos: &mut HashMap<String, StreamInfo>,
         stream: &str,
-        create: bool,
+        create: Option<StreamMode>,
     ) -> Result<Option<StreamInfo>, Response> {
         if let Some(info) = infos.get(stream) {
             return Ok(Some(*info));
         }
-        let resolved = if create {
-            pipeline.stream_info(stream).await.map(Some)
-        } else {
-            pipeline.stream_info_if_exists(stream).await
+        let resolved = match create {
+            Some(mode) => pipeline.stream_info_creating(stream, mode).await.map(Some),
+            None => pipeline.stream_info_if_exists(stream).await,
         };
         match resolved {
             Ok(Some(info)) => {
@@ -420,6 +419,28 @@ async fn handle_bulk_local(
             )),
         }
     }
+    // A batch that writes an explicit `_id` into an index that does not
+    // exist yet asks for document semantics — that index is created in
+    // document mode, not as a log index the `_id` could never mean
+    // anything in (issue #87).
+    let wants_document: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|(_, item)| {
+            item.explicit_id && matches!(item.action, BulkAction::Index | BulkAction::Create)
+        })
+        .map(|(_, item)| item.stream.as_str())
+        .collect();
+    let create_mode: HashMap<String, StreamMode> = items
+        .iter()
+        .map(|(_, item)| {
+            let mode = if wants_document.contains(item.stream.as_str()) {
+                StreamMode::Document
+            } else {
+                StreamMode::Log
+            };
+            (item.stream.clone(), mode)
+        })
+        .collect();
     let mut kept: Vec<(usize, rsearch_ingest::BulkItem)> = Vec::with_capacity(items.len());
     for (position, item) in items {
         // `action.auto_create_index` decides whether a write to a missing
@@ -429,7 +450,8 @@ async fn handle_bulk_local(
         // (issue #87).
         let auto_create =
             rsearch_common::config::auto_create_allows(&state.auto_create_index, &item.stream);
-        let create = matches!(item.action, BulkAction::Index | BulkAction::Create) && auto_create;
+        let create = (matches!(item.action, BulkAction::Index | BulkAction::Create) && auto_create)
+            .then(|| create_mode.get(&item.stream).copied().unwrap_or(StreamMode::Log));
         match resolve_info(&pipeline, &mut infos, &item.stream, create).await? {
             Some(_) => kept.push((position, item)),
             None => {
@@ -706,7 +728,7 @@ async fn handle_bulk_local(
     // request; resolve those too.
     for plan in &planned {
         for stream in &plan.routes {
-            resolve_info(&pipeline, &mut infos, stream, true).await?;
+            resolve_info(&pipeline, &mut infos, stream, Some(StreamMode::Log)).await?;
         }
     }
 

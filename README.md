@@ -246,6 +246,36 @@ Splits written before v0.5 (schema version 2) keep their old tokens and
 have no `.keyword` view until the control node rewrites them (see
 `control.schema_upgrade_splits_per_tick` below).
 
+Declared mappings honor the per-field parameters that change what is
+indexed: **multi-fields** (`"fields": {"keyword": {"type": "keyword"}}`,
+nested as deep as you like, on any parent type), **`normalizer`** on a
+`keyword` (defined in `settings.analysis.normalizer`, filters
+`lowercase`, `uppercase`, `asciifolding` and `trim`, applied to the
+indexed value *and* to the input of every term-level query),
+**`ignore_above`**, and **`ignore_malformed`**. A sub-field declared
+later through `PUT /{index}/_mapping` is indexed in the splits written
+after it, the way a field added to an OpenSearch index applies to new
+documents.
+
+A parameter rSearch does not implement is **refused rather than
+ignored**: an unknown one with OpenSearch's own wording (`unknown
+parameter [x] on mapper [f] of type [keyword]`), and a known one at any
+value but the default that makes it a no-op — so a mapping using stock
+defaults (`index: true`, `doc_values: true`, `analyzer: "standard"`,
+`format: "strict_date_optional_time||epoch_millis"`, …) is accepted
+unchanged, while `index: false` or a custom `format` is a 400 instead of
+a silent surprise. `term` honors `case_insensitive` like `prefix` and
+`wildcard` do; `terms` refuses it, as in OpenSearch.
+
+`date` fields accept the whole default format,
+`strict_date_optional_time||epoch_millis`: `2026`, `2026-09`,
+`2026-09-16`, `…T00:00`, `…T00:00:00`, a fraction of up to nanosecond
+precision, and an offset of `Z`, `±HH:MM`, `±HHMM` or `±HH` (no offset
+means UTC) — on the write side and in query bounds alike. A bare number
+keeps rSearch's unit heuristic (a shipper's epoch seconds, millis,
+micros or nanos), which is a superset of OpenSearch's epoch-millis-only
+reading.
+
 `GET /{index}/_mapping` (and `GET /{index}`) reports the declared
 properties plus every unmapped field the index's splits hold, typed the
 way OpenSearch's dynamic mapping would have typed it: strings as `text`
@@ -258,7 +288,8 @@ first, scanned a few at a time in parallel, 0 disables) and report
 nothing until then. `PUT /{index}/_mapping` adds fields
 to an existing index; a field that already exists must keep its type
 (400, as in OpenSearch), and `PUT /{index}` on an existing index is still
-accepted as an update rather than a 400.
+accepted as an update rather than a 400. `GET /{index}/_settings` echoes
+the `analysis` normalizers the index was created with.
 
 Sorting works on any field OpenSearch can sort on: mapped `keyword`,
 `long`, `double`, `boolean`, `date` and `ip` fields, the timestamp
@@ -350,6 +381,17 @@ curl -XPUT localhost:9200/items -H 'Content-Type: application/json' -d '{
 ```
 
 (`mode` defaults to `log`; it can only change while the index is empty.)
+A write that carries an explicit `_id` into an index that **does not
+exist yet** creates it in document mode — the `_id` says which semantics
+the client wants, and a log index could never honor it. An `_id` sent to
+an index that already exists in log mode is refused with the message
+`delete` and `update` give, instead of silently indexing another copy of
+the document (issue #87). `ingest.auto_create_index` (OpenSearch's
+`action.auto_create_index`: `"true"`, `"false"`, or a first-match-wins
+pattern list such as `"-audit-*,+*"`) turns implicit creation off, so a
+write to a missing index fails and the client's own
+"create it with my mappings" path runs instead.
+
 On a document-mode index:
 
 - `_id` is honored and persisted; `index` on an existing `_id` **replaces**
@@ -360,6 +402,13 @@ On a document-mode index:
   /{index}/_doc/{id}`, `_create`, `_update`, `_source`,
   `_delete_by_query` — and are one-item `_bulk` requests underneath, so
   they share routing, peer handoff and WAL durability.
+- A value a mapped field cannot parse **fails the document** with
+  OpenSearch's `mapper_parsing_exception` (per item in `_bulk`), rather
+  than being dropped from a write that reports success; map the field
+  `ignore_malformed: true` to keep the drop. Log-mode indices keep
+  dropping — one bad field must not stop a shipper — and count it in
+  `rsearch_ingest_malformed_dropped_total`, with a warning per flush
+  naming the stream (issue #86).
 - **Visibility**: a write becomes searchable when its split is cut —
   within `ingest.document_max_batch_secs` (default 5s; log indices use
   `ingest.max_batch_secs`, default 30s). `?refresh=true` or

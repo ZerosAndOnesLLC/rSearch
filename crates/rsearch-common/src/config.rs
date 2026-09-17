@@ -496,7 +496,7 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     }
     match last {
         // A trailing `*` swallows whatever is left.
-        Some(part) if part.is_empty() => true,
+        Some("") => true,
         Some(part) => rest.is_empty() || name.ends_with(part),
         None => rest.is_empty(),
     }
