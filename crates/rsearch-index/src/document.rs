@@ -92,12 +92,21 @@ fn parse_timestamp(value: &serde_json::Value) -> Option<tantivy::DateTime> {
 /// document is stored verbatim in `_source`.
 pub struct DocumentConverter {
     schema: MappedSchema,
+    /// Values dropped because a mapped field could not parse them, since
+    /// this converter was created (issue #86). Only a log-mode index ever
+    /// gets here with one: a document-mode write is refused up front.
+    malformed_dropped: std::sync::atomic::AtomicU64,
 }
 
 impl DocumentConverter {
     /// Create a converter for the given schema.
     pub fn new(schema: MappedSchema) -> Self {
-        Self { schema }
+        Self { schema, malformed_dropped: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// How many values this converter has dropped as unparseable.
+    pub fn malformed_dropped(&self) -> u64 {
+        self.malformed_dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The schema documents are converted against.
@@ -164,7 +173,13 @@ impl DocumentConverter {
                 // field cannot parse is dropped here — the write path
                 // has already refused it on a document-mode index
                 // (issue #86), and a log-mode index keeps ingesting.
-                Some(def) => index_mapped(&mut out, &self.schema, &key, def, &value, None),
+                Some(def) => {
+                    let dropped = index_mapped(&mut out, &self.schema, &key, def, &value);
+                    if dropped > 0 {
+                        self.malformed_dropped
+                            .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 None => {
                     dynamic.insert(key, value);
                 }
@@ -248,43 +263,65 @@ enum Indexed<'a> {
 struct Malformed(String);
 
 /// Index one mapped value into `path`'s column and, recursively, into
-/// every multi-field declared beneath it. `report` collects the first
-/// malformed value instead of dropping it, for the write-path check.
+/// every multi-field declared beneath it. Returns how many values were
+/// dropped because the field could not parse them — on a log-mode index
+/// that is the documented behaviour, and the count is what the flush
+/// reports (a document-mode write never reaches here with one, see
+/// [`MappedSchema::validate_document`]).
 fn index_mapped(
     out: &mut TantivyDocument,
     schema: &MappedSchema,
     path: &str,
     def: &FieldDef,
     value: &serde_json::Value,
-    mut report: Option<&mut Option<IndexError>>,
-) {
+) -> u64 {
+    let mut dropped = 0;
     if let Some(mapped) = schema.fields.get(path) {
         for item in flatten(value) {
             match parse_for(mapped, item) {
                 Ok(Some(parsed)) => add_parsed(out, mapped, parsed),
                 Ok(None) => {}
-                // `ignore_malformed` is the documented way to keep
-                // OpenSearch's drop-the-field behaviour.
-                Err(Malformed(reason)) if !mapped.ignore_malformed => {
-                    if let Some(slot) = report.as_deref_mut()
-                        && slot.is_none()
-                    {
-                        *slot = Some(IndexError::MalformedField {
-                            field: path.to_string(),
-                            ty: mapped.ty.as_str(),
-                            reason,
-                            preview: preview(item),
-                        });
-                    }
-                }
-                Err(_) => {}
+                // `ignore_malformed` is OpenSearch's own way to ask for
+                // the value to be dropped, so it is not counted.
+                Err(_) if mapped.ignore_malformed => {}
+                Err(_) => dropped += 1,
             }
         }
     }
     for (name, sub) in &def.fields {
         let sub_path = format!("{path}.{name}");
-        index_mapped(out, schema, &sub_path, sub, value, report.as_deref_mut());
+        dropped += index_mapped(out, schema, &sub_path, sub, value);
     }
+    dropped
+}
+
+/// Check one mapped value the way [`index_mapped`] would index it,
+/// without building anything: the first value the field cannot parse is
+/// the error the write reports.
+fn validate_mapped(
+    schema: &MappedSchema,
+    path: &str,
+    def: &FieldDef,
+    value: &serde_json::Value,
+) -> IndexResult<()> {
+    if let Some(mapped) = schema.fields.get(path)
+        && !mapped.ignore_malformed
+    {
+        for item in flatten(value) {
+            if let Err(Malformed(reason)) = parse_for(mapped, item) {
+                return Err(IndexError::MalformedField {
+                    field: path.to_string(),
+                    ty: mapped.ty.as_str(),
+                    reason,
+                    preview: preview(item),
+                });
+            }
+        }
+    }
+    for (name, sub) in &def.fields {
+        validate_mapped(schema, &format!("{path}.{name}"), sub, value)?;
+    }
+    Ok(())
 }
 
 /// The offending value as OpenSearch previews it in the error message.
@@ -431,18 +468,15 @@ impl MappedSchema {
     /// per-item `mapper_parsing_exception` instead of a success that
     /// silently dropped a field.
     pub fn validate_document(&self, doc: &serde_json::Value) -> IndexResult<()> {
+        if self.mapping.properties.is_empty() {
+            return Ok(());
+        }
         let Some(obj) = doc.as_object() else {
             return Err(IndexError::InvalidDocument("document must be an object".into()));
         };
-        let mut failure = None;
-        let mut scratch = TantivyDocument::new();
         for (key, value) in obj {
-            let Some(def) = self.mapping.properties.get(key) else {
-                continue;
-            };
-            index_mapped(&mut scratch, self, key, def, value, Some(&mut failure));
-            if let Some(error) = failure {
-                return Err(error);
+            if let Some(def) = self.mapping.properties.get(key) {
+                validate_mapped(self, key, def, value)?;
             }
         }
         Ok(())

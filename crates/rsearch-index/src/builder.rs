@@ -118,6 +118,13 @@ impl SplitBuilder {
         Ok(())
     }
 
+    /// How many values this split's documents lost because a mapped field
+    /// could not parse them (issue #86). A document-mode write never gets
+    /// this far with one; on a log-mode index the flush reports the count.
+    pub fn malformed_dropped(&self) -> u64 {
+        self.converter.malformed_dropped()
+    }
+
     /// Commit the index and bundle it into a single split file.
     pub fn finish(mut self) -> IndexResult<PackagedSplit> {
         if self.doc_count == 0 {

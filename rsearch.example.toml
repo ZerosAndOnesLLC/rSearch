@@ -74,6 +74,10 @@ document_max_batch_secs = 5  # age bound for document-mode streams (tighter
 queue_capacity = 100000  # per-stream in-flight bound before 429s
 memory_budget_mb = 256   # tantivy writer heap per stream worker
 wal_segment_mb = 64      # WAL segment rotation size
+auto_create_index = "true"  # OpenSearch's action.auto_create_index: "true",
+                         # "false", or a first-match-wins pattern list
+                         # ("-audit-*,+*"). Off, a write to a missing index
+                         # fails instead of creating it in log mode
 balance_bulk = true      # hand /_bulk batches round-robin to live ingest
                          # peers (needs cluster.internal_token; keep-alive
                          # clients otherwise pin all work to one node)

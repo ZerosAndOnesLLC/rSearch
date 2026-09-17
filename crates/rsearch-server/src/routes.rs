@@ -287,6 +287,7 @@ async fn node_stats(State(state): State<AppState>) -> Json<Value> {
             "docs_indexed": m.docs_indexed.load(Ordering::Relaxed),
             "splits_published": m.splits_published.load(Ordering::Relaxed),
             "flush_failures": m.flush_failures.load(Ordering::Relaxed),
+            "malformed_dropped": m.malformed_dropped.load(Ordering::Relaxed),
             "queue_depth": m.queue_depth.load(Ordering::Relaxed),
             "wal_outstanding": p.wal().outstanding(),
             "wal_segments": p.wal().segment_count(),

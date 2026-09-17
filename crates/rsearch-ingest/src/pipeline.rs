@@ -166,6 +166,10 @@ pub struct IngestMetrics {
     pub flush_failures: AtomicU64,
     /// Current documents queued across all streams (gauge).
     pub queue_depth: AtomicU64,
+    /// Values dropped because a mapped field could not parse them
+    /// (issue #86). Only log-mode indexes reach this: a document-mode
+    /// write is refused before the WAL.
+    pub malformed_dropped: AtomicU64,
 }
 
 struct PipelineInner {
@@ -188,6 +192,11 @@ struct PipelineInner {
     seq: SeqClock,
     /// Stream name → (info, resolved at). Read-locked per request.
     stream_info: std::sync::RwLock<HashMap<String, (StreamInfo, std::time::Instant)>>,
+    /// Stream name → (schema, resolved at): the mapping a document-mode
+    /// write is validated against before the WAL (issue #86). Same TTL as
+    /// `stream_info`; a mapping can only gain fields, so a stale entry
+    /// validates nothing it should have rejected.
+    stream_schema: std::sync::RwLock<HashMap<String, (Arc<MappedSchema>, std::time::Instant)>>,
 }
 
 /// Cloneable handle to the shared ingest pipeline: routes documents,
@@ -227,6 +236,7 @@ impl IngestPipeline {
                 rules: std::sync::RwLock::new(Arc::new(Vec::new())),
                 seq,
                 stream_info: std::sync::RwLock::new(HashMap::new()),
+                stream_schema: std::sync::RwLock::new(HashMap::new()),
             }),
         };
         // Keep the routing-rule cache warm.
@@ -408,6 +418,30 @@ impl IngestPipeline {
     /// mode) so the next write re-reads it.
     pub fn forget_stream(&self, name: &str) {
         self.inner.stream_info.write().unwrap().remove(name);
+        self.inner.stream_schema.write().unwrap().remove(name);
+    }
+
+    /// The schema a stream's documents are indexed with, for the write
+    /// path's mapping check (issue #86). A stream that does not exist has
+    /// nothing declared, so every field is dynamic and nothing to check.
+    pub async fn stream_schema(&self, stream: &str) -> IngestResult<Arc<MappedSchema>> {
+        if let Some((schema, at)) = self.inner.stream_schema.read().unwrap().get(stream)
+            && at.elapsed() < STREAM_INFO_TTL
+        {
+            return Ok(schema.clone());
+        }
+        let mapping = match self.inner.metastore.get_stream(stream).await {
+            Ok(record) => IndexMapping::from_json(&record.mapping).unwrap_or_default(),
+            Err(rsearch_metastore::MetastoreError::StreamNotFound(_)) => IndexMapping::default(),
+            Err(e) => return Err(e.into()),
+        };
+        let schema = Arc::new(MappedSchema::build(mapping));
+        self.inner
+            .stream_schema
+            .write()
+            .unwrap()
+            .insert(stream.to_string(), (schema.clone(), std::time::Instant::now()));
+        Ok(schema)
     }
 
     /// Next write-sequence stamp (`_seq`) for a document accepted by this
@@ -933,7 +967,20 @@ async fn flush_inner(
                 return Ok(None);
             }
             let indexed = builder.doc_count();
-            builder.finish().map(|packaged| Some((packaged, indexed)))
+            // A mapped field that could not parse its value drops that
+            // value (issue #86). Document-mode writes are refused before
+            // the WAL, so anything counted here came in through a
+            // log-mode index, where dropping is the documented behaviour
+            // — but it is never silent again.
+            let malformed = builder.malformed_dropped();
+            if malformed > 0 {
+                tracing::warn!(
+                    values = malformed,
+                    "dropped values a mapped field could not parse; \
+                     map the field with ignore_malformed or fix the source"
+                );
+            }
+            builder.finish().map(|packaged| Some((packaged, indexed, malformed)))
         }));
         let result = match build {
             Ok(result) => result,
@@ -954,11 +1001,15 @@ async fn flush_inner(
         )
     })?;
 
-    let (packaged, indexed) = match result {
-        Ok(Some((packaged, indexed))) => (packaged, indexed),
+    let (packaged, indexed, malformed) = match result {
+        Ok(Some((packaged, indexed, malformed))) => (packaged, indexed, malformed),
         Ok(None) => return Ok(None),
         Err(e) => return Err((IngestError::Index(e), batch)),
     };
+
+    if malformed > 0 {
+        inner.metrics.malformed_dropped.fetch_add(malformed, Ordering::Relaxed);
+    }
 
     let key = format!("streams/{stream}/{}.split", packaged.meta.split_id);
     if let Err(e) = inner.storage.put_file(&key, &packaged.file_path).await {

@@ -673,16 +673,6 @@ pub async fn put_mapping(
             );
         }
     };
-    let incoming = match rsearch_index::IndexMapping::from_json(&body_json) {
-        Ok(mapping) => mapping,
-        Err(e) => {
-            return es_error(
-                StatusCode::BAD_REQUEST,
-                "mapper_parsing_exception",
-                &e.to_string(),
-            );
-        }
-    };
     let stream = match state.metastore.get_stream(&index).await {
         Ok(stream) => stream,
         Err(MetastoreError::StreamNotFound(_)) => return index_not_found(&index),
@@ -691,6 +681,11 @@ pub async fn put_mapping(
         }
     };
     let existing = rsearch_index::IndexMapping::from_json(&stream.mapping).unwrap_or_default();
+    // New fields may use a normalizer the index was created with.
+    let incoming = match rsearch_index::IndexMapping::from_mapping_update(&body_json, &existing) {
+        Ok(mapping) => mapping,
+        Err(e) => return mapping_error(&e),
+    };
     // Merge: keep every existing field's declaration, add the new ones.
     // Types are compared normalized (`integer` and `long` are one type
     // here), so re-declaring a field the way it already is is a no-op.
@@ -705,25 +700,26 @@ pub async fn put_mapping(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    for (name, ty) in &incoming.properties {
+    for (name, def) in &incoming.properties {
         match existing.properties.get(name) {
-            Some(current) if current != ty => {
-                let from = serde_json::to_value(current).unwrap_or(Value::Null);
-                let to = serde_json::to_value(ty).unwrap_or(Value::Null);
+            Some(current) if current.ty != def.ty => {
                 return es_error(
                     StatusCode::BAD_REQUEST,
                     "illegal_argument_exception",
                     &format!(
                         "mapper [{name}] cannot be changed from type [{}] to [{}]",
-                        from.as_str().unwrap_or("?"),
-                        to.as_str().unwrap_or("?")
+                        current.ty.as_str(),
+                        def.ty.as_str()
                     ),
                 );
             }
             Some(_) => {}
             None => {
-                if let Some(spec) = incoming_props.get(name) {
-                    merged.insert(name.clone(), spec.clone());
+                if incoming_props.contains_key(name) {
+                    // Store the parsed form, so a declared multi-field or
+                    // `ignore_above` added later is honored like one
+                    // declared at creation (issue #85).
+                    merged.insert(name.clone(), def_to_json(def));
                 }
             }
         }
@@ -750,6 +746,25 @@ pub async fn put_mapping(
         service.invalidate_stream(&index);
     }
     Json(json!({"acknowledged": true})).into_response()
+}
+
+/// An `IndexMapping` rejection as the ES-shaped error OpenSearch returns
+/// for it.
+fn mapping_error(error: &rsearch_index::IndexError) -> Response {
+    let error_type = match error {
+        rsearch_index::IndexError::IllegalArgument(_) => "illegal_argument_exception",
+        _ => "mapper_parsing_exception",
+    };
+    es_error(StatusCode::BAD_REQUEST, error_type, &error.to_string())
+}
+
+/// One parsed field declaration rendered back into the ES mapping shape.
+fn def_to_json(def: &rsearch_index::FieldDef) -> Value {
+    let single = rsearch_index::IndexMapping {
+        properties: [("f".to_string(), def.clone())].into_iter().collect(),
+        normalizers: Default::default(),
+    };
+    single.to_json()["properties"]["f"].clone()
 }
 
 /// Read the stream mode out of a `PUT /{index}` body: ES-shaped
@@ -795,17 +810,18 @@ pub async fn put_index(
             return es_error(StatusCode::BAD_REQUEST, "illegal_argument_exception", &reason);
         }
     };
-    let mapping = body_json.get("mappings").cloned();
-    // Validate before storing.
-    if let Some(mapping) = &mapping
-        && let Err(e) = rsearch_index::IndexMapping::from_json(mapping)
-    {
-        return es_error(
-            StatusCode::BAD_REQUEST,
-            "mapper_parsing_exception",
-            &e.to_string(),
-        );
-    }
+    // Validate before storing, and store the canonical form: the mapping
+    // with its `normalizer` chains resolved from `settings.analysis`, so
+    // every split carries the analysis it was written with (issue #85).
+    let mapping = match body_json.get("mappings") {
+        Some(mappings) => {
+            match rsearch_index::IndexMapping::from_request(mappings, body_json.get("settings")) {
+                Ok(parsed) => Some(parsed.to_json()),
+                Err(e) => return mapping_error(&e),
+            }
+        }
+        None => None,
+    };
     let result = async {
         let record = match mode {
             Some(mode) => state.metastore.ensure_stream_with_mode(&index, mode).await?,
@@ -944,16 +960,21 @@ pub async fn delete_index(
     Json(json!({"acknowledged": true})).into_response()
 }
 
-/// ES-shaped settings block for a stream.
+/// ES-shaped settings block for a stream, including the `analysis`
+/// normalizers it was created with (issue #85).
 fn settings_json(stream: &rsearch_metastore::StreamRecord) -> Value {
-    json!({
-        "index": {
-            "mode": stream.mode,
-            "retention_hours": stream.retention_hours,
-            "number_of_shards": "1",
-            "number_of_replicas": "0",
-        }
-    })
+    let mut index = json!({
+        "mode": stream.mode,
+        "retention_hours": stream.retention_hours,
+        "number_of_shards": "1",
+        "number_of_replicas": "0",
+    });
+    if let Ok(mapping) = rsearch_index::IndexMapping::from_json(&stream.mapping)
+        && let Some(analysis) = mapping.analysis_json()
+    {
+        index["analysis"] = analysis;
+    }
+    json!({ "index": index })
 }
 
 /// ES-shaped mappings block for a stream: the declared properties, the

@@ -388,6 +388,12 @@ impl IndexMapping {
         Self::parse(mappings, normalizers)
     }
 
+    /// Parse a `PUT /{index}/_mapping` body: new fields may reference the
+    /// normalizers the index was created with.
+    pub fn from_mapping_update(mappings: &Value, existing: &Self) -> IndexResult<Self> {
+        Self::parse(mappings, existing.normalizers.clone())
+    }
+
     fn parse(mapping: &Value, normalizers: BTreeMap<String, Normalizer>) -> IndexResult<Self> {
         let mut properties = BTreeMap::new();
         let Some(props) = mapping.get("properties") else {

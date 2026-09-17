@@ -24,6 +24,10 @@ pub struct AppState {
     pub auth: crate::auth::AuthState,
     /// Mirror of control.allow_insecure_webhooks for the alerts API.
     pub allow_insecure_webhooks: bool,
+    /// Mirror of `ingest.auto_create_index` (OpenSearch's
+    /// `action.auto_create_index`): whether a write to a missing index
+    /// creates it (issue #87).
+    pub auto_create_index: Arc<String>,
     pub cors_allow_origin: String,
     /// Peer-transfer state, present only on replicated-backend nodes.
     pub internal: Option<Arc<crate::internal_api::InternalState>>,
@@ -76,6 +80,7 @@ impl AppState {
             doc_lookup: None,
             auth: crate::auth::AuthState::default(),
             allow_insecure_webhooks: config.control.allow_insecure_webhooks,
+            auto_create_index: Arc::new(config.ingest.auto_create_index.clone()),
             cors_allow_origin: config.http.cors_allow_origin.clone(),
             internal: None,
             bulk_forward: None,
