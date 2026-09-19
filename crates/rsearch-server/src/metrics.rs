@@ -85,6 +85,12 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         );
         counter(
             &mut out,
+            "rsearch_ingest_malformed_dropped_total",
+            "Values dropped because a mapped field could not parse them (log-mode indexes;              a document-mode write is refused instead).",
+            m.malformed_dropped.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
             "rsearch_ingest_published_splits_total",
             "Splits built, uploaded, and published.",
             m.splits_published.load(Ordering::Relaxed),

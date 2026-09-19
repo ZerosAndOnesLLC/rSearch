@@ -422,6 +422,14 @@ pub struct IngestConfig {
     pub memory_budget_mb: usize,
     /// WAL segment rotation size, in megabytes.
     pub wal_segment_mb: u64,
+    /// OpenSearch's `action.auto_create_index`: whether a write to an
+    /// index that does not exist creates it (in log mode, the default).
+    /// `"true"`, `"false"`, or a comma-separated pattern list where a
+    /// pattern may be negated with `-` and the first match wins
+    /// (`"-audit-*,+*"`). Turning it off is what makes a client's
+    /// "recreate the index with my mappings" path reachable, instead of
+    /// the write silently succeeding into a log-mode index (issue #87).
+    pub auto_create_index: String,
     /// Spread `/_bulk` batches round-robin across live ingest peers
     /// instead of indexing every batch on the node the client happens to
     /// hold a connection to. Takes effect only when
@@ -440,7 +448,78 @@ impl Default for IngestConfig {
             memory_budget_mb: 256,
             wal_segment_mb: 64,
             balance_bulk: true,
+            auto_create_index: "true".to_string(),
         }
+    }
+}
+
+/// Whether `action.auto_create_index` permits creating `index`.
+/// `setting` is `true`/`false` or a first-match-wins pattern list.
+pub fn auto_create_allows(setting: &str, index: &str) -> bool {
+    let setting = setting.trim();
+    match setting {
+        "true" | "" => return true,
+        "false" => return false,
+        _ => {}
+    }
+    for pattern in setting.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (allow, pattern) = match pattern.strip_prefix('-') {
+            Some(rest) => (false, rest),
+            None => (true, pattern.strip_prefix('+').unwrap_or(pattern)),
+        };
+        if glob_matches(pattern, index) {
+            return allow;
+        }
+    }
+    false
+}
+
+/// `*`-glob match over a whole name (no other metacharacters), the way
+/// OpenSearch matches index patterns.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else { return pattern == name };
+    if !name.starts_with(first) {
+        return false;
+    }
+    let mut rest = &name[first.len()..];
+    let mut last: Option<&str> = None;
+    for part in parts {
+        last = Some(part);
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    match last {
+        // A trailing `*` swallows whatever is left.
+        Some("") => true,
+        Some(part) => rest.is_empty() || name.ends_with(part),
+        None => rest.is_empty(),
+    }
+}
+
+#[cfg(test)]
+mod auto_create_tests {
+    use super::auto_create_allows;
+
+    #[test]
+    fn plain_booleans() {
+        assert!(auto_create_allows("true", "logs-1"));
+        assert!(!auto_create_allows("false", "logs-1"));
+    }
+
+    #[test]
+    fn first_matching_pattern_wins() {
+        let setting = "-audit-*,+logs-*,-*";
+        assert!(!auto_create_allows(setting, "audit-2026"));
+        assert!(auto_create_allows(setting, "logs-2026"));
+        assert!(!auto_create_allows(setting, "items"));
+        // Nothing matched: OpenSearch refuses.
+        assert!(!auto_create_allows("+logs-*", "items"));
     }
 }
 

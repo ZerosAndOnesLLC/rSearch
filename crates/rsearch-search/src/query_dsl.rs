@@ -4,6 +4,7 @@
 //! `_timestamp` fast field; mapped fields use their typed Tantivy field;
 //! anything else becomes a JSON-path lookup in the `_dynamic` field.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::ops::Bound;
 
@@ -13,11 +14,9 @@ use tantivy::query::{
     QueryParser, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Term};
-use tantivy::time::OffsetDateTime;
-use tantivy::time::format_description::well_known::Rfc3339;
 use tantivy::tokenizer::TextAnalyzer;
 
-use rsearch_index::{FieldType, MappedSchema};
+use rsearch_index::{FieldType, MappedSchema, Normalizer};
 
 use crate::error::{SearchError, SearchResult};
 
@@ -41,8 +40,8 @@ fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
     if TIMESTAMP_ALIASES.contains(&name) {
         return Resolved::Timestamp(schema.timestamp);
     }
-    if let Some((field, ty)) = schema.fields.get(name) {
-        return Resolved::Typed(*field, *ty);
+    if let Some(mapped) = schema.fields.get(name) {
+        return Resolved::Typed(mapped.field, mapped.ty);
     }
     // Reserved identity fields: keyword `_id`, numeric `_seq`. A legacy
     // split (no such fields) falls through to a `_dynamic` path that no
@@ -67,6 +66,23 @@ fn resolve(schema: &MappedSchema, name: &str) -> Resolved {
         return Resolved::DynamicKeyword(schema.dynamic_raw, base.to_string());
     }
     Resolved::Dynamic(schema.dynamic, name.to_string())
+}
+
+/// The `normalizer` declared on a mapped keyword field, if any. Every
+/// term-level query runs its input through it, the way OpenSearch applies
+/// a normalizer to the query value as well as to the indexed one — a
+/// `term` for `KIRSTEN` finds a value indexed through `lowercase`
+/// (issue #85).
+fn field_normalizer<'a>(schema: &'a MappedSchema, name: &str) -> Option<&'a Normalizer> {
+    schema.fields.get(name).and_then(|m| m.normalizer.as_ref())
+}
+
+/// Apply `normalizer` to query input.
+fn normalize<'a>(normalizer: Option<&Normalizer>, text: &'a str) -> Cow<'a, str> {
+    match normalizer {
+        Some(normalizer) => normalizer.apply(text),
+        None => Cow::Borrowed(text),
+    }
 }
 
 /// `.keyword`, the OpenSearch dynamic sub-field suffix.
@@ -200,7 +216,8 @@ fn float_as_exact_i64(value: &Value) -> Option<i64> {
     (f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0).then_some(f as i64)
 }
 
-/// Parse a timestamp literal (RFC 3339, epoch secs/millis, or "now").
+/// Parse a timestamp literal (`strict_date_optional_time`, epoch
+/// secs/millis, or "now").
 pub(crate) fn parse_time_millis(value: &Value) -> Option<i64> {
     match value {
         Value::String(s) => {
@@ -212,10 +229,10 @@ pub(crate) fn parse_time_millis(value: &Value) -> Option<i64> {
                         .as_millis() as i64,
                 );
             }
-            if let Ok(dt) = OffsetDateTime::parse(s, &Rfc3339) {
-                return Some((dt.unix_timestamp_nanos() / 1_000_000) as i64);
-            }
-            s.parse::<i64>().ok().map(rsearch_index::epoch_to_millis)
+            // The full `strict_date_optional_time||epoch_millis` grammar,
+            // so a bound written the way a document was indexed parses
+            // (issue #86).
+            rsearch_index::parse_date_string(s)
         }
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -381,15 +398,21 @@ fn translate_bool(
     Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
-/// Build a typed term for a mapped field from a JSON literal.
-fn typed_term(field: Field, ty: FieldType, value: &Value) -> SearchResult<Term> {
+/// Build a typed term for a mapped field from a JSON literal, running a
+/// keyword field's `normalizer` over the value first.
+fn typed_term(
+    field: Field,
+    ty: FieldType,
+    normalizer: Option<&Normalizer>,
+    value: &Value,
+) -> SearchResult<Term> {
     let term = match ty {
         FieldType::Keyword | FieldType::Text => {
             let s = value
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| value.to_string());
-            Term::from_field_text(field, &s)
+            Term::from_field_text(field, normalize(normalizer, &s).as_ref())
         }
         FieldType::Long => {
             let i = value
@@ -456,7 +479,9 @@ fn term_query_for(schema: &MappedSchema, name: &str, value: &Value) -> SearchRes
                 .ok_or_else(|| SearchError::BadRequest("invalid timestamp value".into()))?;
             Term::from_field_date(field, tantivy::DateTime::from_timestamp_millis(ms))
         }
-        Resolved::Typed(field, ty) => typed_term(field, ty, value)?,
+        Resolved::Typed(field, ty) => {
+            typed_term(field, ty, field_normalizer(schema, name), value)?
+        }
         Resolved::Dynamic(field, path) => dynamic_term(field, &path, value),
         Resolved::DynamicKeyword(Some(field), path) => raw_term(field, &path, value),
         Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
@@ -464,16 +489,64 @@ fn term_query_for(schema: &MappedSchema, name: &str, value: &Value) -> SearchRes
     Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
 }
 
+/// Read a term-level query's `case_insensitive` (ES 7.10+). A non-boolean
+/// is a parse error, as in OpenSearch, rather than a silently ignored
+/// parameter.
+fn case_insensitive_flag(spec: &Value, kind: &str) -> SearchResult<bool> {
+    match spec.get("case_insensitive") {
+        None => Ok(false),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(SearchError::BadRequest(format!(
+            "[{kind}] query does not support a non-boolean [case_insensitive]"
+        ))),
+    }
+}
+
 fn translate_term(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
-    let obj = body
-        .as_object()
-        .ok_or_else(|| SearchError::BadRequest("term body must be an object".into()))?;
-    let (name, spec) = obj
-        .iter()
-        .next()
-        .ok_or_else(|| SearchError::BadRequest("term query needs a field".into()))?;
+    let (name, spec) = single_field(body, "term")?;
     let value = spec.get("value").unwrap_or(spec);
+    if case_insensitive_flag(spec, "term")? {
+        return case_insensitive_term(schema, name, value);
+    }
     term_query_for(schema, name, value)
+}
+
+/// `{"term": {"f": {"value": "v", "case_insensitive": true}}}` — the
+/// parameter `prefix` and `wildcard` already honored (issue #85). Like
+/// them it runs an anchored, case-folded regex against the term
+/// dictionary; unlike them it anchors on the whole value.
+fn case_insensitive_term(
+    schema: &MappedSchema,
+    name: &str,
+    value: &Value,
+) -> SearchResult<Box<dyn Query>> {
+    let unsupported = |ty: &str| {
+        SearchError::BadRequest(format!(
+            "[{name}] field which is of type [{ty}], does not support case insensitive term \
+             queries"
+        ))
+    };
+    let mut pattern = String::from("(?s)");
+    let field = match resolve(schema, name) {
+        Resolved::Typed(field, FieldType::Keyword | FieldType::Text) => field,
+        Resolved::Typed(_, ty) => return Err(unsupported(ty.as_str())),
+        Resolved::Timestamp(_) => return Err(unsupported("date")),
+        Resolved::Dynamic(field, path) | Resolved::DynamicKeyword(Some(field), path) => {
+            push_dynamic_path_prefix(&mut pattern, field, &path)?;
+            field
+        }
+        Resolved::DynamicKeyword(None, _) => return Ok(empty_query()),
+    };
+    let text = value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    pattern.push_str("(?i:");
+    push_regex_literal_str(&mut pattern, normalize(field_normalizer(schema, name), &text).as_ref());
+    pattern.push(')');
+    let query = RegexQuery::from_pattern(&pattern, field)
+        .map_err(|e| SearchError::BadRequest(format!("invalid term value: {e}")))?;
+    Ok(Box::new(query))
 }
 
 /// Cap on `ids.values` (ES's default `max_terms_count` is 65536; a bulk
@@ -504,6 +577,13 @@ fn translate_terms(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn 
     let obj = body
         .as_object()
         .ok_or_else(|| SearchError::BadRequest("terms body must be an object".into()))?;
+    // OpenSearch has no `case_insensitive` on `terms`; refusing it beats
+    // reading it as a field name.
+    if obj.contains_key("case_insensitive") {
+        return Err(SearchError::BadRequest(
+            "[terms] query does not support [case_insensitive]".into(),
+        ));
+    }
     let (name, values) = obj
         .iter()
         .find(|(k, _)| *k != "boost")
@@ -540,7 +620,9 @@ fn translate_range(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn 
                     tantivy::DateTime::from_timestamp_millis(ms),
                 ))
             }
-            Resolved::Typed(field, ty) => typed_term(field, ty, value),
+            Resolved::Typed(field, ty) => {
+                typed_term(field, ty, field_normalizer(schema, name), value)
+            }
             Resolved::Dynamic(field, path) => Ok(dynamic_term(field, &path, value)),
             Resolved::DynamicKeyword(Some(field), path) => Ok(raw_term(field, &path, value)),
             Resolved::DynamicKeyword(None, _) => Err(SearchError::BadRequest(String::new())),
@@ -630,15 +712,15 @@ fn push_dynamic_path_prefix(out: &mut String, field: Field, path: &str) -> Searc
 /// whose literal part folds case; the walk stays automaton-bounded.
 fn translate_prefix(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
     let (name, spec) = single_field(body, "prefix")?;
-    let case_insensitive = spec
-        .get("case_insensitive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let case_insensitive = case_insensitive_flag(spec, "prefix")?;
     // `value` is current ES; `prefix` is the pre-7.x spelling.
     let value = spec.get("value").or_else(|| spec.get("prefix")).unwrap_or(spec);
     let text = value
         .as_str()
         .ok_or_else(|| SearchError::BadRequest("prefix value must be a string".into()))?;
+    // A keyword field's normalizer applies to the query input too.
+    let normalized = normalize(field_normalizer(schema, name), text);
+    let text = normalized.as_ref();
 
     let not_string_field = || {
         SearchError::BadRequest(format!("prefix query requires a string field, '{name}' is not"))
@@ -705,10 +787,7 @@ fn wildcard_regex_body(value: &str) -> String {
 /// path/anchor bytes stay exact.
 fn translate_wildcard(schema: &MappedSchema, body: &Value) -> SearchResult<Box<dyn Query>> {
     let (name, spec) = single_field(body, "wildcard")?;
-    let case_insensitive = spec
-        .get("case_insensitive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let case_insensitive = case_insensitive_flag(spec, "wildcard")?;
     // `value` is current ES; `wildcard` is the pre-7.x spelling. `boost`
     // and the execution hint `rewrite` are accepted and ignored, as with
     // the other term-level queries.
@@ -716,6 +795,9 @@ fn translate_wildcard(schema: &MappedSchema, body: &Value) -> SearchResult<Box<d
     let text = value
         .as_str()
         .ok_or_else(|| SearchError::BadRequest("wildcard value must be a string".into()))?;
+    // As with `prefix`, a normalizer applies to the pattern's literals.
+    let normalized = normalize(field_normalizer(schema, name), text);
+    let text = normalized.as_ref();
 
     // `(?s)` so `*`/`?` cross newlines inside keyword terms, as in ES;
     // the fst regex is anchored to the whole term dictionary key.
@@ -982,8 +1064,8 @@ fn translate_query_string(
             schema
                 .fields
                 .values()
-                .filter(|(_, ty)| *ty == FieldType::Text)
-                .map(|(field, _)| *field),
+                .filter(|mapped| mapped.ty == FieldType::Text)
+                .map(|mapped| mapped.field),
         );
         // Kept as a parser default so explicit `path:term` syntax inside
         // the query text resolves into `_dynamic`. A bare term against a

@@ -322,6 +322,29 @@ fn item_ok(action: &str, index: &str, id: &str, version: i64, result: &str, stat
     })
 }
 
+/// The per-item error OpenSearch returns when a mapped field cannot
+/// parse its value (issue #86), reason and `caused_by` included.
+fn malformed_item_err(action: &str, index: &str, id: &str, error: &rsearch_index::IndexError) -> Value {
+    let rsearch_index::IndexError::MalformedField { field, ty, reason, preview } = error else {
+        return item_err(action, index, Some(id), 400, "mapper_parsing_exception", &error.to_string());
+    };
+    json!({
+        action: {
+            "_index": index,
+            "_id": id,
+            "status": 400,
+            "error": {
+                "type": "mapper_parsing_exception",
+                "reason": format!(
+                    "failed to parse field [{field}] of type [{ty}] in document with id '{id}'. \
+                     Preview of field's value: '{preview}'"
+                ),
+                "caused_by": {"type": "illegal_argument_exception", "reason": reason},
+            },
+        }
+    })
+}
+
 fn item_err(action: &str, index: &str, id: Option<&str>, status: u16, error_type: &str, reason: &str) -> Value {
     let mut body = json!({
         "_index": index,
@@ -375,15 +398,14 @@ async fn handle_bulk_local(
         pipeline: &rsearch_ingest::IngestPipeline,
         infos: &mut HashMap<String, StreamInfo>,
         stream: &str,
-        create: bool,
+        create: Option<StreamMode>,
     ) -> Result<Option<StreamInfo>, Response> {
         if let Some(info) = infos.get(stream) {
             return Ok(Some(*info));
         }
-        let resolved = if create {
-            pipeline.stream_info(stream).await.map(Some)
-        } else {
-            pipeline.stream_info_if_exists(stream).await
+        let resolved = match create {
+            Some(mode) => pipeline.stream_info_creating(stream, mode).await.map(Some),
+            None => pipeline.stream_info_if_exists(stream).await,
         };
         match resolved {
             Ok(Some(info)) => {
@@ -397,22 +419,62 @@ async fn handle_bulk_local(
             )),
         }
     }
+    // A batch that writes an explicit `_id` into an index that does not
+    // exist yet asks for document semantics — that index is created in
+    // document mode, not as a log index the `_id` could never mean
+    // anything in (issue #87).
+    let wants_document: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|(_, item)| {
+            item.explicit_id && matches!(item.action, BulkAction::Index | BulkAction::Create)
+        })
+        .map(|(_, item)| item.stream.as_str())
+        .collect();
+    let create_mode: HashMap<String, StreamMode> = items
+        .iter()
+        .map(|(_, item)| {
+            let mode = if wants_document.contains(item.stream.as_str()) {
+                StreamMode::Document
+            } else {
+                StreamMode::Log
+            };
+            (item.stream.clone(), mode)
+        })
+        .collect();
     let mut kept: Vec<(usize, rsearch_ingest::BulkItem)> = Vec::with_capacity(items.len());
     for (position, item) in items {
-        let create = matches!(item.action, BulkAction::Index | BulkAction::Create);
+        // `action.auto_create_index` decides whether a write to a missing
+        // index creates it. With creation off, the write fails instead of
+        // quietly landing in a fresh log-mode index, which is what makes
+        // a client's "recreate it with my mappings" path reachable
+        // (issue #87).
+        let auto_create =
+            rsearch_common::config::auto_create_allows(&state.auto_create_index, &item.stream);
+        let create = (matches!(item.action, BulkAction::Index | BulkAction::Create) && auto_create)
+            .then(|| create_mode.get(&item.stream).copied().unwrap_or(StreamMode::Log));
         match resolve_info(&pipeline, &mut infos, &item.stream, create).await? {
             Some(_) => kept.push((position, item)),
-            None => results.push(ItemResult {
-                position,
-                body: item_err(
-                    item.action.as_str(),
-                    &item.stream,
-                    Some(&item.doc_id),
-                    404,
-                    "index_not_found_exception",
-                    &format!("no such index [{}]", item.stream),
-                ),
-            }),
+            None => {
+                let reason = if auto_create {
+                    format!("no such index [{}]", item.stream)
+                } else {
+                    format!(
+                        "no such index [{}] and [action.auto_create_index] is [{}]",
+                        item.stream, state.auto_create_index
+                    )
+                };
+                results.push(ItemResult {
+                    position,
+                    body: item_err(
+                        item.action.as_str(),
+                        &item.stream,
+                        Some(&item.doc_id),
+                        404,
+                        "index_not_found_exception",
+                        &reason,
+                    ),
+                })
+            }
         }
     }
     let items = kept;
@@ -501,6 +563,24 @@ async fn handle_bulk_local(
                 // "updated" is the honest answer for an explicit id on a
                 // document index (the tombstone covers both cases).
                 outcome = ("updated", 200);
+            }
+            // An `_id` means nothing on a log-mode index: every write is
+            // a new document, so accepting one silently doubles the
+            // corpus on a re-index. `delete` and `update` have always
+            // said so; `index` and `create` now say the same (issue #87).
+            BulkAction::Index | BulkAction::Create if item.explicit_id && !document_mode => {
+                results.push(ItemResult {
+                    position,
+                    body: item_err(
+                        action,
+                        &item.stream,
+                        Some(&item.doc_id),
+                        400,
+                        "illegal_argument_exception",
+                        &log_mode_reason(action, &item.stream),
+                    ),
+                });
+                continue;
             }
             BulkAction::Index => {}
             BulkAction::Create if document_mode && item.explicit_id => {
@@ -602,6 +682,29 @@ async fn handle_bulk_local(
                 outcome = ("deleted", 200);
             }
         }
+        // A document-mode write is checked against the mapping before it
+        // is durable, so a value a mapped field cannot parse is a per-item
+        // error instead of a success that silently dropped the field
+        // (issue #86). Log-mode ingest keeps its drop-and-continue
+        // behaviour, counted by `rsearch_ingest_malformed_dropped_total`.
+        if document_mode && matches!(item.action, BulkAction::Index | BulkAction::Create) {
+            let schema = match pipeline.stream_schema(&item.stream).await {
+                Ok(schema) => schema,
+                Err(e) => {
+                    return Err(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &format!("metastore unavailable: {e}"),
+                    ));
+                }
+            };
+            if let Err(e) = schema.validate_document(&item.doc) {
+                results.push(ItemResult {
+                    position,
+                    body: malformed_item_err(action, &item.stream, &item.doc_id, &e),
+                });
+                continue;
+            }
+        }
         // Routing expansion + one write-sequence stamp per item (shared by
         // all its routed copies, so the WAL, the split, and the response
         // agree). Deletes route nowhere: they target exactly the named
@@ -625,7 +728,7 @@ async fn handle_bulk_local(
     // request; resolve those too.
     for plan in &planned {
         for stream in &plan.routes {
-            resolve_info(&pipeline, &mut infos, stream, true).await?;
+            resolve_info(&pipeline, &mut infos, stream, Some(StreamMode::Log)).await?;
         }
     }
 

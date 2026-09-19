@@ -415,8 +415,8 @@ pub fn resolve_sort(
                 (SortTarget::Timestamp, SortType::Date)
             } else if name == rsearch_index::SEQ_FIELD {
                 (SortTarget::Seq, SortType::Long)
-            } else if let Some((_, mapped)) = schema.fields.get(name) {
-                let ty = match mapped {
+            } else if let Some(mapped) = schema.fields.get(name) {
+                let ty = match &mapped.ty {
                     FieldType::Keyword => SortType::Keyword,
                     FieldType::Long => SortType::Long,
                     FieldType::Double => SortType::Double,
