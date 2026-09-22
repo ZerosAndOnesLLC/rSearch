@@ -121,6 +121,27 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         );
     }
 
+    if let Some(heap) = crate::allocator::heap_stats() {
+        gauge(
+            &mut out,
+            "rsearch_heap_allocated_bytes",
+            "Heap bytes allocated and not yet freed.",
+            heap.allocated,
+        );
+        gauge(
+            &mut out,
+            "rsearch_heap_resident_bytes",
+            "Resident bytes in pages the allocator maps (its share of RSS). Far above allocated means freed memory is not being returned.",
+            heap.resident,
+        );
+        gauge(
+            &mut out,
+            "rsearch_heap_retained_bytes",
+            "Address space the allocator returned to the OS but keeps mapped for reuse (not resident).",
+            heap.retained,
+        );
+    }
+
     if let Some(cache) = &state.split_cache {
         let s = cache.stats();
         gauge(

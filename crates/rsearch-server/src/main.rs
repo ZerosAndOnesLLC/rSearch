@@ -2,6 +2,7 @@
 //! exposing the OpenSearch- and Loki-compatible HTTP APIs.
 
 mod admin_api;
+mod allocator;
 mod alerts_api;
 mod auth;
 mod auth_api;
@@ -51,6 +52,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     rsearch_common::telemetry::init();
+    allocator::enable_background_purge();
 
     let config = RsearchConfig::load(cli.config.as_deref()).context("loading configuration")?;
     let roles: Vec<Role> = match cli.roles.as_deref() {

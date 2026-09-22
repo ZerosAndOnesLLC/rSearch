@@ -534,7 +534,10 @@ for restart-replay memory pressure), cluster node liveness/draining
 gauges, split-cache activity (`rsearch_split_cache_*`: memory/disk hits,
 blocks and bytes fetched from storage, evictions, bytes held — a steady
 climb in `rsearch_split_cache_fetched_bytes_total` on repeated queries
-means the working set outgrew `search.cache_max_mb`), and on control
+means the working set outgrew `search.cache_max_mb`), heap gauges
+(`rsearch_heap_allocated_bytes` / `_resident_bytes` — the binary uses
+jemalloc, which returns freed memory to the OS; resident far above
+allocated for long stretches is worth a look), and on control
 nodes leadership plus repair/drain activity. It
 requires search-level auth like `/_rsearch/stats`; point a scrape job at
 it with an API key:
