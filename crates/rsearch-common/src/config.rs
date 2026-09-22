@@ -231,13 +231,19 @@ impl Default for ControlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
-    /// Local split-cache budget, in megabytes.
+    /// Disk budget of the local split block cache, in megabytes.
     pub cache_max_mb: u64,
+    /// Memory budget of the split block cache's in-memory tier, in
+    /// megabytes (hot blocks served without touching disk). 0 disables it.
+    pub memory_cache_mb: u64,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { cache_max_mb: 4096 }
+        Self {
+            cache_max_mb: 4096,
+            memory_cache_mb: 512,
+        }
     }
 }
 

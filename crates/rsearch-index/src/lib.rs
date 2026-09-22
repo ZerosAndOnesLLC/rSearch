@@ -13,12 +13,13 @@ mod mapping;
 mod normalizer;
 mod reader;
 mod split_file;
+mod storage_directory;
 mod tokenizer;
 
 pub use builder::{PackagedSplit, SplitBuilder};
 pub use dynamic_paths::{DynamicFields, DynamicType, dynamic_field_types, dynamic_string_paths, string_paths};
 pub use tantivy::DateTime;
-pub use cache::SplitCache;
+pub use cache::{CacheOptions, CacheStats, DEFAULT_BLOCK_SIZE, SplitCache};
 pub use reader::{ReadDoc, SplitReader};
 pub use document::{
     DocIdentity, DocumentConverter, MAX_SAFE_MILLIS, epoch_to_millis, extract_timestamp,
