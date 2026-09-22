@@ -201,8 +201,9 @@ async fn main() -> anyhow::Result<()> {
 
     // One split cache per node, shared by the search and control roles:
     // cache_max_mb is the node's whole budget, so two roles must not each
-    // claim it in full (issue #18). Sharing also lets control-side merge
-    // reads warm the cache search serves from.
+    // claim it in full (issue #18). Control's merge/compaction reads do
+    // not go through it (scan readers have private caches, #89); its
+    // alert searches do.
     // Ingest nodes need it too: document-mode read-modify-write ops
     // (update, create, GET /_doc) look documents up through a searcher.
     let needs_cache = roles.contains(&Role::Search)
@@ -219,10 +220,12 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => warn!(error = %e, "removing legacy control split cache failed"),
         }
         Some(std::sync::Arc::new(
-            rsearch_index::SplitCache::new(
-                cache_dir.join("splits"),
-                config.search.cache_max_mb << 20,
-            )
+            rsearch_index::SplitCache::with_options(rsearch_index::CacheOptions {
+                root: Some(cache_dir.join("splits")),
+                disk_bytes: config.search.cache_max_mb << 20,
+                memory_bytes: config.search.memory_cache_mb << 20,
+                block_size: rsearch_index::DEFAULT_BLOCK_SIZE,
+            })
             .context("initializing split cache")?,
         ))
     } else {
@@ -303,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
     state.draining = draining_flag;
     state.control = control_metrics;
     state.reconcile = reconcile_metrics;
+    state.split_cache = split_cache;
     // Bulk handoff between ingest peers needs the cluster token both to
     // authenticate outbound handoffs and to verify inbound ones; without
     // a token the node simply indexes everything it receives itself.

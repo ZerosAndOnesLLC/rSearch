@@ -83,7 +83,8 @@ balance_bulk = true      # hand /_bulk batches round-robin to live ingest
                          # clients otherwise pin all work to one node)
 
 [search]
-cache_max_mb = 4096      # local split-fragment cache budget
+cache_max_mb = 4096      # disk budget of the split block cache
+memory_cache_mb = 512    # in-memory tier in front of it (0 disables)
 
 [control]
 interval_secs = 15          # background-job tick on the elected leader

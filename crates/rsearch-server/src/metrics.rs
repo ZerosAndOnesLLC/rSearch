@@ -121,6 +121,70 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         );
     }
 
+    if let Some(cache) = &state.split_cache {
+        let s = cache.stats();
+        gauge(
+            &mut out,
+            "rsearch_split_cache_disk_bytes",
+            "Bytes held by the split block cache's disk tier.",
+            cache.total_bytes(),
+        );
+        gauge(
+            &mut out,
+            "rsearch_split_cache_memory_bytes",
+            "Bytes held by the split block cache's memory tier.",
+            cache.memory_bytes(),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_memory_hits_total",
+            "Split block reads served from memory.",
+            s.memory_hits.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_disk_hits_total",
+            "Split block reads served from the disk tier.",
+            s.disk_hits.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_fetched_blocks_total",
+            "Split blocks fetched from storage (cache misses).",
+            s.fetched_blocks.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_fetched_bytes_total",
+            "Bytes fetched from storage into the split block cache.",
+            s.fetched_bytes.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_fetch_requests_total",
+            "Ranged storage requests issued by split reads.",
+            s.fetch_requests.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_fetch_waits_total",
+            "Split reads that waited on another reader's in-flight fetch of the same blocks.",
+            s.fetch_waits.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_disk_evictions_total",
+            "Blocks evicted from the split cache's disk tier.",
+            s.disk_evictions.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "rsearch_split_cache_memory_evictions_total",
+            "Blocks evicted from the split cache's memory tier.",
+            s.memory_evictions.load(Ordering::Relaxed),
+        );
+    }
+
     if let Some(reconcile) = &state.reconcile {
         counter(
             &mut out,

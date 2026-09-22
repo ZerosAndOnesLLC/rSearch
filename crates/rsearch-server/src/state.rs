@@ -47,6 +47,9 @@ pub struct AppState {
     /// Reconcile sweep counters for /metrics, shared with the reconcile
     /// loop. Present only on replicated-backend nodes.
     pub reconcile: Option<Arc<crate::reconcile::ReconcileMetrics>>,
+    /// The node's split block cache, for `/metrics`; present on nodes
+    /// with a search, ingest or control role.
+    pub split_cache: Option<Arc<rsearch_index::SplitCache>>,
     /// Short-TTL cache of all stream names for wildcard resolution — an
     /// `_msearch` refresh resolves `logs-*` once per TTL instead of one
     /// `list_streams` query per header/body pair per viewer.
@@ -88,6 +91,7 @@ impl AppState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control: None,
             reconcile: None,
+            split_cache: None,
             stream_names: Arc::new(std::sync::Mutex::new(None)),
             label_fields: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }

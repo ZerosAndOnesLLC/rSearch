@@ -1,11 +1,6 @@
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use tantivy::Index;
-use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
-use tantivy::directory::{
-    Directory, FileHandle, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
-};
 use tokio::runtime::Handle;
 
 use rsearch_storage::Storage;
@@ -14,6 +9,7 @@ use crate::cache::SplitCache;
 use crate::error::{IndexError, IndexResult};
 use crate::mapping::{ID_FIELD, IndexMapping, MappedSchema, SEQ_FIELD, SOURCE_FIELD, TIMESTAMP_FIELD};
 use crate::split_file::{BundleMeta, FOOTER_TAIL_LEN, parse_footer_tail, parse_meta};
+use crate::storage_directory::{DirectoryInner, StorageDirectory};
 
 /// One document read back out of a split (merge / compaction re-index).
 #[derive(Debug)]
@@ -28,9 +24,15 @@ pub struct ReadDoc {
     pub seq: i64,
 }
 
+/// Memory budget of a scan reader's private block cache.
+const SCAN_MEMORY_BYTES: u64 = 64 << 20;
+/// Read-ahead of a scan reader continuing a sequential read, in bytes.
+const SCAN_READAHEAD_BYTES: u64 = 8 << 20;
+
 /// An opened split: footer metadata plus a lazily-fetching Tantivy index.
-/// Opening reads only the footer; internal files are range-read from
-/// storage on first use and cached on local disk.
+/// Opening reads the split footer and the tail blocks of each bundled
+/// file; everything else is range-read from storage in blocks as queries
+/// touch it.
 pub struct SplitReader {
     /// Footer metadata: bundled file map plus split metadata.
     pub meta: BundleMeta,
@@ -50,13 +52,36 @@ pub struct SplitReader {
 }
 
 impl SplitReader {
-    /// Open a split by storage key. Async (footer reads); the returned
-    /// index performs storage reads lazily on blocking threads — run
-    /// searches inside `spawn_blocking`.
+    /// Open a split by storage key for searching, reading through the
+    /// node's shared block cache. Async (footer reads); the returned index
+    /// performs storage reads lazily on blocking threads — run searches
+    /// inside `spawn_blocking`.
     pub async fn open(
         storage: Arc<dyn Storage>,
         key: &str,
         cache: Arc<SplitCache>,
+    ) -> IndexResult<Self> {
+        Self::open_with(storage, key, cache, 0).await
+    }
+
+    /// Open a split for a one-off pass — merge, compaction, inventory
+    /// scans — through a private memory-only cache with read-ahead. The
+    /// pass never evicts what searches have cached, and the blocks of a
+    /// split about to be replaced never occupy the node's cache.
+    pub async fn open_for_scan(storage: Arc<dyn Storage>, key: &str) -> IndexResult<Self> {
+        let cache = Arc::new(SplitCache::memory_only(
+            SCAN_MEMORY_BYTES,
+            crate::cache::DEFAULT_BLOCK_SIZE,
+        ));
+        let readahead = SCAN_READAHEAD_BYTES / crate::cache::DEFAULT_BLOCK_SIZE;
+        Self::open_with(storage, key, cache, readahead).await
+    }
+
+    async fn open_with(
+        storage: Arc<dyn Storage>,
+        key: &str,
+        cache: Arc<SplitCache>,
+        readahead_blocks: u64,
     ) -> IndexResult<Self> {
         let size = storage
             .size(key)
@@ -93,6 +118,7 @@ impl SplitReader {
                 meta: meta.clone(),
                 cache,
                 runtime: Handle::current(),
+                readahead_blocks,
             }),
         };
         // Index::open reads bundled files, which bridges back into the
@@ -233,175 +259,6 @@ impl SplitReader {
             }
         }
         Ok(())
-    }
-}
-
-struct DirectoryInner {
-    storage: Arc<dyn Storage>,
-    key: String,
-    meta: BundleMeta,
-    cache: Arc<SplitCache>,
-    runtime: Handle,
-}
-
-/// Ranged-read chunk size for cold split fetches. Large bundled files
-/// (a merged split's doc store can be 100MB+) stream into the cache file
-/// chunk by chunk, so transient memory stays O(chunk) per concurrent
-/// fetch instead of O(file).
-const FETCH_CHUNK_BYTES: u64 = 8 << 20;
-
-impl DirectoryInner {
-    /// Fetch an internal file (whole-file granularity) through the cache.
-    /// Must run on a thread where blocking is permitted.
-    fn fetch(&self, file_name: &str) -> std::io::Result<PathBuf> {
-        if let Some(path) = self.cache.get(&self.meta.split.split_id, file_name) {
-            return Ok(path);
-        }
-        let span = self.meta.files.get(file_name).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{file_name} not in split bundle"),
-            )
-        })?;
-        self.cache
-            .insert_via(&self.meta.split.split_id, file_name, |file| {
-                use std::io::Write;
-                let mut offset = span.offset;
-                let end = span.offset + span.len;
-                while offset < end {
-                    let chunk_end = (offset + FETCH_CHUNK_BYTES).min(end);
-                    let data = self
-                        .runtime
-                        .block_on(self.storage.get_range(&self.key, offset..chunk_end))
-                        .map_err(std::io::Error::other)?;
-                    file.write_all(&data)?;
-                    offset = chunk_end;
-                }
-                Ok(())
-            })
-    }
-}
-
-impl std::fmt::Debug for DirectoryInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorageDirectory")
-            .field("key", &self.key)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug)]
-struct StorageDirectory {
-    inner: Arc<DirectoryInner>,
-}
-
-impl Directory for StorageDirectory {
-    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        let name = path.to_string_lossy().to_string();
-        if !self.inner.meta.files.contains_key(&name) {
-            return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
-        }
-        Ok(Arc::new(LazyFileHandle {
-            dir: self.inner.clone(),
-            name,
-            bytes: OnceLock::new(),
-        }))
-    }
-
-    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
-        Ok(self
-            .inner
-            .meta
-            .files
-            .contains_key(path.to_string_lossy().as_ref()))
-    }
-
-    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-        let name = path.to_string_lossy().to_string();
-        if !self.inner.meta.files.contains_key(&name) {
-            return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
-        }
-        let cached = self
-            .inner
-            .fetch(&name)
-            .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?;
-        std::fs::read(cached).map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))
-    }
-
-    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
-        Err(DeleteError::IoError {
-            io_error: Arc::new(std::io::Error::other("split directories are read-only")),
-            filepath: path.to_path_buf(),
-        })
-    }
-
-    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        Err(OpenWriteError::wrap_io_error(
-            std::io::Error::other("split directories are read-only"),
-            path.to_path_buf(),
-        ))
-    }
-
-    fn atomic_write(&self, _path: &Path, _data: &[u8]) -> std::io::Result<()> {
-        Err(std::io::Error::other("split directories are read-only"))
-    }
-
-    fn sync_directory(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    /// Splits are immutable; locking is a no-op.
-    fn acquire_lock(
-        &self,
-        _lock: &tantivy::directory::Lock,
-    ) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
-        Ok(tantivy::directory::DirectoryLock::from(Box::new(())))
-    }
-
-    fn watch(&self, _callback: WatchCallback) -> tantivy::Result<WatchHandle> {
-        Ok(WatchHandle::empty())
-    }
-}
-
-struct LazyFileHandle {
-    dir: Arc<DirectoryInner>,
-    name: String,
-    bytes: OnceLock<OwnedBytes>,
-}
-
-impl LazyFileHandle {
-    fn bytes(&self) -> std::io::Result<&OwnedBytes> {
-        if let Some(bytes) = self.bytes.get() {
-            return Ok(bytes);
-        }
-        let path = self.dir.fetch(&self.name)?;
-        let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let _ = self.bytes.set(OwnedBytes::new(mmap));
-        Ok(self.bytes.get().unwrap())
-    }
-}
-
-impl std::fmt::Debug for LazyFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LazyFileHandle({})", self.name)
-    }
-}
-
-impl tantivy::HasLen for LazyFileHandle {
-    fn len(&self) -> usize {
-        self.dir
-            .meta
-            .files
-            .get(&self.name)
-            .map(|span| span.len as usize)
-            .unwrap_or(0)
-    }
-}
-
-impl FileHandle for LazyFileHandle {
-    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<OwnedBytes> {
-        Ok(self.bytes()?.slice(range))
     }
 }
 

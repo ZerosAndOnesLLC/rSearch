@@ -40,7 +40,6 @@ const LEADERSHIP_GRACE_SECS: u64 = 15;
 pub struct ControlPlane {
     metastore: Metastore,
     storage: Arc<dyn Storage>,
-    cache: Arc<SplitCache>,
     config: ControlConfig,
     node_id: String,
     work_dir: std::path::PathBuf,
@@ -122,7 +121,6 @@ impl ControlPlane {
         Ok(Self {
             metastore,
             storage,
-            cache,
             config: config.control.clone(),
             node_id: config.node_id(),
             work_dir: data_dir.join("merge"),
@@ -711,8 +709,7 @@ impl ControlPlane {
         let mut skipped_total = 0u64;
         for split in sources {
             let reader = Arc::new(
-                SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
-                    .await?,
+                SplitReader::open_for_scan(self.storage.clone(), &split.storage_key).await?,
             );
             // Tombstones this split already applied (an earlier rebuild)
             // hide nothing in it; skip their lookups.
@@ -888,8 +885,7 @@ impl ControlPlane {
             // Cheap check first: does this split hold anything hidden by
             // tombstones newer than the ones it already applied?
             let reader = Arc::new(
-                SplitReader::open(self.storage.clone(), &split.storage_key, self.cache.clone())
-                    .await?,
+                SplitReader::open_for_scan(self.storage.clone(), &split.storage_key).await?,
             );
             reader.seed_applied_through(split.tombstone_seq_applied);
             let list = tombstones.to_vec();
@@ -1109,12 +1105,9 @@ impl ControlPlane {
         let scans = stream::iter(candidates)
             .map(|split| async move {
                 let scanned = async {
-                    let reader = SplitReader::open(
-                        self.storage.clone(),
-                        &split.storage_key,
-                        self.cache.clone(),
-                    )
-                    .await?;
+                    let reader =
+                        SplitReader::open_for_scan(self.storage.clone(), &split.storage_key)
+                            .await?;
                     tokio::task::spawn_blocking(move || reader.dynamic_field_types())
                         .await
                         .map_err(|e| rsearch_index::IndexError::InvalidDocument(e.to_string()))?

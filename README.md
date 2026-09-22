@@ -68,8 +68,13 @@ Ingest nodes accept logs (`_bulk`, syslog-TLS, GELF), write a local WAL,
 build immutable Tantivy splits, and publish them to object storage. The
 Postgres metastore tracks splits, streams, nodes, and retention. Stateless
 search nodes prune splits by time range via the metastore and execute
-queries directly against storage through a local cache. One binary runs any
-combination of roles: `rsearch --roles ingest,search,control`.
+queries directly against storage through a local cache. Splits are read
+in 256 KiB blocks, so a query downloads only the byte ranges it touches —
+an aggregation reads the fast-field columns it aggregates, not the
+document store. Blocks are cached in memory (`search.memory_cache_mb`) in
+front of local disk (`search.cache_max_mb`). Merges and compaction read
+through private buffers and never evict what searches have cached. One
+binary runs any combination of roles: `rsearch --roles ingest,search,control`.
 
 ## Install
 
@@ -526,7 +531,11 @@ and 1 hour per session, with WebSocket pings reaping dead peers.
 `GET /metrics` serves Prometheus text format: ingest throughput and
 queue depth, WAL backlog (`rsearch_wal_outstanding_records` — watch this
 for restart-replay memory pressure), cluster node liveness/draining
-gauges, and on control nodes leadership plus repair/drain activity. It
+gauges, split-cache activity (`rsearch_split_cache_*`: memory/disk hits,
+blocks and bytes fetched from storage, evictions, bytes held — a steady
+climb in `rsearch_split_cache_fetched_bytes_total` on repeated queries
+means the working set outgrew `search.cache_max_mb`), and on control
+nodes leadership plus repair/drain activity. It
 requires search-level auth like `/_rsearch/stats`; point a scrape job at
 it with an API key:
 
