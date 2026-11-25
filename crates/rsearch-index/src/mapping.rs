@@ -6,6 +6,7 @@ use tantivy::schema::{
     DateOptions, DateTimePrecision, FAST, Field, INDEXED, IndexRecordOption, JsonObjectOptions,
     STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions,
 };
+use tantivy::tokenizer::RAW_TOKENIZER_NAME;
 
 use crate::normalizer::{Normalizer, NormalizerFilter};
 use crate::tokenizer::STANDARD_TOKENIZER;
@@ -622,10 +623,10 @@ impl MappedSchema {
                 TextOptions::default().set_indexing_options(indexing.clone()),
                 JsonObjectOptions::default()
                     .set_indexing_options(indexing)
-                    .set_fast(None),
+                    .set_fast(RAW_TOKENIZER_NAME),
             )
         } else {
-            (TEXT.into(), (TEXT | FAST).into())
+            (TEXT, (TEXT | FAST).into())
         };
         let dynamic = builder.add_json_field(DYNAMIC_FIELD, dynamic_options);
 
@@ -683,10 +684,10 @@ impl MappedSchema {
                 JsonObjectOptions::default()
                     .set_indexing_options(
                         TextFieldIndexing::default()
-                            .set_tokenizer("raw")
+                            .set_tokenizer(RAW_TOKENIZER_NAME)
                             .set_index_option(IndexRecordOption::Basic),
                     )
-                    .set_fast(None),
+                    .set_fast(RAW_TOKENIZER_NAME),
             )
         });
 

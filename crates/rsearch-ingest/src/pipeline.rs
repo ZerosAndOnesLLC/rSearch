@@ -97,10 +97,10 @@ impl SeqClock {
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
         let now = (micros.clamp(0, i64::MAX >> SEQ_SALT_BITS) << SEQ_SALT_BITS) | self.salt;
-        // fetch_update: `last = max(first salted stamp past last, now)`
+        // try_update: `last = max(first salted stamp past last, now)`
         // atomically.
         self.last
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |last| {
                 Some(now.max(self.stamp_after(last)))
             })
             .map(|prev| now.max(self.stamp_after(prev)))

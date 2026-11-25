@@ -13,7 +13,7 @@ categories.workspace = true
 
 [dependencies]
 rsearch-common.workspace = true
-tantivy = "0.26"
+tantivy = "0.27"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
