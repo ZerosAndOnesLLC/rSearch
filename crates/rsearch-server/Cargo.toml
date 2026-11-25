@@ -41,7 +41,7 @@ url.workspace = true
 serde.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
-regex = "1.13.1"
+regex = "1.13.2"
 time = { version = "0.3.55", features = ["parsing", "formatting"] }
 
 # jemalloc instead of glibc malloc: glibc keeps freed memory in per-thread
